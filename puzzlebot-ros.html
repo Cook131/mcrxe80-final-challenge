@@ -1,0 +1,2193 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PuzzleBot — ROS Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0c10;
+    --bg2: #111419;
+    --bg3: #181c23;
+    --border: rgba(255,255,255,0.07);
+    --border2: rgba(255,255,255,0.12);
+    --accent: #00e5a0;
+    --accent2: #00b87a;
+    --accent-dim: rgba(0,229,160,0.12);
+    --accent-glow: rgba(0,229,160,0.25);
+    --warn: #f59e0b;
+    --warn-dim: rgba(245,158,11,0.15);
+    --danger: #ef4444;
+    --danger-dim: rgba(239,68,68,0.15);
+    --info: #60a5fa;
+    --info-dim: rgba(96,165,250,0.12);
+    --text: #e8eaf0;
+    --text2: #9ba3af;
+    --text3: #5c6370;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'Space Grotesk', sans-serif;
+    --r: 8px;
+    --r2: 12px;
+    --left-w: 220px;
+    --right-w: 260px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow-x: hidden;
+  }
+
+  /* ── TOP BAR ── */
+  .topbar {
+    height: 52px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 16px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    flex-shrink: 0;
+  }
+  .topbar-logo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+    color: var(--text);
+  }
+  .logo-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .logo-icon svg { width: 16px; height: 16px; }
+  .topbar-sep { width: 1px; height: 24px; background: var(--border); }
+  .topbar-badge {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    border: 1px solid rgba(0,229,160,0.3);
+    letter-spacing: 0.5px;
+  }
+  .topbar-badge.offline { background: var(--danger-dim); color: var(--danger); border-color: rgba(239,68,68,0.3); }
+  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .topbar-time { font-family: var(--mono); font-size: 12px; color: var(--text2); }
+  .topbar-btn {
+    height: 30px;
+    padding: 0 12px;
+    border-radius: var(--r);
+    border: 1px solid var(--border2);
+    background: transparent;
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .topbar-btn:hover { background: var(--bg3); border-color: var(--border2); }
+  .topbar-btn.danger { border-color: rgba(239,68,68,0.4); color: var(--danger); }
+  .topbar-btn.danger:hover { background: var(--danger-dim); }
+  .topbar-btn.primary { border-color: rgba(0,229,160,0.4); color: var(--accent); }
+  .topbar-btn.primary:hover { background: var(--accent-dim); }
+
+  /* ── LAYOUT ── */
+  .shell {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    height: calc(100vh - 52px);
+  }
+
+  /* ── LEFT SIDEBAR ── */
+  .sidebar-left {
+    width: var(--left-w);
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+  .sidebar-section { padding: 16px; border-bottom: 1px solid var(--border); }
+  .sidebar-title {
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text3);
+    margin-bottom: 10px;
+  }
+
+  /* Module toggles */
+  .module-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 0;
+    gap: 8px;
+  }
+  .module-row-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text2);
+    font-size: 12px;
+  }
+  .module-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--text3);
+  }
+  .module-dot.on { background: var(--accent); box-shadow: 0 0 6px var(--accent-glow); }
+  .module-dot.warn { background: var(--warn); }
+
+  /* Toggle switch */
+  .toggle { position: relative; width: 32px; height: 18px; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle-track {
+    position: absolute;
+    inset: 0;
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+  }
+  .toggle input:checked + .toggle-track { background: var(--accent-dim); border-color: var(--accent); }
+  .toggle-thumb {
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 12px; height: 12px;
+    background: var(--text3);
+    border-radius: 50%;
+    transition: transform 0.2s, background 0.2s;
+    pointer-events: none;
+  }
+  .toggle input:checked ~ .toggle-thumb { transform: translateX(14px); background: var(--accent); }
+
+  /* Network settings */
+  .field-row { margin-bottom: 8px; }
+  .field-label { font-size: 10px; color: var(--text3); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .field-input {
+    width: 100%;
+    height: 28px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 0 8px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .field-input:focus { border-color: var(--accent); }
+  .save-btn {
+    width: 100%;
+    height: 28px;
+    margin-top: 8px;
+    background: var(--accent-dim);
+    border: 1px solid rgba(0,229,160,0.3);
+    border-radius: var(--r);
+    color: var(--accent);
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .save-btn:hover { background: rgba(0,229,160,0.2); }
+
+  /* ── MAIN CONTENT ── */
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    padding: 20px;
+    gap: 16px;
+  }
+
+  /* ── RIGHT SIDEBAR ── */
+  .sidebar-right {
+    width: var(--right-w);
+    background: var(--bg2);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+
+  /* ── CARDS ── */
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: var(--r2);
+    overflow: hidden;
+  }
+  .card-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .card-title {
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text2);
+  }
+  .card-body { padding: 16px; }
+
+  /* ── GAUGES ── */
+  .gauges-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .gauge-container { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .gauge-label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.8px; }
+  .gauge-wrap { position: relative; width: 160px; height: 90px; }
+  .gauge-value {
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 500;
+    color: var(--text);
+    text-align: center;
+  }
+  .gauge-unit {
+    display: block;
+    font-size: 10px;
+    color: var(--text3);
+    text-align: center;
+    margin-top: 2px;
+    font-family: var(--sans);
+  }
+  .gauge-ticks { position: absolute; inset: 0; }
+
+  /* ── VELOCITY INPUTS ── */
+  .velocity-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 16px;
+  }
+  .vel-field label {
+    display: block;
+    font-size: 10px;
+    color: var(--text3);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+  }
+  .vel-field input {
+    width: 100%;
+    height: 32px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 0 10px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .vel-field input:focus { border-color: var(--accent); }
+  .submit-btn {
+    width: 100%;
+    height: 34px;
+    margin-top: 12px;
+    background: var(--accent);
+    border: none;
+    border-radius: var(--r);
+    color: #0a0c10;
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+    letter-spacing: 0.3px;
+  }
+  .submit-btn:hover { opacity: 0.85; }
+  .submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── MOTOR/ENCODER ── */
+  .encoder-table { width: 100%; border-collapse: collapse; }
+  .encoder-table th, .encoder-table td {
+    padding: 6px 8px;
+    text-align: left;
+    font-size: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .encoder-table th { color: var(--text3); font-weight: 400; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .encoder-table td { color: var(--text); font-family: var(--mono); }
+
+  /* ── ROBOT CONTROLS ── */
+  .controls-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 40px);
+    grid-template-rows: repeat(3, 40px);
+    gap: 4px;
+    justify-content: center;
+    margin: 8px auto;
+  }
+  .ctrl-btn {
+    width: 40px; height: 40px;
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius: var(--r);
+    color: var(--text2);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s, border-color 0.1s;
+    font-size: 14px;
+    user-select: none;
+  }
+  .ctrl-btn:hover { background: var(--bg2); border-color: var(--accent); color: var(--accent); }
+  .ctrl-btn:active { transform: scale(0.92); }
+  .ctrl-btn.stop-btn {
+    background: var(--danger-dim);
+    border-color: rgba(239,68,68,0.5);
+    color: var(--danger);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+  .ctrl-btn.stop-btn:hover { background: rgba(239,68,68,0.25); }
+  .ctrl-btn.inactive { opacity: 0.2; cursor: default; pointer-events: none; }
+
+  /* ── ODOMETRY MAP ── */
+  .odom-map {
+    position: relative;
+    background: var(--bg);
+    border-radius: var(--r);
+    overflow: hidden;
+  }
+  #odomCanvas { display: block; width: 100%; }
+  .odom-overlay {
+    position: absolute;
+    top: 8px; right: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-family: var(--mono);
+    font-size: 10px;
+  }
+  .odom-stat {
+    background: rgba(10,12,16,0.85);
+    border: 1px solid var(--border2);
+    border-radius: 4px;
+    padding: 3px 7px;
+    color: var(--accent);
+  }
+
+  /* ── STATS ROW ── */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+  .stat-card {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    padding: 12px 14px;
+  }
+  .stat-card-label { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .stat-card-val {
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 500;
+    color: var(--text);
+    line-height: 1;
+  }
+  .stat-card-unit { font-size: 10px; color: var(--text3); margin-top: 2px; }
+
+  /* ── SENSOR PANEL ── */
+  .sensor-bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .sensor-bar-label { width: 80px; font-size: 11px; color: var(--text2); flex-shrink: 0; }
+  .sensor-bar-track {
+    flex: 1;
+    height: 6px;
+    background: var(--bg);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .sensor-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--accent);
+    transition: width 0.3s ease;
+  }
+  .sensor-bar-fill.warn { background: var(--warn); }
+  .sensor-bar-fill.danger { background: var(--danger); }
+  .sensor-bar-val { width: 44px; text-align: right; font-family: var(--mono); font-size: 11px; color: var(--text2); }
+
+  /* ── LOG ── */
+  .log-panel {
+    background: var(--bg);
+    border-radius: var(--r);
+    padding: 10px;
+    height: 120px;
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.7;
+  }
+  .log-line { display: flex; gap: 8px; }
+  .log-time { color: var(--text3); flex-shrink: 0; }
+  .log-msg { color: var(--text2); }
+  .log-msg.ok { color: var(--accent); }
+  .log-msg.warn { color: var(--warn); }
+  .log-msg.err { color: var(--danger); }
+
+  /* ── REFLECTANCE ── */
+  .reflectance-row {
+    display: flex;
+    gap: 4px;
+    justify-content: center;
+    margin: 8px 0;
+  }
+  .refl-cell {
+    width: 28px; height: 28px;
+    border-radius: 4px;
+    border: 1px solid var(--border2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--text3);
+    transition: background 0.2s, border-color 0.2s;
+  }
+  .refl-cell.active {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── HEADING INDICATOR ── */
+  .compass-wrap { display: flex; justify-content: center; padding: 8px 0; }
+
+
+  /* ── TABS ── */
+  .tab-bar {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 20px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    height: 40px;
+    flex-shrink: 0;
+  }
+  .tab-btn {
+    height: 32px;
+    padding: 0 18px;
+    border-radius: var(--r) var(--r) 0 0;
+    border: 1px solid transparent;
+    border-bottom: none;
+    background: transparent;
+    color: var(--text3);
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    letter-spacing: 0.3px;
+    transition: color 0.15s, background 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    position: relative;
+    bottom: -1px;
+  }
+  .tab-btn:hover { color: var(--text2); background: var(--bg3); }
+  .tab-btn.active {
+    color: var(--accent);
+    background: var(--bg);
+    border-color: var(--border);
+    border-bottom-color: var(--bg);
+  }
+  .tab-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.6;
+  }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: contents; }
+
+  /* When tab-panel is active inside .shell it shows its children */
+  .shell > .tab-panel { display: none; flex: 1; overflow: hidden; }
+  .shell > .tab-panel.active { display: flex; }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+  /* Control mode toggle */
+  .mode-toggle { display: flex; border: 1px solid var(--border2); border-radius: var(--r); overflow: hidden; }
+  .mode-opt {
+    flex: 1;
+    padding: 5px 0;
+    text-align: center;
+    font-size: 11px;
+    color: var(--text3);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .mode-opt.active { background: var(--accent-dim); color: var(--accent); }
+
+  .tag {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: var(--mono);
+  }
+  .tag.ok { background: var(--accent-dim); color: var(--accent); }
+  .tag.warn { background: var(--warn-dim); color: var(--warn); }
+  .tag.err { background: var(--danger-dim); color: var(--danger); }
+  .tag.info { background: var(--info-dim); color: var(--info); }
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<header class="topbar">
+  <div class="topbar-logo">
+    <div class="logo-icon">
+      <svg viewBox="0 0 16 16" fill="none">
+        <circle cx="5" cy="10" r="3" stroke="#00e5a0" stroke-width="1.2"/>
+        <circle cx="11" cy="10" r="3" stroke="#00e5a0" stroke-width="1.2"/>
+        <rect x="4" y="3" width="8" height="5" rx="1.5" stroke="#00e5a0" stroke-width="1.2"/>
+        <circle cx="5" cy="5" r="0.8" fill="#00e5a0"/>
+        <circle cx="8" cy="5" r="0.8" fill="#00e5a0"/>
+      </svg>
+    </div>
+    PuzzleBot
+  </div>
+  <div class="topbar-sep"></div>
+  <span class="tag info" style="font-size:10px;">Jetson/LiDAR Edition</span>
+  <span class="topbar-badge" id="connBadge">● CONNECTED</span>
+  <div class="topbar-right">
+    <span class="topbar-time" id="clock">--:--:--</span>
+    <button class="topbar-btn" id="resetBtn">↺ Reset to Default</button>
+    <button class="topbar-btn danger" id="restartBtn">⏻ Restart Robot</button>
+  </div>
+</header>
+
+<!-- TAB BAR -->
+<nav class="tab-bar">
+  <button class="tab-btn active" id="tab-control" onclick="switchTab('control')">
+    <div class="tab-dot"></div> Control
+  </button>
+  <button class="tab-btn" id="tab-telem" onclick="switchTab('telem')">
+    <div class="tab-dot"></div> Telemetría
+  </button>
+  <button class="tab-btn" id="tab-sys" onclick="switchTab('sys')">
+    <div class="tab-dot"></div> Sistema
+  </button>
+</nav>
+
+<div class="shell" id="mainShell">
+
+  <!-- ══════════════════════════════════
+       TAB 1 — CONTROL
+  ══════════════════════════════════ -->
+  <div class="tab-panel active" id="panel-control" style="display:flex;flex:1;overflow:hidden;">
+
+    <!-- RIGHT SIDEBAR: motor + controls + kinematics -->
+    <aside class="sidebar-right" style="order:2;">
+
+      <div class="sidebar-section">
+        <div class="sidebar-title">Motor / Encoder</div>
+        <div class="field-row">
+          <div class="field-label">Control Mode</div>
+          <select class="field-input" id="controlMode" style="height:28px;cursor:pointer;">
+            <option>Robot Velocities (v and ω)</option>
+            <option>Wheel Speeds (ωL, ωR)</option>
+            <option>Open Loop</option>
+          </select>
+        </div>
+        <div id="motorParamsPanel" style="margin-top:10px;"></div>
+        <button class="save-btn" style="margin-top:10px;" id="saveMotorBtn">Save Motor Config</button>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-title">Robot Controls</div>
+        <div class="mode-toggle" style="margin-bottom:12px;" id="modeToggle">
+          <div class="mode-opt active" data-mode="onscreen">On-screen</div>
+          <div class="mode-opt" data-mode="keyboard">Keyboard (WASD)</div>
+        </div>
+        <div class="controls-grid">
+          <div></div>
+          <button class="ctrl-btn" id="btnFwd" title="Forward (W)">▲</button>
+          <div></div>
+          <button class="ctrl-btn" id="btnLeft" title="Turn Left (A)">◀</button>
+          <button class="ctrl-btn stop-btn" id="btnStop" title="STOP (Space)">STOP</button>
+          <button class="ctrl-btn" id="btnRight" title="Turn Right (D)">▶</button>
+          <div></div>
+          <button class="ctrl-btn" id="btnBack" title="Backward (S)">▼</button>
+          <div></div>
+        </div>
+        <div style="margin-top:10px;">
+          <div class="field-label" style="margin-bottom:4px;">Step Speed (m/s)</div>
+          <input type="range" id="stepSpeedSlider" min="0.05" max="0.5" step="0.05" value="0.2" style="width:100%;">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:2px;">
+            <span>0.05</span><span id="stepSpeedVal">0.20 m/s</span><span>0.50</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-title">Kinematics</div>
+        <table class="encoder-table">
+          <tbody>
+            <tr>
+              <td style="color:var(--text2);font-size:11px;white-space:nowrap;">Wheel Radius r</td>
+              <td><div style="display:flex;align-items:center;gap:4px;">
+                <input type="number" id="kRInput" value="0.050" step="0.001" min="0.01" max="0.2"
+                  style="width:70px;height:24px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);color:var(--text);font-family:var(--mono);font-size:11px;padding:0 5px;outline:none;transition:border-color 0.15s;"
+                  onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border2)'">
+                <span style="font-size:10px;color:var(--text3);">m</span>
+              </div></td>
+            </tr>
+            <tr>
+              <td style="color:var(--text2);font-size:11px;white-space:nowrap;">Wheel Base L</td>
+              <td><div style="display:flex;align-items:center;gap:4px;">
+                <input type="number" id="kLInput" value="0.188" step="0.001" min="0.05" max="0.5"
+                  style="width:70px;height:24px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);color:var(--text);font-family:var(--mono);font-size:11px;padding:0 5px;outline:none;transition:border-color 0.15s;"
+                  onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border2)'">
+                <span style="font-size:10px;color:var(--text3);">m</span>
+              </div></td>
+            </tr>
+            <tr>
+              <td style="color:var(--text2);font-size:11px;">v linear</td>
+              <td id="kV" style="font-family:var(--mono);font-size:12px;color:var(--text3);background:var(--bg);border-radius:4px;padding:2px 5px;border:1px solid var(--border);">0.00 m/s</td>
+            </tr>
+            <tr>
+              <td style="color:var(--text2);font-size:11px;">ω angular</td>
+              <td id="kW" style="font-family:var(--mono);font-size:12px;color:var(--text3);background:var(--bg);border-radius:4px;padding:2px 5px;border:1px solid var(--border);">0.00 rad/s</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+    </aside>
+
+    <!-- MAIN: Wheel params + sensors + log -->
+    <main class="main" style="order:1;">
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+
+        <!-- WHEEL PARAMETERS -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Wheel Parameters</span>
+            <span class="tag ok" id="motionTag">IDLE</span>
+          </div>
+          <div class="card-body">
+            <div style="display:flex;gap:0;margin-bottom:14px;border:1px solid var(--border2);border-radius:var(--r);overflow:hidden;">
+              <button id="tabWheelL" onclick="selectWheel('L')"
+                style="flex:1;height:28px;background:var(--accent-dim);border:none;color:var(--accent);font-family:var(--sans);font-size:11px;font-weight:500;cursor:pointer;letter-spacing:0.3px;border-right:1px solid var(--border2);transition:background 0.15s,color 0.15s;">◀ Left Wheel</button>
+              <button id="tabWheelR" onclick="selectWheel('R')"
+                style="flex:1;height:28px;background:transparent;border:none;color:var(--text3);font-family:var(--sans);font-size:11px;font-weight:500;cursor:pointer;letter-spacing:0.3px;transition:background 0.15s,color 0.15s;">Right Wheel ▶</button>
+            </div>
+            <div style="display:flex;flex-direction:column;align-items:center;gap:4px;margin-bottom:10px;">
+              <div style="font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px;" id="gaugeActiveLabel">Left Wheel</div>
+              <div class="gauge-wrap" style="width:180px;height:100px;">
+                <canvas id="gaugeActive" width="180" height="100"></canvas>
+                <div class="gauge-value" id="gValActive" style="font-size:24px;">0.00<span class="gauge-unit">rad/s</span></div>
+              </div>
+              <div style="display:flex;gap:16px;margin-top:6px;">
+                <div style="text-align:center;"><div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">RPM</div><div style="font-family:var(--mono);font-size:13px;color:var(--text);" id="gaugeRPM">0</div></div>
+                <div style="text-align:center;"><div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">Direction</div><div style="font-family:var(--mono);font-size:13px;color:var(--text);" id="gaugeDir">—</div></div>
+                <div style="text-align:center;"><div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">Other ω</div><div style="font-family:var(--mono);font-size:13px;color:var(--text2);" id="gaugeOther">0.00</div></div>
+              </div>
+            </div>
+            <div class="velocity-row">
+              <div class="vel-field"><label>Linear vel v (m/s)</label><input type="number" id="linVelInput" step="0.1" value="0.0" min="-1.5" max="1.5"></div>
+              <div class="vel-field"><label>Angular vel ω (rad/s)</label><input type="number" id="angVelInput" step="0.1" value="0.0" min="-3.14" max="3.14"></div>
+            </div>
+            <button class="submit-btn" id="submitVel">Publish /cmd_vel</button>
+          </div>
+        </div>
+
+        <!-- DISTANCE SENSORS -->
+        <div class="card">
+          <div class="card-header"><span class="card-title">Distance Sensors</span></div>
+          <div class="card-body" style="padding-bottom:8px;">
+            <div class="sensor-bar-row"><span class="sensor-bar-label">ToF Front</span><div class="sensor-bar-track"><div class="sensor-bar-fill" id="bar-tof-front" style="width:0%"></div></div><span class="sensor-bar-val" id="lbl-tof-front">—</span></div>
+            <div class="sensor-bar-row"><span class="sensor-bar-label">ToF Left</span><div class="sensor-bar-track"><div class="sensor-bar-fill" id="bar-tof-left" style="width:0%"></div></div><span class="sensor-bar-val" id="lbl-tof-left">—</span></div>
+            <div class="sensor-bar-row"><span class="sensor-bar-label">ToF Right</span><div class="sensor-bar-track"><div class="sensor-bar-fill" id="bar-tof-right" style="width:0%"></div></div><span class="sensor-bar-val" id="lbl-tof-right">—</span></div>
+            <div class="sensor-bar-row"><span class="sensor-bar-label">ToF Rear</span><div class="sensor-bar-track"><div class="sensor-bar-fill" id="bar-tof-rear" style="width:0%"></div></div><span class="sensor-bar-val" id="lbl-tof-rear">—</span></div>
+            <div class="sensor-bar-row" style="margin-bottom:0;"><span class="sensor-bar-label">LiDAR Min</span><div class="sensor-bar-track"><div class="sensor-bar-fill" id="bar-lidar" style="width:0%;background:var(--info)"></div></div><span class="sensor-bar-val" id="lbl-lidar">—</span></div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- LOG -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">System Log</span>
+          <button class="topbar-btn" id="clearLog" style="height:24px;font-size:10px;padding:0 8px;">Clear</button>
+        </div>
+        <div class="card-body" style="padding:8px;">
+          <div class="log-panel" id="logPanel"></div>
+        </div>
+      </div>
+
+    </main>
+  </div><!-- /panel-control -->
+
+
+  <!-- ══════════════════════════════════
+       TAB 2 — TELEMETRÍA
+  ══════════════════════════════════ -->
+  <div class="tab-panel" id="panel-telem" style="display:none;flex:1;overflow:hidden;">
+  <main class="main">
+
+    <!-- STATS ROW -->
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-card-label">Position X</div><div class="stat-card-val" id="posX">0.00</div><div class="stat-card-unit">meters</div></div>
+      <div class="stat-card"><div class="stat-card-label">Position Y</div><div class="stat-card-val" id="posY">0.00</div><div class="stat-card-unit">meters</div></div>
+      <div class="stat-card"><div class="stat-card-label">Heading θ</div><div class="stat-card-val" id="headingVal">0.0°</div><div class="stat-card-unit">degrees</div></div>
+      <div class="stat-card"><div class="stat-card-label">Distance Traveled</div><div class="stat-card-val" id="distVal">0.00</div><div class="stat-card-unit">meters</div></div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 280px;gap:16px;">
+
+      <!-- ODOMETRY MAP -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Odometry Map</span>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <button class="topbar-btn" id="clearPath" style="height:24px;font-size:10px;padding:0 8px;">Clear</button>
+            <span class="tag info" id="odomTag">LIVE</span>
+          </div>
+        </div>
+        <div class="card-body" style="padding:8px;">
+          <div class="odom-map">
+            <canvas id="odomCanvas" width="400" height="300"></canvas>
+            <div class="odom-overlay">
+              <div class="odom-stat" id="ovX">X: 0.00 m</div>
+              <div class="odom-stat" id="ovY">Y: 0.00 m</div>
+              <div class="odom-stat" id="ovT">θ: 0.0°</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- COMPASS + REFLECTANCE -->
+      <div style="display:flex;flex-direction:column;gap:16px;">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Compass</span></div>
+          <div class="card-body" style="display:flex;justify-content:center;padding:16px;">
+            <canvas id="compassCanvas" width="140" height="140"></canvas>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Reflectance</span></div>
+          <div class="card-body">
+            <div style="font-size:10px;color:var(--text3);text-align:center;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">8-Cell Array</div>
+            <div class="reflectance-row" id="reflRow"></div>
+            <div style="font-size:10px;color:var(--text3);text-align:center;margin-top:4px;font-family:var(--mono);" id="reflCenter">Center: —</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+  </div><!-- /panel-telem -->
+
+
+  <!-- ══════════════════════════════════
+       TAB 3 — SISTEMA
+  ══════════════════════════════════ -->
+  <div class="tab-panel" id="panel-sys" style="display:none;flex:1;overflow:hidden;">
+  <main class="main">
+
+    <!-- CAMERA -->
+    <div class="card" id="cameraCard">
+      <div class="card-header">
+        <span class="card-title">Camera Feed</span>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--text3);" id="camResLabel">—</span>
+          <span class="tag" id="camTag" style="background:var(--bg3);color:var(--text3);border:1px solid var(--border2);">OFFLINE</span>
+          <button class="topbar-btn" id="camSnapshotBtn" style="height:24px;font-size:10px;padding:0 8px;" disabled>⬇ Snapshot</button>
+          <button class="topbar-btn primary" id="camConnectBtn" style="height:24px;font-size:10px;padding:0 8px;">Connect</button>
+        </div>
+      </div>
+      <div class="card-body" style="padding:0;position:relative;background:var(--bg);border-radius:0 0 var(--r2) var(--r2);overflow:hidden;">
+        <div id="camPlaceholder" style="height:260px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+            <rect x="4" y="12" width="40" height="28" rx="4" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+            <circle cx="24" cy="26" r="8" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+            <circle cx="24" cy="26" r="3" fill="rgba(255,255,255,0.06)"/>
+            <path d="M16 12V10a2 2 0 012-2h12a2 2 0 012 2v2" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+            <line x1="4" y1="44" x2="44" y2="4" stroke="rgba(239,68,68,0.3)" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <div style="font-size:12px;color:var(--text3);">Camera offline — enable module or connect stream</div>
+          <div style="font-size:10px;color:var(--text3);font-family:var(--mono);">Topic: /camera/image_raw &nbsp;|&nbsp; Aruco: /aruco/markers</div>
+        </div>
+        <video id="camVideo" autoplay playsinline muted style="display:none;width:100%;max-height:360px;object-fit:cover;"></video>
+        <canvas id="camCanvas" style="display:none;width:100%;"></canvas>
+        <div id="camHud" style="display:none;position:absolute;inset:0;pointer-events:none;">
+          <div style="position:absolute;top:8px;left:8px;display:flex;flex-direction:column;gap:3px;">
+            <div style="background:rgba(10,12,16,0.75);border:1px solid var(--border2);border-radius:4px;padding:3px 7px;font-family:var(--mono);font-size:10px;color:var(--accent);" id="camFpsLabel">0 fps</div>
+            <div style="background:rgba(10,12,16,0.75);border:1px solid var(--border2);border-radius:4px;padding:3px 7px;font-family:var(--mono);font-size:10px;color:var(--text2);" id="camTopicLabel">/camera/image_raw</div>
+          </div>
+          <div id="camArucoBadge" style="display:none;position:absolute;top:8px;right:8px;background:rgba(10,12,16,0.85);border:1px solid rgba(0,229,160,0.4);border-radius:4px;padding:3px 8px;font-family:var(--mono);font-size:10px;color:var(--accent);">ArUco: <span id="camArucoCount">0</span> markers</div>
+          <div style="position:absolute;bottom:0;left:0;right:0;background:linear-gradient(transparent,rgba(10,12,16,0.7));padding:12px 10px 6px;display:flex;justify-content:space-between;">
+            <span style="font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.4);" id="camTimestamp">—</span>
+          </div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-top:1px solid var(--border);flex-wrap:wrap;">
+        <span style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;">Source</span>
+        <div class="mode-toggle" id="camSourceToggle" style="flex:1;min-width:0;">
+          <div class="mode-opt active" data-src="ros">ROS Topic</div>
+          <div class="mode-opt" data-src="webrtc">WebRTC</div>
+          <div class="mode-opt" data-src="mjpeg">MJPEG HTTP</div>
+          <div class="mode-opt" data-src="device">Local Device</div>
+        </div>
+      </div>
+      <div id="camUrlRow" style="display:none;padding:0 12px 10px;gap:6px;align-items:center;">
+        <input class="field-input" id="camUrlInput" type="text" placeholder="http://192.168.1.120:8080/stream" style="flex:1;height:28px;font-size:11px;">
+        <button class="save-btn" id="camUrlApplyBtn" style="width:auto;padding:0 12px;height:28px;flex-shrink:0;">Apply</button>
+      </div>
+      <div style="padding:0 12px 10px;border-top:1px solid var(--border);">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding-top:8px;margin-bottom:6px;">
+          <span style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px;">ArUco Detection</span>
+          <label class="toggle"><input type="checkbox" id="arucoToggle"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <div id="arucoSettings" style="display:none;grid-template-columns:1fr 1fr;gap:6px;">
+          <div><div class="field-label">Dictionary</div>
+            <select class="field-input" id="arucoDictSelect" style="height:26px;cursor:pointer;font-size:11px;">
+              <option>DICT_4X4_50</option><option>DICT_4X4_100</option><option>DICT_5X5_50</option>
+              <option selected>DICT_6X6_250</option><option>DICT_ARUCO_ORIGINAL</option>
+            </select>
+          </div>
+          <div><div class="field-label">Min Size (px)</div>
+            <input class="field-input" type="number" id="arucoMinSize" value="20" min="5" max="200" style="height:26px;font-size:11px;">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODULES + NETWORK + SESSION -->
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;">
+
+      <div class="card">
+        <div class="card-header"><span class="card-title">Active Modules</span></div>
+        <div class="card-body">
+          <div class="module-row"><div class="module-row-label"><div class="module-dot on" id="dot-servo"></div>Servo Motor</div><label class="toggle"><input type="checkbox" checked id="tog-servo"><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          <div class="module-row"><div class="module-row-label"><div class="module-dot on" id="dot-tof-sonar"></div>ToF Sonar</div><label class="toggle"><input type="checkbox" checked id="tog-tof-sonar"><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          <div class="module-row"><div class="module-row-label"><div class="module-dot on" id="dot-tof-laser"></div>ToF Laser</div><label class="toggle"><input type="checkbox" checked id="tog-tof-laser"><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          <div class="module-row"><div class="module-row-label"><div class="module-dot warn" id="dot-refl"></div>Reflectance</div><label class="toggle"><input type="checkbox" checked id="tog-refl"><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          <div class="module-row"><div class="module-row-label"><div class="module-dot on" id="dot-lidar"></div>LiDAR</div><label class="toggle"><input type="checkbox" checked id="tog-lidar"><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          <div class="module-row"><div class="module-row-label"><div class="module-dot on" id="dot-cam"></div>Camera</div><label class="toggle"><input type="checkbox" id="tog-cam"><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><span class="card-title">Network</span></div>
+        <div class="card-body">
+          <div class="field-row"><div class="field-label">SSID</div><input class="field-input" type="text" value="PuzzleNet" id="ssidInput"></div>
+          <div class="field-row"><div class="field-label">Password</div><input class="field-input" type="password" value="PuzzleNet2" id="passInput"></div>
+          <div class="field-row"><div class="field-label">ROS Bridge IP</div><input class="field-input" type="text" value="192.168.1.120" id="ipInput"></div>
+          <button class="save-btn" id="netSaveBtn">Save & Reconnect</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><span class="card-title">Session</span></div>
+        <div class="card-body">
+          <div class="stat-card" style="padding:8px 10px;margin-bottom:8px;">
+            <div class="stat-card-label">Uptime</div>
+            <div class="stat-card-val" id="uptimeVal" style="font-size:20px;">00:00:00</div>
+          </div>
+          <div class="stat-card" style="padding:8px 10px;">
+            <div class="stat-card-label">Messages / s</div>
+            <div class="stat-card-val" id="msgRate" style="font-size:20px;">0</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </main>
+  </div><!-- /panel-sys -->
+
+</div><!-- /shell -->
+
+<script>
+// ════════════════════════════════════════════
+// STATE
+// ════════════════════════════════════════════
+let R = 0.050; // wheel radius m
+let L = 0.188; // wheelbase m
+
+const state = {
+  connected: true,
+  linVel: 0, angVel: 0,
+  wL: 0, wR: 0,
+  x: 0, y: 0, theta: 0,
+  dist: 0,
+  tofFront: 0.8, tofLeft: 1.2, tofRight: 0.9, tofRear: 1.5,
+  lidarMin: 0.7,
+  refl: [0,0,0,0,0,0,0,0],
+  startTime: Date.now(),
+  msgCount: 0,
+  path: [{x:0, y:0}],
+  mapScale: 50, // px per meter
+  mapOffset: {x:200, y:120}
+};
+
+// ════════════════════════════════════════════
+// CLOCK
+// ════════════════════════════════════════════
+function updateClock(){
+  const now = new Date();
+  document.getElementById('clock').textContent = now.toLocaleTimeString('es-MX',{hour12:false});
+  // uptime
+  const up = Math.floor((Date.now() - state.startTime)/1000);
+  const h = String(Math.floor(up/3600)).padStart(2,'0');
+  const m = String(Math.floor((up%3600)/60)).padStart(2,'0');
+  const s = String(up%60).padStart(2,'0');
+  document.getElementById('uptimeVal').textContent = `${h}:${m}:${s}`;
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ════════════════════════════════════════════
+// GAUGE DRAWING
+// ════════════════════════════════════════════
+function drawGauge(id, value, minV, maxV, color){
+  const canvas = document.getElementById(id);
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+
+  const cx = W/2, cy = H - 8;
+  const r = 70;
+  const startA = Math.PI, endA = 0;
+  const t = (value - minV)/(maxV - minV);
+  const valA = Math.PI + t * Math.PI;
+
+  // Background arc
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, startA, endA);
+  ctx.strokeStyle = '#1a1f2a';
+  ctx.lineWidth = 14;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // Color zones
+  const zones = [
+    {s:0,    e:0.35, c:'#1d5e42'},
+    {s:0.35, e:0.65, c:'#00e5a0'},
+    {s:0.65, e:0.85, c:'#f59e0b'},
+    {s:0.85, e:1.0,  c:'#ef4444'},
+  ];
+  zones.forEach(z=>{
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, Math.PI + z.s*Math.PI, Math.PI + z.e*Math.PI);
+    ctx.strokeStyle = z.c;
+    ctx.lineWidth = 14;
+    ctx.lineCap = 'butt';
+    ctx.stroke();
+  });
+
+  // Needle
+  const nA = valA;
+  const nx = cx + (r-4)*Math.cos(nA);
+  const ny = cy + (r-4)*Math.sin(nA);
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(nx, ny);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // Center dot
+  ctx.beginPath();
+  ctx.arc(cx, cy, 5, 0, Math.PI*2);
+  ctx.fillStyle = '#fff';
+  ctx.fill();
+
+  // Tick marks
+  for(let i=0; i<=10; i++){
+    const a = Math.PI + i*Math.PI/10;
+    const ir = r-20, or = r-12;
+    ctx.beginPath();
+    ctx.moveTo(cx+ir*Math.cos(a), cy+ir*Math.sin(a));
+    ctx.lineTo(cx+or*Math.cos(a), cy+or*Math.sin(a));
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+
+let activeWheel = 'L'; // 'L' or 'R'
+
+function selectWheel(side){
+  activeWheel = side;
+  const tabL = document.getElementById('tabWheelL');
+  const tabR = document.getElementById('tabWheelR');
+  if(side === 'L'){
+    tabL.style.background = 'var(--accent-dim)';
+    tabL.style.color = 'var(--accent)';
+    tabR.style.background = 'transparent';
+    tabR.style.color = 'var(--text3)';
+  } else {
+    tabR.style.background = 'var(--accent-dim)';
+    tabR.style.color = 'var(--accent)';
+    tabL.style.background = 'transparent';
+    tabL.style.color = 'var(--text3)';
+  }
+  updateGauges();
+}
+
+function updateGauges(){
+  const maxW = 15;
+  const w     = activeWheel === 'L' ? state.wL : state.wR;
+  const wOther= activeWheel === 'L' ? state.wR : state.wL;
+  const rpm   = Math.round(Math.abs(w) * 60 / (2 * Math.PI));
+  const encOk = activeWheel === 'L' ? motorState.encL : motorState.encR;
+
+  drawGauge('gaugeActive', Math.abs(w), 0, maxW, '#00e5a0');
+
+  // Value display
+  const valEl = document.getElementById('gValActive');
+  if(valEl) valEl.childNodes[0].textContent = w.toFixed(2);
+
+  // Label
+  setText('gaugeActiveLabel', activeWheel === 'L' ? 'Left Wheel' : 'Right Wheel');
+
+  // Mini stats
+  setText('gaugeRPM',  encOk ? String(rpm) : '—');
+  setText('gaugeDir',  w > 0.01 ? 'FWD' : w < -0.01 ? 'REV' : 'STOP');
+  setText('gaugeOther', wOther.toFixed(2));
+}
+
+// ════════════════════════════════════════════
+// COMPASS
+// ════════════════════════════════════════════
+function drawCompass(theta){
+  const canvas = document.getElementById('compassCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const cx = W/2, cy = H/2, r = 50;
+  ctx.clearRect(0,0,W,H);
+
+  // Ring
+  ctx.beginPath();
+  ctx.arc(cx,cy,r,0,Math.PI*2);
+  ctx.strokeStyle = '#1a1f2a';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Cardinals
+  const dirs = ['N','E','S','W'];
+  ctx.font = '10px IBM Plex Mono, monospace';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  dirs.forEach((d,i)=>{
+    const a = i*Math.PI/2 - Math.PI/2;
+    const x = cx + (r+12)*Math.cos(a), y = cy + (r+12)*Math.sin(a);
+    ctx.fillStyle = d==='N' ? '#ef4444' : '#5c6370';
+    ctx.fillText(d, x, y);
+  });
+
+  // Arrow
+  const a = theta - Math.PI/2;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(a);
+  // North (red)
+  ctx.beginPath();
+  ctx.moveTo(0, -r+8);
+  ctx.lineTo(5, 0);
+  ctx.lineTo(-5, 0);
+  ctx.closePath();
+  ctx.fillStyle = '#ef4444';
+  ctx.fill();
+  // South (gray)
+  ctx.beginPath();
+  ctx.moveTo(0, r-8);
+  ctx.lineTo(4, 0);
+  ctx.lineTo(-4, 0);
+  ctx.closePath();
+  ctx.fillStyle = '#2c3042';
+  ctx.fill();
+  ctx.restore();
+}
+
+// ════════════════════════════════════════════
+// ODOMETRY MAP
+// ════════════════════════════════════════════
+function drawOdomMap(){
+  const canvas = document.getElementById('odomCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  const gStep = state.mapScale; // 1m grid
+  const ox = state.mapOffset.x % gStep;
+  const oy = state.mapOffset.y % gStep;
+  for(let x = ox; x < W; x+=gStep){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for(let y = oy; y < H; y+=gStep){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+  // Axes
+  const aox = state.mapOffset.x, aoy = state.mapOffset.y;
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(aox,0); ctx.lineTo(aox,H); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,aoy); ctx.lineTo(W,aoy); ctx.stroke();
+
+  // Scale label
+  ctx.fillStyle = 'rgba(92,99,112,0.8)';
+  ctx.font = '9px IBM Plex Mono, monospace';
+  ctx.fillText('1 m', aox + gStep + 2, aoy - 3);
+
+  // Path
+  if(state.path.length > 1){
+    ctx.beginPath();
+    ctx.moveTo(aox + state.path[0].x*state.mapScale, aoy - state.path[0].y*state.mapScale);
+    for(let i=1;i<state.path.length;i++){
+      ctx.lineTo(aox + state.path[i].x*state.mapScale, aoy - state.path[i].y*state.mapScale);
+    }
+    ctx.strokeStyle = 'rgba(0,229,160,0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // Robot dot + heading arrow
+  const rx = aox + state.x*state.mapScale;
+  const ry = aoy - state.y*state.mapScale;
+  // glow
+  const grd = ctx.createRadialGradient(rx,ry,0,rx,ry,12);
+  grd.addColorStop(0,'rgba(0,229,160,0.3)');
+  grd.addColorStop(1,'rgba(0,229,160,0)');
+  ctx.beginPath();
+  ctx.arc(rx,ry,12,0,Math.PI*2);
+  ctx.fillStyle=grd; ctx.fill();
+  // dot
+  ctx.beginPath();
+  ctx.arc(rx,ry,5,0,Math.PI*2);
+  ctx.fillStyle='#00e5a0'; ctx.fill();
+  // heading
+  const hx = rx + 14*Math.cos(-state.theta + Math.PI/2);
+  const hy = ry - 14*Math.sin(-state.theta + Math.PI/2);
+
+  // arrow
+  ctx.save();
+  ctx.translate(rx,ry);
+  ctx.rotate(-state.theta);
+  ctx.beginPath();
+  ctx.moveTo(0,-14);
+  ctx.lineTo(4,-6);
+  ctx.lineTo(-4,-6);
+  ctx.closePath();
+  ctx.fillStyle='#ffffff';
+  ctx.fill();
+  ctx.restore();
+
+  // Start marker
+  const sx = aox, sy = aoy;
+  ctx.beginPath();
+  ctx.arc(sx,sy,3,0,Math.PI*2);
+  ctx.fillStyle='rgba(245,158,11,0.8)'; ctx.fill();
+  ctx.fillStyle='rgba(92,99,112,0.6)';
+  ctx.font='9px IBM Plex Mono, monospace';
+  ctx.fillText('origin', sx+5, sy+3);
+}
+
+// ════════════════════════════════════════════
+// REFLECTANCE CELLS
+// ════════════════════════════════════════════
+function initReflectance(){
+  const row = document.getElementById('reflRow');
+  row.innerHTML = '';
+  for(let i=0;i<8;i++){
+    const cell = document.createElement('div');
+    cell.className = 'refl-cell';
+    cell.id = `refl-${i}`;
+    cell.textContent = i+1;
+    row.appendChild(cell);
+  }
+}
+
+function updateReflectance(){
+  let center = 0, active = 0;
+  state.refl.forEach((v,i)=>{
+    const cell = document.getElementById(`refl-${i}`);
+    if(v){ cell.className='refl-cell active'; center += i; active++; }
+    else  cell.className='refl-cell';
+  });
+  const lbl = document.getElementById('reflCenter');
+  if(active>0) lbl.textContent = `Center: ${(center/active).toFixed(1)} / 7`;
+  else          lbl.textContent = 'Center: No line detected';
+}
+
+// ════════════════════════════════════════════
+// SENSOR BARS
+// ════════════════════════════════════════════
+function setSensorBar(id, lblId, dist, maxDist=2.5){
+  const pct = Math.min(dist/maxDist*100, 100);
+  const fill = document.getElementById(id);
+  fill.style.width = pct + '%';
+  if(dist < 0.3){ fill.className='sensor-bar-fill danger'; }
+  else if(dist < 0.6){ fill.className='sensor-bar-fill warn'; }
+  else { fill.className='sensor-bar-fill'; }
+  document.getElementById(lblId).textContent = dist.toFixed(2)+'m';
+}
+
+// ════════════════════════════════════════════
+// LOG
+// ════════════════════════════════════════════
+function log(msg, type=''){
+  const panel = document.getElementById('logPanel');
+  const now = new Date().toLocaleTimeString('es-MX',{hour12:false});
+  const line = document.createElement('div');
+  line.className='log-line';
+  line.innerHTML=`<span class="log-time">${now}</span><span class="log-msg ${type}">${msg}</span>`;
+  panel.appendChild(line);
+  if(panel.children.length > 80) panel.removeChild(panel.firstChild);
+  panel.scrollTop = panel.scrollHeight;
+}
+
+// ════════════════════════════════════════════
+// KINEMATICS
+// ════════════════════════════════════════════
+function setText(id, val){ const el=document.getElementById(id); if(el) el.textContent=val; }
+
+function applyVelocity(v, w){
+  state.linVel = v;
+  state.angVel = w;
+  state.wL = (v - w*L/2)/R * (motorState.invL ? -1 : 1);
+  state.wR = (v + w*L/2)/R * (motorState.invR ? -1 : 1);
+  setText('kV', v.toFixed(2)+' m/s');
+  setText('kW', w.toFixed(2)+' rad/s');
+  setText('encOmL', motorState.encL ? state.wL.toFixed(2) : '—');
+  setText('encOmR', motorState.encR ? state.wR.toFixed(2) : '—');
+  setText('rpmL',   motorState.encL ? String(Math.round(state.wL*60/(2*Math.PI))) : '—');
+  setText('rpmR',   motorState.encR ? String(Math.round(state.wR*60/(2*Math.PI))) : '—');
+  setText('encV', v.toFixed(2));
+  setText('encW', w.toFixed(2));
+  document.getElementById('motionTag').textContent = (v!==0||w!==0)?'MOVING':'IDLE';
+  document.getElementById('motionTag').className = 'tag ' + (v!==0||w!==0?'ok':'info');
+  updateGauges();
+}
+
+// ════════════════════════════════════════════
+// ════════════════════════════════════════════
+// ROS CONNECTION
+// ════════════════════════════════════════════
+let ros = null;
+let cmdVelTopic = null;
+let msgRateCounter = 0;
+let lastRateT = Date.now();
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function updatePathFromOdom(){
+  const last = state.path[state.path.length-1];
+  if(Math.abs(state.x-last.x)>0.005 || Math.abs(state.y-last.y)>0.005){
+    state.path.push({x:state.x, y:state.y});
+    if(state.path.length > 2000) state.path.shift();
+  }
+}
+
+function updateAllUI(){
+  document.getElementById('posX').textContent = state.x.toFixed(2);
+  document.getElementById('posY').textContent = state.y.toFixed(2);
+  document.getElementById('headingVal').textContent = ((state.theta*180/Math.PI)%360).toFixed(1)+'°';
+  document.getElementById('distVal').textContent = state.dist.toFixed(2);
+  document.getElementById('ovX').textContent = 'X: '+state.x.toFixed(2)+' m';
+  document.getElementById('ovY').textContent = 'Y: '+state.y.toFixed(2)+' m';
+  document.getElementById('ovT').textContent = 'θ: '+((state.theta*180/Math.PI)%360).toFixed(1)+'°';
+  setSensorBar('bar-tof-front','lbl-tof-front', state.tofFront);
+  setSensorBar('bar-tof-left', 'lbl-tof-left',  state.tofLeft);
+  setSensorBar('bar-tof-right','lbl-tof-right', state.tofRight);
+  setSensorBar('bar-tof-rear', 'lbl-tof-rear',  state.tofRear);
+  setSensorBar('bar-lidar',    'lbl-lidar',      state.lidarMin, 5);
+  updateReflectance();
+  drawOdomMap();
+  drawCompass(state.theta);
+  updateGauges();
+  msgRateCounter++;
+  if(Date.now()-lastRateT >= 1000){
+    document.getElementById('msgRate').textContent = msgRateCounter;
+    msgRateCounter = 0;
+    lastRateT = Date.now();
+  }
+}
+
+// ── Quaternion → yaw ─────────────────────────────────────────────────────────
+function quatToYaw(q){
+  return Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z));
+}
+
+// ── ROS Connect ──────────────────────────────────────────────────────────────
+function rosConnect(){
+  const ip   = document.getElementById('ipInput').value.trim() || '192.168.1.120';
+  const wsUrl = `ws://${ip}:9090`;
+
+  if(ros){ try{ ros.close(); }catch(e){} }
+
+  ros = new ROSLIB.Ros({ url: wsUrl });
+  log(`Conectando a rosbridge: ${wsUrl}`, '');
+  document.getElementById('connBadge').textContent = '● CONNECTING';
+  document.getElementById('connBadge').className = 'topbar-badge';
+
+  ros.on('connection', () => {
+    document.getElementById('connBadge').textContent = '● CONNECTED';
+    document.getElementById('connBadge').style.background = 'var(--accent-dim)';
+    document.getElementById('connBadge').style.color = 'var(--accent)';
+    log('ROS bridge conectado', 'ok');
+    rosSubscribeAll();
+    rosSetupPublishers();
+  });
+
+  ros.on('error', (err) => {
+    document.getElementById('connBadge').textContent = '● ERROR';
+    document.getElementById('connBadge').style.background = 'var(--danger-dim)';
+    document.getElementById('connBadge').style.color = 'var(--danger)';
+    log('ROS bridge error: ' + (err.message||err), 'err');
+  });
+
+  ros.on('close', () => {
+    document.getElementById('connBadge').textContent = '● OFFLINE';
+    document.getElementById('connBadge').style.background = 'var(--bg3)';
+    document.getElementById('connBadge').style.color = 'var(--text3)';
+    log('ROS bridge desconectado', 'warn');
+    cmdVelTopic = null;
+    // Auto-retry after 3s
+    setTimeout(rosConnect, 3000);
+  });
+}
+
+// ── Publishers ───────────────────────────────────────────────────────────────
+function rosSetupPublishers(){
+  cmdVelTopic = new ROSLIB.Topic({
+    ros, name: '/cmd_vel',
+    messageType: 'geometry_msgs/Twist'
+  });
+  log('/cmd_vel publisher listo', 'ok');
+}
+
+// Override applyVelocity to also publish to ROS
+// (the original applyVelocity still runs for UI updates)
+const _applyVelocityBase = applyVelocity;
+function rosPublishCmdVel(v, w){
+  _applyVelocityBase(v, w);
+  if(!cmdVelTopic){ log('cmd_vel: sin conexión ROS', 'warn'); return; }
+  cmdVelTopic.publish(new ROSLIB.Message({
+    linear:  { x: v, y: 0, z: 0 },
+    angular: { x: 0, y: 0, z: w }
+  }));
+}
+// Replace global applyVelocity with ROS-aware version
+// NOTE: All control buttons already call applyVelocity —
+//       we patch it here so nothing else needs to change.
+window.applyVelocity = rosPublishCmdVel;
+
+// ── Subscribers ──────────────────────────────────────────────────────────────
+function rosSubscribeAll(){
+
+  // /odom — posición y velocidades reales
+  new ROSLIB.Topic({ ros, name: '/odom',
+    messageType: 'nav_msgs/Odometry', throttle_rate: 50
+  }).subscribe(msg => {
+    const prevX = state.x, prevY = state.y;
+    state.x     = msg.pose.pose.position.x;
+    state.y     = msg.pose.pose.position.y;
+    state.theta = quatToYaw(msg.pose.pose.orientation);
+    const dx = state.x - prevX, dy = state.y - prevY;
+    state.dist += Math.sqrt(dx*dx + dy*dy);
+    state.linVel = msg.twist.twist.linear.x;
+    state.angVel = msg.twist.twist.angular.z;
+    updatePathFromOdom();
+    updateAllUI();
+  });
+
+  // /joint_states — velocidades de rueda (encoders)
+  new ROSLIB.Topic({ ros, name: '/joint_states',
+    messageType: 'sensor_msgs/JointState', throttle_rate: 50
+  }).subscribe(msg => {
+    const li = msg.name.indexOf('left_wheel_joint');
+    const ri = msg.name.indexOf('right_wheel_joint');
+    if(li >= 0) state.wL = msg.velocity[li];
+    if(ri >= 0) state.wR = msg.velocity[ri];
+    updateGauges();
+    setText('rpmL', motorState.encL ? String(Math.round(state.wL*60/(2*Math.PI))) : '—');
+    setText('rpmR', motorState.encR ? String(Math.round(state.wR*60/(2*Math.PI))) : '—');
+  });
+
+  // /tof/front, left, right, rear — Time of Flight
+  const tofTopics = {
+    '/tof/front': 'tofFront',
+    '/tof/left':  'tofLeft',
+    '/tof/right': 'tofRight',
+    '/tof/rear':  'tofRear'
+  };
+  Object.entries(tofTopics).forEach(([topicName, stateKey]) => {
+    new ROSLIB.Topic({ ros, name: topicName,
+      messageType: 'sensor_msgs/Range', throttle_rate: 100
+    }).subscribe(msg => {
+      if(isFinite(msg.range) && msg.range > 0) state[stateKey] = msg.range;
+    });
+  });
+
+  // /scan — LiDAR (LaserScan) → toma el mínimo finito
+  new ROSLIB.Topic({ ros, name: '/scan',
+    messageType: 'sensor_msgs/LaserScan', throttle_rate: 200
+  }).subscribe(msg => {
+    const finite = msg.ranges.filter(r => isFinite(r) && r > 0.01);
+    if(finite.length) state.lidarMin = Math.min(...finite);
+  });
+
+  // /reflectance — array de 8 celdas IR
+  new ROSLIB.Topic({ ros, name: '/reflectance',
+    messageType: 'std_msgs/Int8MultiArray', throttle_rate: 50
+  }).subscribe(msg => {
+    if(msg.data && msg.data.length === 8) state.refl = Array.from(msg.data);
+  });
+
+  log('Suscripciones ROS activas: /odom /joint_states /scan /tof/* /reflectance', 'ok');
+}
+
+// ── Render loop (UI only — no simulation, datos vienen de ROS callbacks) ─────
+function simStep(){
+  // Sin ROS conectado, el loop solo mantiene el reloj y el mapa vivos
+  // pero no genera datos falsos
+  if(!ros || !ros.isConnected){
+    drawOdomMap();
+    drawCompass(state.theta);
+    updateGauges();
+  }
+  // msgRate se actualiza en updateAllUI() al llegar msgs de /odom
+  requestAnimationFrame(simStep);
+}
+
+// ════════════════════════════════════════════
+// EVENTS
+// ════════════════════════════════════════════
+
+// Submit velocity
+document.getElementById('submitVel').addEventListener('click',()=>{
+  const v = parseFloat(document.getElementById('linVelInput').value)||0;
+  const w = parseFloat(document.getElementById('angVelInput').value)||0;
+  applyVelocity(v, w);
+  log(`/cmd_vel published: v=${v.toFixed(2)} w=${w.toFixed(2)}`, 'ok');
+});
+
+// Kinematics parameter inputs — r and L are configurable physical constants
+document.getElementById('kRInput').addEventListener('change', function(){
+  const val = parseFloat(this.value);
+  if(isNaN(val) || val <= 0){ this.value = R.toFixed(3); return; }
+  R = val;
+  // Re-apply current velocity so wL/wR recalculate with new radius
+  applyVelocity(state.linVel, state.angVel);
+  log(`Wheel radius r updated: ${R.toFixed(3)} m`, 'ok');
+});
+
+document.getElementById('kLInput').addEventListener('change', function(){
+  const val = parseFloat(this.value);
+  if(isNaN(val) || val <= 0){ this.value = L.toFixed(3); return; }
+  L = val;
+  applyVelocity(state.linVel, state.angVel);
+  log(`Wheel base L updated: ${L.toFixed(3)} m`, 'ok');
+});
+
+// Control buttons
+const btnStep = () => parseFloat(document.getElementById('stepSpeedSlider').value);
+
+function pressCtrl(v, w, label){
+  applyVelocity(v, w);
+  document.getElementById('linVelInput').value = v.toFixed(2);
+  document.getElementById('angVelInput').value = w.toFixed(2);
+  log(`Control: ${label}`, 'ok');
+}
+
+document.getElementById('btnFwd').addEventListener('click',  ()=>pressCtrl(btnStep(), 0, 'Forward'));
+document.getElementById('btnBack').addEventListener('click', ()=>pressCtrl(-btnStep(), 0, 'Reverse'));
+document.getElementById('btnLeft').addEventListener('click', ()=>pressCtrl(0, 1.0, 'Turn Left'));
+document.getElementById('btnRight').addEventListener('click',()=>pressCtrl(0, -1.0, 'Turn Right'));
+document.getElementById('btnStop').addEventListener('click', ()=>{
+  pressCtrl(0, 0, 'STOP');
+  document.getElementById('linVelInput').value = '0.00';
+  document.getElementById('angVelInput').value = '0.00';
+});
+
+// Keyboard control
+const WASD_ACTIVE = {w:false,a:false,s:false,d:false};
+document.addEventListener('keydown',(e)=>{
+  if(['w','a','s','d',' '].includes(e.key.toLowerCase())){
+    e.preventDefault();
+    const k = e.key.toLowerCase();
+    if(k==='w')      pressCtrl(btnStep(), 0, 'Fwd [W]');
+    else if(k==='s') pressCtrl(-btnStep(), 0, 'Rev [S]');
+    else if(k==='a') pressCtrl(0, 1.0, 'Left [A]');
+    else if(k==='d') pressCtrl(0, -1.0, 'Right [D]');
+    else if(k===' ') pressCtrl(0, 0, 'STOP [Space]');
+  }
+});
+
+// Step speed slider
+document.getElementById('stepSpeedSlider').addEventListener('input',function(){
+  document.getElementById('stepSpeedVal').textContent = parseFloat(this.value).toFixed(2)+' m/s';
+});
+
+// Mode toggle (on-screen / keyboard)
+document.querySelectorAll('.mode-opt').forEach(el=>{
+  el.addEventListener('click',()=>{
+    document.querySelectorAll('.mode-opt').forEach(x=>x.classList.remove('active'));
+    el.classList.add('active');
+    log(`Control mode: ${el.dataset.mode}`, '');
+  });
+});
+
+// ── MOTOR PANEL: render según control mode ──────────────────────────────────
+const motorState = {
+  invL: false, invR: true, encL: true, encR: true,
+  pwmL: 0, pwmR: 0, wLCmd: 0, wRCmd: 0,
+  ticksL: 540, ticksR: 540,
+  maxRpm: 150
+};
+
+// Editable input — white bg tinted, accent border on focus
+function inputHtml(id, val, type='number', extra=''){
+  return `<input type="${type}" id="${id}" value="${val}" ${extra}
+    style="width:100%;height:26px;background:var(--bg3);border:1px solid var(--border2);
+    border-radius:var(--r);color:var(--text);font-family:var(--mono);font-size:11px;
+    padding:0 4px;outline:none;transition:border-color 0.15s;"
+    onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border2)'">`;
+}
+
+// Read-only display — darker, muted, clearly not interactive
+function roHtml(id, val, colspan=1){
+  const cs = colspan > 1 ? `colspan="${colspan}"` : '';
+  return `<td ${cs} id="${id}"
+    style="background:var(--bg);border-radius:4px;padding:3px 5px;
+    color:var(--text3);font-family:var(--mono);font-size:11px;
+    border:1px solid var(--border);letter-spacing:0.2px;text-align:center;">${val}</td>`;
+}
+
+function toggleHtml(id, checked){
+  // Input sits ABOVE the decorative divs in z-order so clicks always reach it.
+  // opacity:0 + full cover = invisible but fully interactive.
+  return `<label class="toggle" style="transform:scale(0.85);transform-origin:left;display:inline-block;position:relative;">
+    <div class="toggle-track" style="position:absolute;inset:0;z-index:0;"></div>
+    <div class="toggle-thumb" id="thumb_${id}" style="position:absolute;top:2px;left:${checked?'16px':'2px'};z-index:1;background:${checked?'var(--accent)':'var(--text3)'};width:12px;height:12px;border-radius:50%;transition:left 0.2s,background 0.2s;pointer-events:none;"></div>
+    <input type="checkbox" id="${id}" ${checked?'checked':''}
+      style="position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;z-index:2;margin:0;"
+      onchange="
+        const thumb=document.getElementById('thumb_${id}');
+        if(thumb){thumb.style.left=this.checked?'16px':'2px';thumb.style.background=this.checked?'var(--accent)':'var(--text3)';}
+        const track=this.parentElement.querySelector('.toggle-track');
+        if(track){track.style.background=this.checked?'var(--accent-dim)':'';track.style.borderColor=this.checked?'var(--accent)':'';}
+      ">
+  </label>`;
+}
+
+// Shared config rows present in all modes
+function configRows(){
+  return `
+    <tr>
+      <td style="color:var(--text2);font-family:var(--sans);font-size:11px;">Invert Dir</td>
+      <td>${toggleHtml('invL', motorState.invL)}</td>
+      <td>${toggleHtml('invR', motorState.invR)}</td>
+    </tr>
+    <tr>
+      <td style="color:var(--text2);font-family:var(--sans);font-size:11px;">Encoders</td>
+      <td>${toggleHtml('encL', motorState.encL)}</td>
+      <td>${toggleHtml('encR', motorState.encR)}</td>
+    </tr>
+    <tr>
+      <td style="color:var(--text2);font-family:var(--sans);font-size:11px;">Ticks/Rev</td>
+      <td>${inputHtml('ticksL', motorState.ticksL, 'number', 'min="1" max="9999" step="1"')}</td>
+      <td>${inputHtml('ticksR', motorState.ticksR, 'number', 'min="1" max="9999" step="1"')}</td>
+    </tr>`;
+}
+
+function renderMotorPanel(mode){
+  const p = document.getElementById('motorParamsPanel');
+  const th = (t) => `<th>${t}</th>`;
+  const tdL = (label) => `<td style="color:var(--text2);font-family:var(--sans);font-size:10px;line-height:1.3;vertical-align:middle;padding:4px 2px 4px 0;">${label}</td>`;
+
+  // Separator row with label
+  const sep = (label) => `<tr><td colspan="3"
+    style="padding:4px 0 2px;font-size:8.5px;text-transform:uppercase;letter-spacing:0.8px;color:var(--text3);
+    border-top:1px solid var(--border);">
+    ${label}</td></tr>`;
+
+  let rows = configRows();
+
+  if(mode === 0){ // Robot Velocities
+    rows += sep('— Live readings (read-only)');
+    rows += `
+      <tr>${tdL('RPM')}${roHtml('rpmL','0')}${roHtml('rpmR','0')}</tr>
+      <tr>${tdL('ω actual (rad/s)')}${roHtml('encOmL','0.00')}${roHtml('encOmR','0.00')}</tr>
+      <tr>${tdL('v published (m/s)')}${roHtml('encV','0.00',2)}</tr>
+      <tr>${tdL('ω published (rad/s)')}${roHtml('encW','0.00',2)}</tr>`;
+
+  } else if(mode === 1){ // Wheel Speeds
+    rows += sep('— Setpoints (editable)');
+    rows += `
+      <tr>
+        ${tdL('ωL cmd (rad/s)')}
+        <td colspan="2">${inputHtml('wLCmd', motorState.wLCmd.toFixed(2), 'number', 'step="0.1" min="-20" max="20"')}</td>
+      </tr>
+      <tr>
+        ${tdL('ωR cmd (rad/s)')}
+        <td colspan="2">${inputHtml('wRCmd', motorState.wRCmd.toFixed(2), 'number', 'step="0.1" min="-20" max="20"')}</td>
+      </tr>`;
+    rows += sep('— Live readings (read-only)');
+    rows += `
+      <tr>${tdL('ωL actual (rad/s)')}${roHtml('encOmL','0.00')}${roHtml('encOmR','0.00')}</tr>
+      <tr>${tdL('RPM')}${roHtml('rpmL','0')}${roHtml('rpmR','0')}</tr>`;
+
+  } else { // Open Loop
+    rows += `<tr><td colspan="3"
+      style="padding:5px 0 3px;color:var(--warn);font-family:var(--sans);font-size:10px;">
+      ⚠ No feedback — encoders ignored</td></tr>`;
+    rows += sep('— Commands (editable)');
+    rows += `
+      <tr>${tdL('PWM Left %')}<td colspan="2">
+        <input type="range" id="pwmL" min="-100" max="100" step="1" value="${motorState.pwmL}" style="width:100%;margin-bottom:2px;">
+        <div style="text-align:center;font-family:var(--mono);font-size:11px;color:var(--accent);" id="pwmLVal">${motorState.pwmL}%</div>
+      </td></tr>
+      <tr>${tdL('PWM Right %')}<td colspan="2">
+        <input type="range" id="pwmR" min="-100" max="100" step="1" value="${motorState.pwmR}" style="width:100%;margin-bottom:2px;">
+        <div style="text-align:center;font-family:var(--mono);font-size:11px;color:var(--accent);" id="pwmRVal">${motorState.pwmR}%</div>
+      </td></tr>`;
+    rows += sep('— Estimated readings (read-only)');
+    rows += `<tr>${tdL('Est. RPM')}${roHtml('rpmL','0')}${roHtml('rpmR','0')}</tr>`;
+  }
+
+  p.innerHTML = `<table class="encoder-table" style="table-layout:fixed;width:100%;">
+    <colgroup><col style="width:38%"><col style="width:31%"><col style="width:31%"></colgroup>
+    <thead><tr>${th('')}${th('Left')}${th('Right')}</tr></thead>
+    <tbody>${rows}</tbody></table>`;
+
+  // Toggle state is handled by event delegation on #motorParamsPanel below
+  // (no per-element listeners needed here — they would double-fire)
+
+  // Wire Ticks/Rev — affects encoder resolution display
+  ['ticksL','ticksR'].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el) el.addEventListener('change',()=>{
+      motorState[id] = parseInt(el.value)||540;
+      log(`${id}: ${motorState[id]} ticks/rev`, 'ok');
+    });
+  });
+
+  // Wire wheel speed setpoints (mode 1)
+  if(mode === 1){
+    ['wLCmd','wRCmd'].forEach(id=>{
+      const el = document.getElementById(id);
+      if(el) el.addEventListener('change',()=>{
+        motorState[id] = parseFloat(el.value)||0;
+        const v = (motorState.wLCmd + motorState.wRCmd)/2 * R;
+        const w = (motorState.wRCmd - motorState.wLCmd)/L * R;
+        applyVelocity(v, w);
+        document.getElementById('linVelInput').value = v.toFixed(2);
+        document.getElementById('angVelInput').value = w.toFixed(2);
+        log(`Wheel cmd: ωL=${motorState.wLCmd.toFixed(2)} ωR=${motorState.wRCmd.toFixed(2)} rad/s`, 'ok');
+      });
+    });
+  }
+
+  // Wire PWM sliders (mode 2)
+  if(mode === 2){
+    ['pwmL','pwmR'].forEach(id=>{
+      const el = document.getElementById(id);
+      if(!el) return;
+      el.addEventListener('input',()=>{
+        motorState[id] = parseInt(el.value);
+        document.getElementById(id+'Val').textContent = motorState[id]+'%';
+        const wL = (motorState.pwmL/100)*15 * (motorState.invL?-1:1);
+        const wR = (motorState.pwmR/100)*15 * (motorState.invR?-1:1);
+        const v = (wL+wR)/2*R, w2 = (wR-wL)/L*R;
+        applyVelocity(v, w2);
+      });
+    });
+  }
+}
+
+// Init and wire select
+renderMotorPanel(0);
+document.getElementById('controlMode').addEventListener('change', function(){
+  const idx = this.selectedIndex;
+  const names = ['Robot Velocities (v and ω)', 'Wheel Speeds (ωL, ωR)', 'Open Loop'];
+  renderMotorPanel(idx);
+  log(`Control mode changed → ${names[idx]}`, 'ok');
+});
+
+// Patch applyVelocity to also update extra fields in mode 0
+const _origApply = applyVelocity;
+// (applyVelocity is already defined above, we update extra cells if present)
+function updateMotorPanelLive(){
+  const mode = document.getElementById('controlMode').selectedIndex;
+  if(mode === 0){
+    const vEl = document.getElementById('encV');
+    const wEl = document.getElementById('encW');
+    if(vEl) vEl.textContent = state.linVel.toFixed(2);
+    if(wEl) wEl.textContent = state.angVel.toFixed(2);
+  }
+}
+
+// Clear path
+document.getElementById('clearPath').addEventListener('click',()=>{
+  state.path = [{x:state.x, y:state.y}];
+  log('Odometry path cleared', 'warn');
+});
+
+// Clear log
+document.getElementById('clearLog').addEventListener('click',()=>{
+  document.getElementById('logPanel').innerHTML='';
+});
+
+// Reset defaults
+document.getElementById('resetBtn').addEventListener('click',()=>{
+  applyVelocity(0, 0);
+  document.getElementById('linVelInput').value='0.00';
+  document.getElementById('angVelInput').value='0.00';
+  log('Reset to default config', 'warn');
+});
+
+// Restart
+document.getElementById('restartBtn').addEventListener('click',()=>{
+  applyVelocity(0,0);
+  state.x=0; state.y=0; state.theta=0; state.dist=0;
+  state.path=[{x:0,y:0}];
+  state.startTime=Date.now();
+  log('Robot restarted. All state cleared.', 'err');
+});
+
+// Net save
+document.getElementById('netSaveBtn').addEventListener('click',()=>{
+  const ssid = document.getElementById('ssidInput').value;
+  const ip   = document.getElementById('ipInput').value;
+  log(`Network saved. SSID: ${ssid}  Bridge: ${ip}`, 'ok');
+});
+
+// Module toggles
+['servo','tof-sonar','tof-laser','refl','lidar','cam'].forEach(id=>{
+  const tog = document.getElementById('tog-'+id);
+  if(!tog) return;
+  tog.addEventListener('change',()=>{
+    const dot = document.getElementById('dot-'+id);
+    if(dot) dot.className='module-dot'+(tog.checked?' on':'');
+    log(`Module ${id}: ${tog.checked?'enabled':'disabled'}`, tog.checked?'ok':'warn');
+    // Camera module toggle wires to camera card visibility
+    if(id==='cam'){
+      if(tog.checked){ camConnect(); }
+      else { camDisconnect(); }
+    }
+    // Sensor modules: when disabled, zero out their readings
+    if(id==='tof-sonar'||id==='tof-laser'){
+      if(!tog.checked){
+        ['tofFront','tofLeft','tofRight','tofRear'].forEach(k=>{ if(!document.getElementById('tog-tof-sonar').checked && !document.getElementById('tog-tof-laser').checked) state[k]=0; });
+      }
+    }
+    if(id==='lidar'){ if(!tog.checked) state.lidarMin=0; }
+  });
+});
+
+// ── INVERT DIR / ENCODER TOGGLES ────────────────────────────────────────────
+// Event delegation: motorParamsPanel is the stable parent; children are re-rendered
+// on mode switch so we listen here instead of on each input directly.
+document.getElementById('motorParamsPanel').addEventListener('change', function(e){
+  const id = e.target.id;
+
+  // ── Ticks/Rev inputs ──
+  if(id === 'ticksL' || id === 'ticksR'){
+    motorState[id] = parseInt(e.target.value) || 540;
+    log(`${id}: ${motorState[id]} ticks/rev saved`, 'ok');
+    return;
+  }
+
+  // ── Wheel speed setpoints (mode 1) — handled here too for safety ──
+  if(id === 'wLCmd' || id === 'wRCmd'){
+    motorState[id] = parseFloat(e.target.value) || 0;
+    const v = (motorState.wLCmd + motorState.wRCmd) / 2 * R;
+    const w = (motorState.wRCmd - motorState.wLCmd) / L * R;
+    applyVelocity(v, w);
+    document.getElementById('linVelInput').value = v.toFixed(2);
+    document.getElementById('angVelInput').value = w.toFixed(2);
+    log(`Wheel cmd: ωL=${motorState.wLCmd.toFixed(2)} ωR=${motorState.wRCmd.toFixed(2)} rad/s`, 'ok');
+    return;
+  }
+
+  if(!['invL','invR','encL','encR'].includes(id)) return;
+  motorState[id] = e.target.checked;
+
+  // ── Invert Dir ──
+  // Flips wheel sign in applyVelocity (wL/wR *= -1 for that side).
+  // Re-calling applyVelocity with the current velocity immediately updates
+  // gauges, RPM display, and odometry integration direction.
+  if(id === 'invL' || id === 'invR'){
+    applyVelocity(state.linVel, state.angVel);
+    const side = id === 'invL' ? 'Left' : 'Right';
+    log(`Invert Dir ${side}: ${motorState[id] ? 'INVERTED' : 'normal'}`, 'ok');
+  }
+
+  // ── Encoder enable/disable ──
+  // When disabled: readings become undefined (—). Re-enabling resumes live values.
+  if(id === 'encL' || id === 'encR'){
+    const side = id === 'encL' ? 'Left' : 'Right';
+    if(!motorState[id]){
+      if(id === 'encL'){ setText('encOmL', '—'); setText('rpmL', '—'); }
+      else              { setText('encOmR', '—'); setText('rpmR', '—'); }
+      log(`Encoder ${side}: disabled — readings paused`, 'warn');
+    } else {
+      // Resume: force an immediate update so values appear right away
+      applyVelocity(state.linVel, state.angVel);
+      log(`Encoder ${side}: enabled`, 'ok');
+    }
+  }
+});
+
+// ── CAMERA LOGIC ────────────────────────────────────────────────────────────
+let camStream = null;
+let camAnimFrame = null;
+let camFpsCounter = 0;
+let camLastFpsT = Date.now();
+let camSimInterval = null;
+let camConnected = false;
+
+function camUpdateTag(state){
+  const tag = document.getElementById('camTag');
+  const map = {
+    offline:  {text:'OFFLINE', bg:'var(--bg3)',       color:'var(--text3)',  border:'var(--border2)'},
+    live:     {text:'LIVE',    bg:'var(--accent-dim)', color:'var(--accent)', border:'rgba(0,229,160,0.4)'},
+    error:    {text:'ERROR',   bg:'var(--danger-dim)', color:'var(--danger)', border:'rgba(239,68,68,0.4)'},
+    waiting:  {text:'WAITING', bg:'var(--warn-dim)',   color:'var(--warn)',   border:'rgba(245,158,11,0.4)'},
+  };
+  const s = map[state]||map.offline;
+  tag.textContent = s.text;
+  tag.style.cssText = `background:${s.bg};color:${s.color};border:1px solid ${s.border};font-size:10px;padding:2px 6px;border-radius:4px;font-family:var(--mono);`;
+}
+
+function camShowFeed(show){
+  document.getElementById('camPlaceholder').style.display = show ? 'none' : 'flex';
+  document.getElementById('camHud').style.display = show ? 'block' : 'none';
+}
+
+function camSetFps(fps){
+  setText('camFpsLabel', fps+' fps');
+}
+
+function camConnect(){
+  const src = document.querySelector('#camSourceToggle .mode-opt.active')?.dataset?.src || 'ros';
+  camUpdateTag('waiting');
+  log('Camera: connecting via '+src+'...', '');
+
+  if(src === 'device'){
+    navigator.mediaDevices.getUserMedia({video:{width:640,height:480}})
+      .then(stream=>{
+        camStream = stream;
+        const video = document.getElementById('camVideo');
+        video.srcObject = stream;
+        video.style.display = 'block';
+        document.getElementById('camCanvas').style.display = 'none';
+        camShowFeed(true);
+        camConnected = true;
+        camUpdateTag('live');
+        document.getElementById('camSnapshotBtn').disabled = false;
+        document.getElementById('camResLabel').textContent = '640×480';
+        setText('camTopicLabel', 'Local webcam');
+        log('Camera: local device connected', 'ok');
+        // FPS counter
+        const track = stream.getVideoTracks()[0];
+        const settings = track.getSettings();
+        if(settings.width) document.getElementById('camResLabel').textContent = settings.width+'×'+settings.height;
+        startCamFps();
+      })
+      .catch(err=>{
+        camUpdateTag('error');
+        log('Camera: device error — '+err.message, 'err');
+      });
+    return;
+  }
+
+  if(src === 'mjpeg'){
+    const url = document.getElementById('camUrlInput').value.trim();
+    if(!url){ camUpdateTag('error'); log('Camera: no URL provided', 'err'); return; }
+    const img = new Image();
+    img.onload = ()=>{
+      const canvas = document.getElementById('camCanvas');
+      canvas.width = img.naturalWidth||640;
+      canvas.height = img.naturalHeight||480;
+      canvas.style.display = 'block';
+      document.getElementById('camVideo').style.display = 'none';
+      camShowFeed(true);
+      camConnected = true;
+      camUpdateTag('live');
+      document.getElementById('camResLabel').textContent = canvas.width+'×'+canvas.height;
+      document.getElementById('camSnapshotBtn').disabled = false;
+      log('Camera: MJPEG stream connected', 'ok');
+    };
+    img.onerror = ()=>{ camUpdateTag('error'); log('Camera: MJPEG stream unreachable', 'err'); };
+    img.src = url;
+    return;
+  }
+
+  // ROS / WebRTC: simulate feed (replace with actual roslib/WebRTC in production)
+  camStartSimFeed();
+}
+
+function camStartSimFeed(){
+  const canvas = document.getElementById('camCanvas');
+  canvas.width = 640; canvas.height = 360;
+  canvas.style.display = 'block';
+  document.getElementById('camVideo').style.display = 'none';
+  camShowFeed(true);
+  camConnected = true;
+  camUpdateTag('live');
+  document.getElementById('camResLabel').textContent = '640×360';
+  document.getElementById('camSnapshotBtn').disabled = false;
+  document.getElementById('camArucoBadge').style.display = 'block';
+  setText('camTopicLabel', '/camera/image_raw');
+  log('Camera: ROS topic stream active (simulated)', 'ok');
+
+  const ctx = canvas.getContext('2d');
+  let t = 0;
+  let arucoFrames = 0;
+
+  function drawSimFrame(){
+    if(!camConnected) return;
+    t += 0.03;
+    const W = canvas.width, H = canvas.height;
+    ctx.fillStyle = '#0d1117';
+    ctx.fillRect(0,0,W,H);
+
+    // Simulated camera perspective grid (floor)
+    ctx.strokeStyle = 'rgba(0,229,160,0.06)';
+    ctx.lineWidth = 1;
+    for(let i=0;i<20;i++){
+      const y = H*0.45 + i*(H*0.55/20);
+      const spread = (i/20)*W*0.5;
+      ctx.beginPath(); ctx.moveTo(W/2-spread, y); ctx.lineTo(W/2+spread, y); ctx.stroke();
+    }
+    for(let i=-8;i<=8;i++){
+      ctx.beginPath();
+      ctx.moveTo(W/2+i*(W/16), H*0.45);
+      ctx.lineTo(W/2+i*(W/2), H);
+      ctx.stroke();
+    }
+
+    // Horizon line
+    ctx.strokeStyle='rgba(0,229,160,0.12)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(0,H*0.45); ctx.lineTo(W,H*0.45); ctx.stroke();
+
+    // Simulated ArUco marker (drifts slightly)
+    if(document.getElementById('arucoToggle').checked){
+      arucoFrames++;
+      const mx = W/2 + Math.sin(t*0.4)*60;
+      const my = H*0.35 + Math.cos(t*0.3)*20;
+      const ms = 50 + Math.sin(t*0.2)*8;
+      // Marker border
+      ctx.strokeStyle='rgba(0,229,160,0.9)';
+      ctx.lineWidth=2;
+      ctx.strokeRect(mx-ms/2, my-ms/2, ms, ms);
+      // Corner dots
+      [[mx-ms/2,my-ms/2],[mx+ms/2,my-ms/2],[mx+ms/2,my+ms/2],[mx-ms/2,my+ms/2]].forEach(([cx,cy])=>{
+        ctx.beginPath(); ctx.arc(cx,cy,3,0,Math.PI*2);
+        ctx.fillStyle='#00e5a0'; ctx.fill();
+      });
+      // ID label
+      ctx.fillStyle='rgba(0,229,160,0.9)';
+      ctx.font='bold 11px IBM Plex Mono, monospace';
+      ctx.textAlign='center';
+      ctx.fillText('ID: 7', mx, my-ms/2-5);
+      // Distance estimate
+      ctx.fillStyle='rgba(255,255,255,0.5)';
+      ctx.font='10px IBM Plex Mono, monospace';
+      ctx.fillText((0.45+Math.sin(t*0.15)*0.05).toFixed(2)+'m', mx, my+ms/2+14);
+      setText('camArucoCount','1');
+    } else {
+      setText('camArucoCount','0');
+    }
+
+    // Scan line effect
+    const scanY = ((t*60)%H);
+    const grad = ctx.createLinearGradient(0,scanY-8,0,scanY+8);
+    grad.addColorStop(0,'rgba(0,229,160,0)');
+    grad.addColorStop(0.5,'rgba(0,229,160,0.06)');
+    grad.addColorStop(1,'rgba(0,229,160,0)');
+    ctx.fillStyle=grad;
+    ctx.fillRect(0,scanY-8,W,16);
+
+    // Timestamp
+    const now = new Date();
+    setText('camTimestamp', now.toLocaleTimeString('es-MX',{hour12:false})+'.'+String(now.getMilliseconds()).padStart(3,'0'));
+
+    // FPS
+    camFpsCounter++;
+    if(Date.now()-camLastFpsT >= 1000){
+      camSetFps(camFpsCounter);
+      camFpsCounter=0;
+      camLastFpsT=Date.now();
+    }
+
+    camAnimFrame = requestAnimationFrame(drawSimFrame);
+  }
+  drawSimFrame();
+}
+
+function startCamFps(){
+  const video = document.getElementById('camVideo');
+  function tick(){
+    if(!camConnected) return;
+    camFpsCounter++;
+    if(Date.now()-camLastFpsT>=1000){ camSetFps(camFpsCounter); camFpsCounter=0; camLastFpsT=Date.now(); }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
+function camDisconnect(){
+  camConnected = false;
+  if(camStream){ camStream.getTracks().forEach(t=>t.stop()); camStream=null; }
+  if(camAnimFrame){ cancelAnimationFrame(camAnimFrame); camAnimFrame=null; }
+  document.getElementById('camVideo').style.display='none';
+  document.getElementById('camCanvas').style.display='none';
+  document.getElementById('camArucoBadge').style.display='none';
+  camShowFeed(false);
+  camUpdateTag('offline');
+  document.getElementById('camSnapshotBtn').disabled=true;
+  document.getElementById('camResLabel').textContent='—';
+  log('Camera: disconnected', 'warn');
+}
+
+document.getElementById('camConnectBtn').addEventListener('click',()=>{
+  if(camConnected){ camDisconnect(); document.getElementById('camConnectBtn').textContent='Connect'; }
+  else { camConnect(); document.getElementById('camConnectBtn').textContent='Disconnect'; }
+});
+
+document.getElementById('camSnapshotBtn').addEventListener('click',()=>{
+  const canvas = document.getElementById('camCanvas');
+  const video  = document.getElementById('camVideo');
+  let snap;
+  if(video.style.display!=='none' && video.srcObject){
+    const c = document.createElement('canvas');
+    c.width=video.videoWidth; c.height=video.videoHeight;
+    c.getContext('2d').drawImage(video,0,0);
+    snap = c;
+  } else { snap = canvas; }
+  const a = document.createElement('a');
+  a.download = 'puzzlebot_cam_'+Date.now()+'.png';
+  a.href = snap.toDataURL('image/png');
+  a.click();
+  log('Camera: snapshot saved', 'ok');
+});
+
+// Camera source toggle
+document.querySelectorAll('#camSourceToggle .mode-opt').forEach(el=>{
+  el.addEventListener('click',()=>{
+    document.querySelectorAll('#camSourceToggle .mode-opt').forEach(x=>x.classList.remove('active'));
+    el.classList.add('active');
+    const urlRow = document.getElementById('camUrlRow');
+    urlRow.style.display = ['webrtc','mjpeg'].includes(el.dataset.src) ? 'flex' : 'none';
+    if(camConnected){ camDisconnect(); document.getElementById('camConnectBtn').textContent='Connect'; }
+  });
+});
+
+// ArUco toggle
+document.getElementById('arucoToggle').addEventListener('change', function(){
+  document.getElementById('arucoSettings').style.display = this.checked ? 'grid' : 'none';
+  document.getElementById('camArucoBadge').style.display = (this.checked && camConnected) ? 'block' : 'none';
+  log('ArUco detection: '+(this.checked?'enabled':'disabled'), this.checked?'ok':'warn');
+});
+
+// ════════════════════════════════════════════
+// INIT
+// ════════════════════════════════════════════
+initReflectance();
+updateGauges();
+drawCompass(0);
+drawOdomMap();
+
+log('PuzzleBot Control Center initialized', 'ok');
+log('ROS2 Humble / Jetson Lidar Edition', 'ok');
+// Wire Save & Reconnect to rosConnect
+document.getElementById('netSaveBtn').addEventListener('click', ()=>{ rosConnect(); });
+
+// Auto-connect on load
+rosConnect();
+
+log('PuzzleBot ROS Dashboard inicializado', 'ok');
+log('Intentando conectar a rosbridge...', '');
+
+
+// ── TAB SWITCHING ────────────────────────────────────────────────────────────
+function switchTab(name){
+  const panels = ['control','telem','sys'];
+  panels.forEach(p => {
+    const panel = document.getElementById('panel-'+p);
+    const btn   = document.getElementById('tab-'+p);
+    if(panel) panel.style.display = (p===name) ? 'flex' : 'none';
+    if(btn)   btn.classList.toggle('active', p===name);
+  });
+  // Re-draw canvases that may have been hidden (canvas size = 0 when display:none)
+  if(name === 'telem'){
+    drawOdomMap();
+    drawCompass(state.theta);
+  }
+  if(name === 'control'){
+    updateGauges();
+  }
+  log(`Tab: ${name}`, '');
+}
+
+requestAnimationFrame(simStep);
+</script>
+</body>
+</html>
