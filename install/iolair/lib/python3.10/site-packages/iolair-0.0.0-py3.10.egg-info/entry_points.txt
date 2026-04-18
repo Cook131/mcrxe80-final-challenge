@@ -1,0 +1,5 @@
+[console_scripts]
+controlador = iolair.PuzzlebotController:main
+go_to_goal = iolair.puzzlebotGoToGoal:main
+odometria = iolair.puzzlebotOdometry:main
+

@@ -1,0 +1,32 @@
+running egg_info
+writing ../../build/iolair/iolair.egg-info/PKG-INFO
+writing dependency_links to ../../build/iolair/iolair.egg-info/dependency_links.txt
+writing entry points to ../../build/iolair/iolair.egg-info/entry_points.txt
+writing requirements to ../../build/iolair/iolair.egg-info/requires.txt
+writing top-level names to ../../build/iolair/iolair.egg-info/top_level.txt
+reading manifest file '../../build/iolair/iolair.egg-info/SOURCES.txt'
+writing manifest file '../../build/iolair/iolair.egg-info/SOURCES.txt'
+running build
+running build_py
+copying iolair/puzzlebotGoToGoal.py -> /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair
+copying iolair/puzzlebotController.py -> /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair
+copying iolair/puzzlebotOdometry.py -> /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair
+running install
+running install_lib
+copying /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair/puzzlebotGoToGoal.py -> /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair
+copying /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair/puzzlebotController.py -> /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair
+copying /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair/puzzlebotOdometry.py -> /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair
+byte-compiling /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair/puzzlebotGoToGoal.py to puzzlebotGoToGoal.cpython-310.pyc
+byte-compiling /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair/puzzlebotController.py to puzzlebotController.cpython-310.pyc
+byte-compiling /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair/puzzlebotOdometry.py to puzzlebotOdometry.cpython-310.pyc
+running install_data
+creating /home/serch/mcrxe80-final-challenge/install/iolair/share/iolair/launch
+copying launch/odometry.launch.py -> /home/serch/mcrxe80-final-challenge/install/iolair/share/iolair/launch
+running install_egg_info
+removing '/home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair-0.0.0-py3.10.egg-info' (and everything under it)
+Copying ../../build/iolair/iolair.egg-info to /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair-0.0.0-py3.10.egg-info
+running install_scripts
+Installing controlador script to /home/serch/mcrxe80-final-challenge/install/iolair/lib/iolair
+Installing go_to_goal script to /home/serch/mcrxe80-final-challenge/install/iolair/lib/iolair
+Installing odometria script to /home/serch/mcrxe80-final-challenge/install/iolair/lib/iolair
+writing list of installed files to '/home/serch/mcrxe80-final-challenge/build/iolair/install.log'

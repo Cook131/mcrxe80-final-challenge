@@ -1,0 +1,26 @@
+[0.687s] Invoking command in '/home/serch/mcrxe80-final-challenge/src/iolair': PYTHONPATH=/home/serch/mcrxe80-final-challenge/build/iolair/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/iolair build --build-base /home/serch/mcrxe80-final-challenge/build/iolair/build install --record /home/serch/mcrxe80-final-challenge/build/iolair/install.log --single-version-externally-managed install_data
+[0.901s] running egg_info
+[0.902s] writing ../../build/iolair/iolair.egg-info/PKG-INFO
+[0.902s] writing dependency_links to ../../build/iolair/iolair.egg-info/dependency_links.txt
+[0.902s] writing entry points to ../../build/iolair/iolair.egg-info/entry_points.txt
+[0.902s] writing requirements to ../../build/iolair/iolair.egg-info/requires.txt
+[0.902s] writing top-level names to ../../build/iolair/iolair.egg-info/top_level.txt
+[0.903s] reading manifest file '../../build/iolair/iolair.egg-info/SOURCES.txt'
+[0.904s] writing manifest file '../../build/iolair/iolair.egg-info/SOURCES.txt'
+[0.904s] running build
+[0.904s] running build_py
+[0.904s] copying iolair/puzzlebotGoToGoal.py -> /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair
+[0.905s] running install
+[0.905s] running install_lib
+[0.905s] copying /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair/puzzlebotGoToGoal.py -> /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair
+[0.906s] byte-compiling /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair/puzzlebotGoToGoal.py to puzzlebotGoToGoal.cpython-310.pyc
+[0.907s] running install_data
+[0.907s] running install_egg_info
+[0.908s] removing '/home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair-0.0.0-py3.10.egg-info' (and everything under it)
+[0.909s] Copying ../../build/iolair/iolair.egg-info to /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair-0.0.0-py3.10.egg-info
+[0.909s] running install_scripts
+[0.932s] Installing controlador script to /home/serch/mcrxe80-final-challenge/install/iolair/lib/iolair
+[0.932s] Installing go_to_goal script to /home/serch/mcrxe80-final-challenge/install/iolair/lib/iolair
+[0.932s] Installing odometria script to /home/serch/mcrxe80-final-challenge/install/iolair/lib/iolair
+[0.932s] writing list of installed files to '/home/serch/mcrxe80-final-challenge/build/iolair/install.log'
+[0.960s] Invoked command in '/home/serch/mcrxe80-final-challenge/src/iolair' returned '0': PYTHONPATH=/home/serch/mcrxe80-final-challenge/build/iolair/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/iolair build --build-base /home/serch/mcrxe80-final-challenge/build/iolair/build install --record /home/serch/mcrxe80-final-challenge/build/iolair/install.log --single-version-externally-managed install_data
