@@ -1,0 +1,37 @@
+running egg_info
+creating ../../build/iolair/iolair.egg-info
+writing ../../build/iolair/iolair.egg-info/PKG-INFO
+writing dependency_links to ../../build/iolair/iolair.egg-info/dependency_links.txt
+writing entry points to ../../build/iolair/iolair.egg-info/entry_points.txt
+writing requirements to ../../build/iolair/iolair.egg-info/requires.txt
+writing top-level names to ../../build/iolair/iolair.egg-info/top_level.txt
+writing manifest file '../../build/iolair/iolair.egg-info/SOURCES.txt'
+reading manifest file '../../build/iolair/iolair.egg-info/SOURCES.txt'
+writing manifest file '../../build/iolair/iolair.egg-info/SOURCES.txt'
+running build
+running build_py
+creating /home/serch/mcrxe80-final-challenge/build/iolair/build
+creating /home/serch/mcrxe80-final-challenge/build/iolair/build/lib
+creating /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair
+copying iolair/__init__.py -> /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair
+copying iolair/odometria.py -> /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair
+copying iolair/PuzzlebotController.py -> /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair
+running install
+running install_lib
+creating /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair
+copying /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair/__init__.py -> /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair
+copying /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair/odometria.py -> /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair
+copying /home/serch/mcrxe80-final-challenge/build/iolair/build/lib/iolair/PuzzlebotController.py -> /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair
+byte-compiling /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair/__init__.py to __init__.cpython-310.pyc
+byte-compiling /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair/odometria.py to odometria.cpython-310.pyc
+byte-compiling /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair/PuzzlebotController.py to PuzzlebotController.cpython-310.pyc
+running install_data
+creating /home/serch/mcrxe80-final-challenge/install/iolair/share/ament_index
+creating /home/serch/mcrxe80-final-challenge/install/iolair/share/ament_index/resource_index
+creating /home/serch/mcrxe80-final-challenge/install/iolair/share/ament_index/resource_index/packages
+copying resource/iolair -> /home/serch/mcrxe80-final-challenge/install/iolair/share/ament_index/resource_index/packages
+copying package.xml -> /home/serch/mcrxe80-final-challenge/install/iolair/share/iolair
+running install_egg_info
+Copying ../../build/iolair/iolair.egg-info to /home/serch/mcrxe80-final-challenge/install/iolair/lib/python3.10/site-packages/iolair-0.0.0-py3.10.egg-info
+running install_scripts
+writing list of installed files to '/home/serch/mcrxe80-final-challenge/build/iolair/install.log'
