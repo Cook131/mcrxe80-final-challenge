@@ -1,0 +1,166 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Map1
+        - /LaserScan1
+        - /MCL Pose1
+        - /Particles MCL1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+
+Visualization Manager:
+  Class: ""
+  Displays:
+
+    # ── Occupancy grid from map_publisher_node ──────────────────────────────
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Map
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map
+      Alpha: 0.8
+      Color Scheme: map
+      Draw Behind: false
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map_updates
+
+    # ── LiDAR scan (live sensor from Gazebo) ───────────────────────────────
+    - Class: rviz_default_plugins/LaserScan
+      Enabled: true
+      Name: LaserScan
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /lidar
+      Alpha: 1.0
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Color: 255; 0; 0
+      Color Transformer: FlatColor
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Position Transformer: XYZ
+      Size (m): 0.05
+      Style: Points
+
+    # ── MCL best-pose arrow ────────────────────────────────────────────────
+    - Class: rviz_default_plugins/Pose
+      Enabled: true
+      Name: MCL Pose
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /mcl_pose
+      Color: 61; 150; 255
+      Shaft Length: 0.4
+      Shaft Radius: 0.04
+      Head Length: 0.15
+      Head Radius: 0.08
+
+    # ── MCL particle cloud ─────────────────────────────────────────────────
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Particles MCL
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /particles
+
+    # ── Odometry trail ─────────────────────────────────────────────────────
+    - Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Name: Odometry
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /odom
+      Keep: 500
+      Angle Tolerance: 0.1
+      Position Tolerance: 0.1
+      Shape:
+        Alpha: 1
+        Axes Length: 0.15
+        Axes Radius: 0.01
+        Color: 255; 255; 0
+        Head Length: 0.07
+        Head Radius: 0.035
+        Shaft Length: 0.2
+        Shaft Radius: 0.02
+        Value: Arrow
+
+    # ── TF tree (helpful for debugging frame issues) ───────────────────────
+    - Class: rviz_default_plugins/TF
+      Enabled: false
+      Name: TF
+      Frame Timeout: 15
+      Marker Scale: 0.5
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+
+  # ── Global options ────────────────────────────────────────────────────────
+  Global Options:
+    Background Color: 40; 40; 40
+    Fixed Frame: map
+    Frame Rate: 30
+
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /initialpose
+
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Scale: 120
+      Target Frame: map
+      Value: TopDownOrtho (rviz_default_plugins)
+      X: 0
+      Y: 0
+
+  Window Geometry:
+    Displays:
+      collapsed: false
+    Height: 900
+    Hide Left Dock: false
+    Hide Right Dock: true
+    Width: 1400
+    X: 0
+    Y: 0

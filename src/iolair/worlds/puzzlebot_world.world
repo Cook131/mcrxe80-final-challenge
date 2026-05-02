@@ -1,0 +1,223 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="puzzlebot_world">
+
+    <include><uri>model://ground_plane</uri></include>
+    <include><uri>model://sun</uri></include>
+
+    <physics type="ode">
+      <max_step_size>0.005</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>100</real_time_update_rate>
+    </physics>
+
+    <!-- ══ PAREDES EXTERIORES ══ -->
+    <model name="wall_north">
+      <static>true</static><pose>0 1.45 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>4.5 0.1 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>4.5 0.1 0.8</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="wall_south">
+      <static>true</static><pose>0 -1.45 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>4.5 0.1 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>4.5 0.1 0.8</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static><pose>-2.30 0 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 2.8 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 2.8 0.8</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ══ PARED ESTE — 4 segmentos + 3 dinteles ══ -->
+    <model name="wall_east_seg1">
+      <static>true</static><pose>2.30 1.20 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 0.4 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 0.4 0.8</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="wall_east_seg2">
+      <static>true</static><pose>2.30 0.40 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 0.4 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 0.4 0.8</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="wall_east_seg3">
+      <static>true</static><pose>2.30 -0.40 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 0.4 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 0.4 0.8</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="wall_east_seg4">
+      <static>true</static><pose>2.30 -1.20 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 0.4 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 0.4 0.8</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="door_lintel_1">
+      <static>true</static><pose>2.30 0.80 0.70 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 0.4 0.2</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 0.4 0.2</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="door_lintel_2">
+      <static>true</static><pose>2.30 0.00 0.70 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 0.4 0.2</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 0.4 0.2</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="door_lintel_3">
+      <static>true</static><pose>2.30 -0.80 0.70 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 0.4 0.2</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 0.4 0.2</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ══ COLUMNA A OESTE — 6 bloques ══ -->
+    <model name="block_west_a1"><static>true</static><pose>-1.90  1.10 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.3 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_west_a2"><static>true</static><pose>-1.90  0.65 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.3 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_west_a3"><static>true</static><pose>-1.90  0.20 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.3 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_west_a4"><static>true</static><pose>-1.90 -0.25 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.3 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_west_a5"><static>true</static><pose>-1.90 -0.70 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.3 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_west_a6"><static>true</static><pose>-1.90 -1.10 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.3 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ══ BLOQUES CENTRO — mas chicos y separados ══ -->
+    <model name="block_center_left_top">
+      <static>true</static><pose>-0.70 0.85 0.075 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 0.15 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 0.15 0.30</size></box></geometry>
+          <material><ambient>0.8 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_center_left_bot">
+      <static>true</static><pose>-0.70 -0.40 0.075 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 0.15 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 0.15 0.30</size></box></geometry>
+          <material><ambient>0.8 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ══ BLOQUES NORTE — 5 bloques ══ -->
+    <model name="block_north_1"><static>true</static><pose>-1.80 1.15 0.075 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.8 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_north_2"><static>true</static><pose>-1.45 1.15 0.075 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.8 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_north_3"><static>true</static><pose>-1.10 1.15 0.075 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.8 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_north_4"><static>true</static><pose>-0.75 1.15 0.075 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.8 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="block_north_5"><static>true</static><pose>-0.40 1.15 0.075 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.28 0.28 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.28 0.28 0.30</size></box></geometry>
+          <material><ambient>0.8 0.3 0.7 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ══ ROBOT — incluido via GAZEBO_MODEL_PATH ══ -->
+    <include>
+      <uri>model://puzzlebot</uri>
+      <name>puzzlebot1</name>
+      <pose>0.0 0.0 0.05 0 0 0</pose>
+    </include>
+
+  </world>
+</sdf>
