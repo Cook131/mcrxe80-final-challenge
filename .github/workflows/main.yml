@@ -14,7 +14,7 @@ jobs:
     steps:
       # 1. Checkout de la branch que triggereó el workflow
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       # 2. Verificar si existe código ROS 2 en esta branch
       - name: Check for ROS 2 packages
