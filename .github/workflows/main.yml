@@ -1,0 +1,88 @@
+name: PuzzleBot CI - ROS 2 Humble
+
+on:
+  push:
+    branches: [ '**' ]   # Corre en TODAS las branches
+  pull_request:
+    branches: [ '**' ]
+
+jobs:
+  build-and-test:
+    name: Build ROS 2 Workspace (Humble)
+    runs-on: ubuntu-22.04
+
+    steps:
+      # 1. Checkout de la branch que triggereó el workflow
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # 2. Verificar si existe código ROS 2 en esta branch
+      - name: Check for ROS 2 packages
+        id: check_packages
+        run: |
+          if [ -d "src" ]; then
+            echo "has_src=true" >> $GITHUB_OUTPUT
+            echo "✓ Carpeta src/ encontrada"
+            find src/ -name "package.xml" | head -20
+          else
+            echo "has_src=false" >> $GITHUB_OUTPUT
+            echo "⚠ No se encontró carpeta src/ en esta branch"
+            echo "Branch: ${{ github.ref_name }}"
+          fi
+
+      # 3. Configurar ROS 2 Humble (solo si hay paquetes)
+      - name: ROS 2 Workspace Action
+        if: steps.check_packages.outputs.has_src == 'true'
+        uses: ichiro-its/ros2-ws-action@v1.0.1
+        with:
+          distro: humble
+
+      # 4. Instalar dependencias con rosdep
+      - name: Install dependencies with rosdep
+        if: steps.check_packages.outputs.has_src == 'true'
+        run: |
+          source /opt/ros/humble/setup.bash
+          sudo rosdep init || true
+          rosdep update
+          rosdep install \
+            --from-paths src \
+            --ignore-src \
+            --rosdistro humble \
+            -y
+
+      # 5. Build del workspace con colcon
+      - name: Build workspace (colcon build)
+        if: steps.check_packages.outputs.has_src == 'true'
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build \
+            --symlink-install \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release \
+            --event-handlers console_cohesion+
+
+      # 6. Verificar build
+      - name: Verify build artifacts
+        if: steps.check_packages.outputs.has_src == 'true'
+        run: |
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          echo "=========================================="
+          echo "Paquetes instalados correctamente:"
+          echo "=========================================="
+          colcon list --names-only
+          echo ""
+          echo "Estado: OK ✓"
+
+      # 7. Resumen en GitHub Actions
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## PuzzleBot CI — ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Campo        | Valor                        |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------------|------------------------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch       | \`${{ github.ref_name }}\`   |" >> $GITHUB_STEP_SUMMARY
+          echo "| Distro       | ROS 2 Humble                 |" >> $GITHUB_STEP_SUMMARY
+          echo "| OS           | Ubuntu 22.04                 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit       | \`${{ github.sha }}\`        |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }}          |" >> $GITHUB_STEP_SUMMARY
