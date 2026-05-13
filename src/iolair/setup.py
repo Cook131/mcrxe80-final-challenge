@@ -31,6 +31,7 @@ data_files=[
             'controlador = iolair.PuzzlebotController:main',
             'odometria = iolair.puzzlebotOdometry:main',
             'go_to_goal = iolair.puzzlebotGoToGoal:main',
+            'puzzlebot_teleop = iolair.puzzlebotTeleop:main',
         ],
     },
 )
