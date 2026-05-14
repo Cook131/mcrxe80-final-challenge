@@ -1,0 +1,12 @@
+IO_LOC "clk"        4;   // 27MHz — no tocar
+IO_LOC "rst_n"      15;  // Botón S1 — no tocar
+
+IO_LOC "uart_rx"    25;  // IOB8A — OK, no cambia
+IO_LOC "uart_tx"    26;  // IOB6B — OK, no cambia
+
+IO_LOC "servo1_pwm" 40;  // IOT40B — BANK1, pin limpio
+IO_LOC "servo2_pwm" 42;  // IOB42B — BANK1, pin limpio
+
+IO_PORT "clk"       PULL_MODE=UP;
+IO_PORT "rst_n"     PULL_MODE=UP;
+IO_PORT "uart_rx"   PULL_MODE=UP; // Evita flotar cuando no hay conexión
