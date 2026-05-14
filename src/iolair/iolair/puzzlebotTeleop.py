@@ -12,7 +12,7 @@ class PuzzlebotTeleop(Node):
         super().__init__('puzzlebot_teleop')
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         
-        self.max_lin = 4.0  
+        self.max_lin = 0.2
         self.max_ang = 0.8 
         
         # Save terminal settings to restore on exit
