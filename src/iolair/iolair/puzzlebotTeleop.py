@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""PuzzleBot teleop node for keyboard-controlled robot velocity commands."""
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -10,7 +11,10 @@ import threading
 
 
 class PuzzlebotTeleop(Node):
+    """Teleop node for PuzzleBot with smooth acceleration."""
+
     def __init__(self):
+        """Initialize the teleop node with velocity publishers and parameters."""
         super().__init__('puzzlebot_teleop')
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
 
@@ -128,6 +132,7 @@ class PuzzlebotTeleop(Node):
 
 
 def main(args=None):
+    """Main entry point for the teleop node."""
     rclpy.init(args=args)
     node = PuzzlebotTeleop()
 
