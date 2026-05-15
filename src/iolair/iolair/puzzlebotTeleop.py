@@ -14,7 +14,11 @@ class PuzzlebotTeleop(Node):
     """Teleop node for PuzzleBot with smooth acceleration."""
 
     def __init__(self):
-        """Initialize the teleop node with velocity publishers and parameters."""
+        """Initialize the teleop node with velocity publishers and parameters.
+
+        Sets up ROS 2 velocity publishers, declares configurable speed and
+        acceleration parameters, and initializes the keyboard input handler.
+        """
         super().__init__('puzzlebot_teleop')
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
 
@@ -73,7 +77,11 @@ class PuzzlebotTeleop(Node):
             self.current_ang = 0.0
 
     def publish_velocity(self):
-        """Interpolate current velocity toward target velocity (Kinematic Smoothing)."""
+        """Interpolate current velocity toward target (Kinematic Smoothing).
+
+        Smoothly ramps linear and angular velocities towards their target
+        values using acceleration limits to create kinematic smoothing.
+        """
         # Smoothly ramp linear velocity
         if self.target_lin > self.current_lin:
             self.current_lin = min(
@@ -126,13 +134,17 @@ class PuzzlebotTeleop(Node):
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
     def stop_robot(self):
-        """Final safety stop to zero out velocities before dying."""
+        """Stop the robot by zeroing out velocities before shutdown."""
         msg = Twist()
         self.publisher_.publish(msg)
 
 
 def main(args=None):
-    """Main entry point for the teleop node."""
+    """Run the teleop node.
+
+    Initializes the PuzzlebotTeleop node and spins the ROS 2 event loop
+    in a background thread while handling keyboard input in the main thread.
+    """
     rclpy.init(args=args)
     node = PuzzlebotTeleop()
 

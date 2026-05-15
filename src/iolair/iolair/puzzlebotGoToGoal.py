@@ -147,7 +147,11 @@ class GoToGoalNode(Node):
 
 
 def main(args=None):
-    """Main entry point for the go-to-goal node."""
+    """Start the go-to-goal navigation node.
+
+    Initializes the GoToGoalNode and runs the ROS 2 event loop until
+    interrupted by user input.
+    """
     rclpy.init(args=args)
     node = GoToGoalNode()
     try:

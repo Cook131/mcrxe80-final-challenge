@@ -258,7 +258,12 @@ class PuzzlebotController(Node):
 # ── Entry point ─────────────────────────────────────────────────────────
 
 def main(args=None):
-    """Main entry point for the controller node."""
+    """Start the Puzzlebot controller node.
+
+    Initializes the PuzzlebotController and runs the ROS 2 event loop
+    until interrupted by user input. Performs safe shutdown with
+    velocity set-points zeroed.
+    """
     rclpy.init(args=args)
     node = PuzzlebotController()
     try:
