@@ -42,7 +42,7 @@ class PuzzlebotOdometry(Node):
         self.timer = self.create_timer(1.0 / self.rate, self.update_position)
 
         self.get_logger().info(
-            f"🟢 Odometría iniciada (Rango Angular: -π a π rad)")
+            " Odometría iniciada (Rango Angular: -π a π rad)")
 
     def cb_l(self, msg):
         """Store left wheel velocity measurement."""

@@ -124,7 +124,7 @@ class PuzzlebotController(Node):
     MAX_WHEEL_VEL = 21.0
 
     def __init__(self):
-        """Initialize controller with PID gains and ROS subscribers/publishers."""
+        """Initialize controller with PID gains and ROS interfaces."""
         super().__init__('puzzlebot_main_controller')
 
         # ── PID gains (tunable at runtime via parameters) ─────────────────
