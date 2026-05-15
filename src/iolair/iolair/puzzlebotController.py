@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-puzzlebotController.py — Closed-loop wheel velocity controller
+puzzlebotController.py — Closed-loop wheel velocity controller.
+
 ==============================================================
 Architecture
 ------------
   /cmd_vel (Twist)
-      │
-      ▼ inverse kinematics
-  [target_wr, target_wl]  ← desired wheel angular velocities [rad/s]
-      │
-      ▼  PID (one per wheel, runs at 50 Hz)
-  [VelocitySetR, VelocitySetL]  → firmware PWM driver
-      ▲
-  [VelocityEncR, VelocityEncL]  ← actual wheel velocities from encoders
+      |
+      v inverse kinematics
+  [target_wr, target_wl]  <- desired wheel angular velocities [rad/s]
+      |
+      v  PID (one per wheel, runs at 50 Hz)
+  [VelocitySetR, VelocitySetL]  -> firmware PWM driver
+      ^
+  [VelocityEncR, VelocityEncL]  <- actual wheel velocities from encoders
 
 Why a PID?
 ----------
@@ -22,26 +23,26 @@ load, and battery voltage make the actual speed differ from the set-point.
 That error accumulates in odometry, blurring the SLAM map.
 
 The PID closes the loop:
-  error  = target_velocity − measured_velocity
-  output = Kp·error + Ki·∫error dt + Kd·d(error)/dt
+  error  = target_velocity - measured_velocity
+  output = Kp*error + Ki*int(error dt) + Kd*d(error)/dt
 
 Tuning guide (start here, adjust on the bench)
 -----------------------------------------------
-  Kp = 1.0   → raise until wheels reach set-point quickly without overshoot
-  Ki = 0.5   → raise slowly to eliminate steady-state error at low speeds
-  Kd = 0.05  → raise slightly only if you see oscillation
+  Kp = 1.0   -> raise until wheels reach set-point quickly without overshoot
+  Ki = 0.5   -> raise slowly to eliminate steady-state error at low speeds
+  Kd = 0.05  -> raise slightly only if you see oscillation
 
 Override via --ros-args:
   ros2 run iolair controller --ros-args -p Kp:=1.2 -p Ki:=0.6 -p Kd:=0.02
 
 Subscribes to:
-    /cmd_vel       (geometry_msgs/Twist)  — velocity command
-    /VelocityEncR  (std_msgs/Float32)     — measured right wheel [rad/s]
-    /VelocityEncL  (std_msgs/Float32)     — measured left  wheel [rad/s]
+    /cmd_vel       (geometry_msgs/Twist)  - velocity command
+    /VelocityEncR  (std_msgs/Float32)     - measured right wheel [rad/s]
+    /VelocityEncL  (std_msgs/Float32)     - measured left  wheel [rad/s]
 
 Publishes to:
-    /VelocitySetR  (std_msgs/Float32)     — right wheel set-point [rad/s]
-    /VelocitySetL  (std_msgs/Float32)     — left  wheel set-point [rad/s]
+    /VelocitySetR  (std_msgs/Float32)     - right wheel set-point [rad/s]
+    /VelocitySetL  (std_msgs/Float32)     - left  wheel set-point [rad/s]
 """
 
 import rclpy
@@ -54,8 +55,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 # ── Simple PID ──────────────────────────────────────────────────────────
 
 class PID:
-    """
-    Discrete PID controller with anti-windup and output clamping.
+    """Discrete PID controller with anti-windup and output clamping.
 
     Parameters
     ----------
@@ -67,6 +67,7 @@ class PID:
 
     def __init__(self, Kp: float, Ki: float, Kd: float,
                  dt: float, out_min: float, out_max: float):
+        """Initialize PID controller with gains and output limits."""
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
@@ -78,10 +79,12 @@ class PID:
         self._prev_error = 0.0
 
     def reset(self):
+        """Reset integral and previous error tracking."""
         self._integral = 0.0
         self._prev_error = 0.0
 
     def update(self, error: float) -> float:
+        """Compute PID output for given error value."""
         # Proportional
         p = self.Kp * error
 
@@ -100,6 +103,7 @@ class PID:
         return max(self.out_min, min(self.out_max, output))
 
     def update_gains(self, Kp: float, Ki: float, Kd: float):
+        """Update PID gains and reset controller state."""
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
@@ -109,6 +113,7 @@ class PID:
 # ── Controller Node ─────────────────────────────────────────────────────
 
 class PuzzlebotController(Node):
+    """Closed-loop wheel velocity controller for Puzzlebot robot."""
 
     # Physical constants (match model.sdf / odometry node)
     WHEEL_RADIUS = 0.05   # metres
@@ -119,6 +124,7 @@ class PuzzlebotController(Node):
     MAX_WHEEL_VEL = 21.0
 
     def __init__(self):
+        """Initialize controller with PID gains and ROS subscribers/publishers."""
         super().__init__('puzzlebot_main_controller')
 
         # ── PID gains (tunable at runtime via parameters) ─────────────────
@@ -183,10 +189,10 @@ class PuzzlebotController(Node):
             f'Kp={Kp}, Ki={Ki}, Kd={Kd}, rate={rate} Hz'
         )
 
-    # ── Callbacks ───────────────────────────────────────────────────────────
+    # ── Callbacks ─────────────────────────────────────────────────────────
 
     def _cb_cmd_vel(self, msg: Twist):
-        """Convert Twist → desired wheel angular velocities [rad/s]."""
+        """Convert Twist to desired wheel angular velocities [rad/s]."""
         v = msg.linear.x
         w = msg.angular.z
         r = self.WHEEL_RADIUS
@@ -209,18 +215,17 @@ class PuzzlebotController(Node):
             self._pid_l.reset()
 
     def _cb_enc_r(self, msg: Float32):
+        """Process right encoder measurement."""
         self._meas_r = msg.data
 
     def _cb_enc_l(self, msg: Float32):
+        """Process left encoder measurement."""
         self._meas_l = msg.data
 
     # ── Control loop ────────────────────────────────────────────────────────
 
     def _control_loop(self):
-        """
-        Runs at `control_rate` Hz.
-        Computes PID output for each wheel and publishes the set-point.
-        """
+        """Run control loop to compute PID outputs and publish set-points."""
         # When target is zero, stop immediately (don't let PID fight a stop)
         if self._target_r == 0.0 and self._target_l == 0.0:
             self._pid_r.reset()
@@ -241,6 +246,7 @@ class PuzzlebotController(Node):
     # ── Publisher helper ────────────────────────────────────────────────────
 
     def _publish(self, vel_r: float, vel_l: float):
+        """Publish wheel velocity set-points to firmware."""
         msg_r = Float32()
         msg_l = Float32()
         msg_r.data = vel_r
@@ -252,6 +258,7 @@ class PuzzlebotController(Node):
 # ── Entry point ─────────────────────────────────────────────────────────
 
 def main(args=None):
+    """Main entry point for the controller node."""
     rclpy.init(args=args)
     node = PuzzlebotController()
     try:
