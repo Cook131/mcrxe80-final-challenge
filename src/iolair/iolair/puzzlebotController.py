@@ -55,7 +55,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 # ── Simple PID ──────────────────────────────────────────────────────────
 
 class PID:
-    """Discrete PID controller with anti-windup and output clamping.
+    """
+    Discrete PID controller with anti-windup and output clamping.
 
     Parameters
     ----------
@@ -63,6 +64,7 @@ class PID:
     dt         : time step [s] — must match the control-loop rate
     out_min    : minimum output value (clamps integral windup too)
     out_max    : maximum output value
+
     """
 
     def __init__(self, Kp: float, Ki: float, Kd: float,
@@ -258,7 +260,8 @@ class PuzzlebotController(Node):
 # ── Entry point ─────────────────────────────────────────────────────────
 
 def main(args=None):
-    """Start the Puzzlebot controller node.
+    """
+    Start the Puzzlebot controller node.
 
     Initializes the PuzzlebotController and runs the ROS 2 event loop
     until interrupted by user input. Performs safe shutdown with

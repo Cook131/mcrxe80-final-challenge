@@ -14,7 +14,8 @@ class PuzzlebotTeleop(Node):
     """Teleop node for PuzzleBot with smooth acceleration."""
 
     def __init__(self):
-        """Initialize the teleop node with velocity publishers and parameters.
+        """
+        Initialize the teleop node with velocity publishers and parameters.
 
         Sets up ROS 2 velocity publishers, declares configurable speed and
         acceleration parameters, and initializes the keyboard input handler.
@@ -77,7 +78,8 @@ class PuzzlebotTeleop(Node):
             self.current_ang = 0.0
 
     def publish_velocity(self):
-        """Interpolate current velocity toward target (Kinematic Smoothing).
+        """
+        Interpolate current velocity toward target (Kinematic Smoothing).
 
         Smoothly ramps linear and angular velocities towards their target
         values using acceleration limits to create kinematic smoothing.
@@ -140,7 +142,8 @@ class PuzzlebotTeleop(Node):
 
 
 def main(args=None):
-    """Run the teleop node.
+    """
+    Run the teleop node.
 
     Initializes the PuzzlebotTeleop node and spins the ROS 2 event loop
     in a background thread while handling keyboard input in the main thread.
