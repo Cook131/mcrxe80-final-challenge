@@ -10,7 +10,7 @@ class GoToGoalNode(Node):
     """PID-based go-to-goal controller for autonomous navigation."""
 
     def __init__(self):
-        """Initialize go-to-goal node with subscribers, publishers, and PID gains."""
+        """Initialize go-to-goal node with subscribers, publishers and PID."""
         super().__init__('go_to_goal_node')
 
         # --- COMUNICACIÓN ROS 2 ---
@@ -99,7 +99,8 @@ class GoToGoalNode(Node):
         error_angle = angle_to_goal - self.th
 
         # Normalizar ángulo entre -pi y pi
-        error_angle = math.atan2(math.sin(error_angle), math.cos(error_angle))
+        error_angle = math.atan2(math.sin(error_angle),
+                                 math.cos(error_angle))
 
         cmd = Twist()
 
@@ -113,26 +114,29 @@ class GoToGoalNode(Node):
             # 2. PID Lineal (Distancia)
             self.integral_dist += dist * dt
             derivative_dist = (dist - self.error_dist_prev) / dt
-            v_out = (self.kp_v * dist) + (self.ki_v *
-                                          self.integral_dist) + (self.kd_v * derivative_dist)
+            v_out = ((self.kp_v * dist) +
+                     (self.ki_v * self.integral_dist) +
+                     (self.kd_v * derivative_dist))
 
             # 3. PID Angular (Orientación)
             self.integral_angle += error_angle * dt
             derivative_angle = (error_angle - self.error_angle_prev) / dt
-            w_out = (self.kp_w * error_angle) + (self.ki_w *
-                                                 self.integral_angle) + (self.kd_w * derivative_angle)
+            w_out = ((self.kp_w * error_angle) +
+                     (self.ki_w * self.integral_angle) +
+                     (self.kd_w * derivative_angle))
 
             # 4. Lógica de Movimiento y Saturación
             # Primero: Limitar la rotación para que sea lenta
             cmd.angular.z = max(
-                min(w_out, self.max_angular_velocity), -self.max_angular_velocity)
+                min(w_out, self.max_angular_velocity),
+                -self.max_angular_velocity)
 
             # Segundo: Controlar el avance lineal según la alineación
             if abs(error_angle) > self.angle_threshold:
                 # Si está muy desalineado, casi no avanza (solo gira)
                 cmd.linear.x = 0.02
             else:
-                # Si está alineado, aplica la velocidad lineal (hasta 0.7 m/s)
+                # Si está alineado, aplica velocidad lineal
                 cmd.linear.x = min(v_out, self.max_linear_velocity)
 
             # Guardar errores para el siguiente ciclo
