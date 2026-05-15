@@ -6,6 +6,7 @@ from geometry_msgs.msg import Quaternion
 import math
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
+
 class PuzzlebotOdometry(Node):
     def __init__(self):
         super().__init__('puzzlebot_odom_node')
@@ -17,18 +18,20 @@ class PuzzlebotOdometry(Node):
             depth=10
         )
 
-        self.sub_l = self.create_subscription(Float32, '/VelocityEncL', self.cb_l, qos_profile)
-        self.sub_r = self.create_subscription(Float32, '/VelocityEncR', self.cb_r, qos_profile)
+        self.sub_l = self.create_subscription(
+            Float32, '/VelocityEncL', self.cb_l, qos_profile)
+        self.sub_r = self.create_subscription(
+            Float32, '/VelocityEncR', self.cb_r, qos_profile)
         self.pub_odom = self.create_publisher(Odometry, '/odom', 10)
 
         # Parámetros físicos
         self.r = 0.05
         self.L = 0.19
-        
+
         # Estado inicial
         self.x, self.y, self.th = 0.0, 0.0, 0.0
         self.wl, self.wr = 0.0, 0.0
-        
+
         # Frecuencia a 200Hz (0.005s por ciclo)
         self.rate = 200.0
         self.last_time = self.get_clock().now()
@@ -42,23 +45,23 @@ class PuzzlebotOdometry(Node):
     def update_position(self):
         current_time = self.get_clock().now()
         dt = (current_time - self.last_time).nanoseconds / 1e9
-        
+
         # Validación de dt para estabilidad ante lag
         if dt < 0.001 or dt > 0.1:
             self.last_time = current_time
             return
-            
+
         self.last_time = current_time
 
         # 1. Cinemática Diferencial
         v = self.r * (self.wr + self.wl) / 2.0
         w = self.r * (self.wr - self.wl) / self.L
-        
+
         # 2. Integración de Pose
         self.x += v * math.cos(self.th) * dt
         self.y += v * math.sin(self.th) * dt
         self.th += w * dt
-        
+
         # --- MEJORA: Normalización de -PI a PI ---
         # atan2(sin, cos) es la forma más limpia de mantener el rango
         self.th = math.atan2(math.sin(self.th), math.cos(self.th))
@@ -71,10 +74,11 @@ class PuzzlebotOdometry(Node):
 
         odom_msg.pose.pose.position.x = self.x
         odom_msg.pose.pose.position.y = self.y
-        
+
         # Orientación en Cuaternión
-        odom_msg.pose.pose.orientation = self.euler_to_quaternion(0, 0, self.th)
-        
+        odom_msg.pose.pose.orientation = self.euler_to_quaternion(
+            0, 0, self.th)
+
         # Velocidades en el mensaje
         odom_msg.twist.twist.linear.x = v
         odom_msg.twist.twist.angular.z = w
@@ -95,6 +99,7 @@ class PuzzlebotOdometry(Node):
         q.z = cr * cp * sy - sr * sp * cy
         return q
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = PuzzlebotOdometry()
@@ -105,6 +110,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

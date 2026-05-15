@@ -51,7 +51,7 @@ from std_msgs.msg import Float32
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 
-# ── Simple PID ────────────────────────────────────────────────────────────────
+# ── Simple PID ──────────────────────────────────────────────────────────
 
 class PID:
     """
@@ -74,11 +74,11 @@ class PID:
         self.out_min = out_min
         self.out_max = out_max
 
-        self._integral  = 0.0
+        self._integral = 0.0
         self._prev_error = 0.0
 
     def reset(self):
-        self._integral   = 0.0
+        self._integral = 0.0
         self._prev_error = 0.0
 
     def update(self, error: float) -> float:
@@ -106,13 +106,13 @@ class PID:
         self.reset()
 
 
-# ── Controller Node ───────────────────────────────────────────────────────────
+# ── Controller Node ─────────────────────────────────────────────────────
 
 class PuzzlebotController(Node):
 
     # Physical constants (match model.sdf / odometry node)
     WHEEL_RADIUS = 0.05   # metres
-    WHEEL_BASE   = 0.19   # metres
+    WHEEL_BASE = 0.19   # metres
 
     # Maximum wheel angular velocity the motors can deliver [rad/s]
     # RPM_max ≈ 200 rpm → 200/60 * 2π ≈ 21 rad/s (conservative cap)
@@ -127,11 +127,11 @@ class PuzzlebotController(Node):
         self.declare_parameter('Kd', 0.05)
         self.declare_parameter('control_rate', 50.0)   # Hz
 
-        Kp   = self.get_parameter('Kp').value
-        Ki   = self.get_parameter('Ki').value
-        Kd   = self.get_parameter('Kd').value
+        Kp = self.get_parameter('Kp').value
+        Ki = self.get_parameter('Ki').value
+        Kd = self.get_parameter('Kd').value
         rate = self.get_parameter('control_rate').value
-        dt   = 1.0 / rate
+        dt = 1.0 / rate
 
         self._pid_r = PID(Kp, Ki, Kd, dt,
                           -self.MAX_WHEEL_VEL, self.MAX_WHEEL_VEL)
@@ -159,9 +159,17 @@ class PuzzlebotController(Node):
         )
 
         # ── Subscribers ───────────────────────────────────────────────────
-        self.create_subscription(Twist,   '/cmd_vel',      self._cb_cmd_vel, 10)
-        self.create_subscription(Float32, '/VelocityEncR', self._cb_enc_r,   enc_qos)
-        self.create_subscription(Float32, '/VelocityEncL', self._cb_enc_l,   enc_qos)
+        self.create_subscription(Twist, '/cmd_vel', self._cb_cmd_vel, 10)
+        self.create_subscription(
+            Float32,
+            '/VelocityEncR',
+            self._cb_enc_r,
+            enc_qos)
+        self.create_subscription(
+            Float32,
+            '/VelocityEncL',
+            self._cb_enc_l,
+            enc_qos)
 
         # ── Publishers ────────────────────────────────────────────────────
         self._pub_r = self.create_publisher(Float32, '/VelocitySetR', 10)
@@ -175,7 +183,7 @@ class PuzzlebotController(Node):
             f'Kp={Kp}, Ki={Ki}, Kd={Kd}, rate={rate} Hz'
         )
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
+    # ── Callbacks ───────────────────────────────────────────────────────────
 
     def _cb_cmd_vel(self, msg: Twist):
         """Convert Twist → desired wheel angular velocities [rad/s]."""
@@ -206,7 +214,7 @@ class PuzzlebotController(Node):
     def _cb_enc_l(self, msg: Float32):
         self._meas_l = msg.data
 
-    # ── Control loop ──────────────────────────────────────────────────────────
+    # ── Control loop ────────────────────────────────────────────────────────
 
     def _control_loop(self):
         """
@@ -230,7 +238,7 @@ class PuzzlebotController(Node):
 
         self._publish(self._set_r, self._set_l)
 
-    # ── Publisher helper ──────────────────────────────────────────────────────
+    # ── Publisher helper ────────────────────────────────────────────────────
 
     def _publish(self, vel_r: float, vel_l: float):
         msg_r = Float32()
@@ -241,7 +249,7 @@ class PuzzlebotController(Node):
         self._pub_l.publish(msg_l)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)

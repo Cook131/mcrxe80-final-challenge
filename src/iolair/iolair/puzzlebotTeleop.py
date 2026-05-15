@@ -8,17 +8,18 @@ import tty
 import select
 import threading
 
+
 class PuzzlebotTeleop(Node):
     def __init__(self):
         super().__init__('puzzlebot_teleop')
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
-        
+
         # 1. ROS 2 Parameters for configurable speeds and acceleration
         self.declare_parameter('max_lin', 0.8)
         self.declare_parameter('max_ang', 0.8)
         self.declare_parameter('accel_lin', 0.2)
         self.declare_parameter('accel_ang', 0.05)
-        
+
         self.max_lin = self.get_parameter('max_lin').value
         self.max_ang = self.get_parameter('max_ang').value
         self.accel_lin = self.get_parameter('accel_lin').value
@@ -27,14 +28,14 @@ class PuzzlebotTeleop(Node):
         # Target velocities (what the user wants based on key press)
         self.target_lin = 0.0
         self.target_ang = 0.0
-        
+
         # Current velocities (what the robot is actually doing)
         self.current_lin = 0.0
         self.current_ang = 0.0
-        
+
         # 50Hz update rate for smooth velocity publishing
         self.timer = self.create_timer(0.02, self.publish_velocity)
-        
+
         self.get_logger().info(
             "\nTeleop Active:\n"
             "---------------------------\n"
@@ -71,15 +72,27 @@ class PuzzlebotTeleop(Node):
         """Interpolate current velocity toward target velocity (Kinematic Smoothing)."""
         # Smoothly ramp linear velocity
         if self.target_lin > self.current_lin:
-            self.current_lin = min(self.target_lin, self.current_lin + self.accel_lin)
+            self.current_lin = min(
+                self.target_lin,
+                self.current_lin +
+                self.accel_lin)
         elif self.target_lin < self.current_lin:
-            self.current_lin = max(self.target_lin, self.current_lin - self.accel_lin)
+            self.current_lin = max(
+                self.target_lin,
+                self.current_lin -
+                self.accel_lin)
 
         # Smoothly ramp angular velocity
         if self.target_ang > self.current_ang:
-            self.current_ang = min(self.target_ang, self.current_ang + self.accel_ang)
+            self.current_ang = min(
+                self.target_ang,
+                self.current_ang +
+                self.accel_ang)
         elif self.target_ang < self.current_ang:
-            self.current_ang = max(self.target_ang, self.current_ang - self.accel_ang)
+            self.current_ang = max(
+                self.target_ang,
+                self.current_ang -
+                self.accel_ang)
 
         # Publish
         msg = Twist()
@@ -97,7 +110,7 @@ class PuzzlebotTeleop(Node):
                 rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if rlist:
                     key = sys.stdin.read(1)
-                    if key == '\x03' or key.lower() == 'q': # CTRL+C or 'q'
+                    if key == '\x03' or key.lower() == 'q':  # CTRL+C or 'q'
                         break
                     self.process_key(key)
                 else:
@@ -113,11 +126,13 @@ class PuzzlebotTeleop(Node):
         msg = Twist()
         self.publisher_.publish(msg)
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = PuzzlebotTeleop()
 
-    # 2. Spin ROS 2 callbacks in a background thread to unblock terminal reading
+    # 2. Spin ROS 2 callbacks in a background thread to unblock terminal
+    # reading
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -134,6 +149,7 @@ def main(args=None):
         node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
