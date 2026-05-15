@@ -8,7 +8,7 @@ Puzzlebot.  No Gazebo, no nav2, no MCL required.
 Node graph
 ----------
   firmware ──/VelocityEncR, /VelocityEncL──► odometry   → /odom + TF odom→base_link
-  /lidar   ──────────────────────────────► slam_node   → /slam_map + TF map→odom
+  /scan    ──────────────────────────────► slam_node   → /slam_map + TF map→odom
   teleop   ──/cmd_vel──► controller ──/VelocitySetR,L──► firmware
 
 How to use
@@ -27,9 +27,11 @@ How to use
      → writes /tmp/slam_map.pgm and /tmp/slam_map.yaml
 
   5. Copy the map files to iolair/maps/ and rebuild.
+
+  6. Monitor diagnostics:
+       ros2 topic echo /slam/diagnostics
 """
 
-import os
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import TimerAction
@@ -50,7 +52,6 @@ def generate_launch_description():
     # ── 2. Odometry node ──────────────────────────────────────────────────
     # Reads /VelocityEncR and /VelocityEncL from the Puzzlebot firmware.
     # Publishes /odom and broadcasts the odom → base_link TF.
-    # Executable 'odometry' = iolair.puzzlebotOdometry:main  (see setup.py)
     odometry_node = Node(
         package='iolair',
         executable='odometry',
@@ -60,7 +61,6 @@ def generate_launch_description():
 
     # ── 3. Controller node ────────────────────────────────────────────────
     # Converts /cmd_vel (Twist) → /VelocitySetR and /VelocitySetL (Float32).
-    # Executable 'controller' = iolair.puzzlebotController:main
     controller_node = Node(
         package='iolair',
         executable='controller',
@@ -69,10 +69,9 @@ def generate_launch_description():
     )
 
     # ── 4. SLAM node (delayed 2 s so /odom is already flowing) ────────────
-    # Subscribes to /lidar and /odom.
-    # Publishes /slam_map, /slam_pose, and the map → odom TF at 20 Hz.
+    # Subscribes to /scan and /odom.
+    # Publishes /slam_map, /slam_pose, /slam/diagnostics, and map→odom TF.
     # Call /slam/save_map (std_srvs/Trigger) to dump the map to disk.
-    # Executable 'slam' = iolair.slam_node:main
     slam_node = TimerAction(
         period=2.0,
         actions=[
@@ -82,6 +81,10 @@ def generate_launch_description():
                 name='slam_node',
                 output='screen',
                 parameters=[{
+                    # ── Topic ─────────────────────────────────────────────
+                    # Must match the topic your LiDAR driver publishes.
+                    'scan_topic':      '/scan',
+
                     # ── Grid ──────────────────────────────────────────────
                     'resolution':      0.05,   # 5 cm per cell
                     'map_init_size':   400,    # 400×400 cells = 20 m × 20 m
@@ -92,9 +95,11 @@ def generate_launch_description():
                     # Match this to your sensor's usable range:
                     #   RPLiDAR A1 → 8 m | A2 → 10 m | A3 → 25 m
                     'lidar_max_range': 8.0,
-                    # beam_skip=1 → all beams (best quality, most CPU).
-                    # Raise to 3-4 on a slow Raspberry Pi.
-                    'beam_skip':       2,
+                    # beam_skip=0  → adaptive (auto sub-samples to target_beams).
+                    # beam_skip=1  → all beams (best quality, most CPU).
+                    # beam_skip=3  → recommended for slow Raspberry Pi.
+                    'beam_skip':       0,      # adaptive mode
+                    'target_beams':    180,    # beams used per scan in adaptive mode
 
                     # ── Log-odds update model ─────────────────────────────
                     'log_odds_occ':    0.85,
@@ -102,15 +107,24 @@ def generate_launch_description():
                     'log_odds_max':    3.5,
                     'log_odds_min':   -3.5,
 
-                    # ── ICP scan-to-scan correction ───────────────────────
-                    # Compensates for odometry drift without nav2 or MCL.
-                    # Set use_icp: False if the Raspberry Pi is overloaded.
-                    'use_icp':         True,
-                    'icp_max_iter':    15,
-                    'icp_tolerance':   1e-4,
+                    # ── ICP scan correction ───────────────────────────────
+                    # Compensates for odometry drift (scan-to-scan +
+                    # scan-to-map).  Set use_icp: False if the Pi is overloaded
+                    # (monitor /slam/diagnostics → avg_scan_ms).
+                    'use_icp':            True,
+                    'icp_max_iter':       20,
+                    'icp_tolerance':      1e-4,
+                    'icp_max_correction': 0.4,  # m — discard wilder jumps
+
+                    # ── Motion gate ───────────────────────────────────────
+                    # Map is only updated when the robot has moved this much.
+                    # Prevents noise accumulation when standing still.
+                    'min_travel_m':    0.05,   # metres
+                    'min_travel_rad':  0.02,   # radians (~1.1 °)
 
                     # ── Publishing ────────────────────────────────────────
-                    'publish_rate':    1.0,    # Hz (lower = less network load)
+                    'publish_rate':    1.0,    # Hz — map topic (lower = less network load)
+                    'tf_rate':         20.0,   # Hz — map→odom TF
 
                     # ── Map save destination ──────────────────────────────
                     'save_map_path':   '/tmp/slam_map',
@@ -118,11 +132,6 @@ def generate_launch_description():
             )
         ],
     )
-
-    # ── 5. Teleop node ────────────────────────────────────────────────────
-    # Keyboard control: W=forward, S=backward, A=left, D=right, Q=quit.
-    # Runs in the same terminal (no xterm needed on the robot).
-    # Executable 'teleop' = iolair.puzzlebotTeleop:main
 
     return LaunchDescription([
         static_tf_lidar,
