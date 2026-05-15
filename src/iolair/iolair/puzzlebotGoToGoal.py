@@ -134,4 +134,35 @@ class GoToGoalNode(Node):
             # Segundo: Controlar el avance lineal según la alineación
             if abs(error_angle) > self.angle_threshold:
                 # Si está muy desalineado, casi no avanza (solo gira)
-                cmd.linear.x = 0.
+                cmd.linear.x = 0.02
+            else:
+                # Si está alineado, aplica velocidad lineal
+                cmd.linear.x = min(v_out, self.max_linear_velocity)
+
+            # Guardar errores para el siguiente ciclo
+            self.error_dist_prev = dist
+            self.error_angle_prev = error_angle
+
+        self.pub_cmd.publish(cmd)
+
+
+def main(args=None):
+    """
+    Start the go-to-goal navigation node.
+
+    Initializes the GoToGoalNode and runs the ROS 2 event loop until
+    interrupted by user input.
+    """
+    rclpy.init(args=args)
+    node = GoToGoalNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
