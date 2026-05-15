@@ -113,7 +113,7 @@ class PuzzlebotOdometry(Node):
 
 
 def main(args=None):
-    """Main entry point for the odometry node."""
+    """Start the odometry node."""
     rclpy.init(args=args)
     node = PuzzlebotOdometry()
     try:
