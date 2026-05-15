@@ -1,3 +1,4 @@
+"""Odometry node for PuzzleBot wheel velocities integration."""
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32
@@ -8,7 +9,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 
 class PuzzlebotOdometry(Node):
+    """Compute robot odometry from left and right wheel encoder velocities."""
+
     def __init__(self):
+        """Initialize odometry node with subscriptions and publishers."""
         super().__init__('puzzlebot_odom_node')
 
         # --- QoS de alto rendimiento para evitar lag ---
@@ -37,12 +41,19 @@ class PuzzlebotOdometry(Node):
         self.last_time = self.get_clock().now()
         self.timer = self.create_timer(1.0 / self.rate, self.update_position)
 
-        self.get_logger().info(f"🟢 Odometría iniciada (Rango Angular: -π a π rad)")
+        self.get_logger().info(
+            f"🟢 Odometría iniciada (Rango Angular: -π a π rad)")
 
-    def cb_l(self, msg): self.wl = msg.data
-    def cb_r(self, msg): self.wr = msg.data
+    def cb_l(self, msg):
+        """Store left wheel velocity measurement."""
+        self.wl = msg.data
+
+    def cb_r(self, msg):
+        """Store right wheel velocity measurement."""
+        self.wr = msg.data
 
     def update_position(self):
+        """Update robot position using differential kinematics."""
         current_time = self.get_clock().now()
         dt = (current_time - self.last_time).nanoseconds / 1e9
 
@@ -86,6 +97,7 @@ class PuzzlebotOdometry(Node):
         self.pub_odom.publish(odom_msg)
 
     def euler_to_quaternion(self, roll, pitch, yaw):
+        """Convert Euler angles to quaternion representation."""
         cy = math.cos(yaw * 0.5)
         sy = math.sin(yaw * 0.5)
         cp = math.cos(pitch * 0.5)
@@ -101,6 +113,7 @@ class PuzzlebotOdometry(Node):
 
 
 def main(args=None):
+    """Main entry point for the odometry node."""
     rclpy.init(args=args)
     node = PuzzlebotOdometry()
     try:
