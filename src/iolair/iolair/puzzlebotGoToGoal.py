@@ -1,3 +1,4 @@
+"""Go-to-Goal navigation node for PuzzleBot with PID control."""
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
@@ -6,7 +7,10 @@ import math
 
 
 class GoToGoalNode(Node):
+    """PID-based go-to-goal controller for autonomous navigation."""
+
     def __init__(self):
+        """Initialize go-to-goal node with subscribers, publishers, and PID gains."""
         super().__init__('go_to_goal_node')
 
         # --- COMUNICACIÓN ROS 2 ---
@@ -44,9 +48,11 @@ class GoToGoalNode(Node):
 
         self.get_logger().info("Nodo Go-to-Goal PID iniciado.")
         self.get_logger().info(
-            f"Configuración: V_MAX={self.max_linear_velocity}, W_MAX={self.max_angular_velocity}")
+            f"Configuración: V_MAX={self.max_linear_velocity}, "
+            f"W_MAX={self.max_angular_velocity}")
 
     def odom_callback(self, msg):
+        """Update robot pose from odometry message."""
         # 1. Extraer posición
         self.x = msg.pose.pose.position.x
         self.y = msg.pose.pose.position.y
@@ -61,6 +67,7 @@ class GoToGoalNode(Node):
             self.control_loop()
 
     def goal_callback(self, msg):
+        """Set new goal target and reset error accumulators."""
         self.target_x = msg.x
         self.target_y = msg.y
         self.active = True
@@ -72,9 +79,10 @@ class GoToGoalNode(Node):
         self.error_angle_prev = 0.0
 
         self.get_logger().info(
-            f"📍 Nuevo objetivo: x={self.target_x}, y={self.target_y}")
+            f"Nuevo objetivo: x={self.target_x}, y={self.target_y}")
 
     def control_loop(self):
+        """Compute velocity commands using PID control."""
         # Cálculo de tiempo (Delta Time)
         current_time = self.get_clock().now()
         dt = (current_time - self.last_time).nanoseconds / 1e9
@@ -98,7 +106,7 @@ class GoToGoalNode(Node):
         # Condición de parada (Llegada al punto)
         if dist < 0.02:
             self.active = False
-            self.get_logger().info("✅ Objetivo alcanzado")
+            self.get_logger().info("Objetivo alcanzado")
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
         else:
@@ -135,6 +143,7 @@ class GoToGoalNode(Node):
 
 
 def main(args=None):
+    """Main entry point for the go-to-goal node."""
     rclpy.init(args=args)
     node = GoToGoalNode()
     try:
