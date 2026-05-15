@@ -6,79 +6,134 @@ import sys
 import termios
 import tty
 import select
+import threading
 
 class PuzzlebotTeleop(Node):
     def __init__(self):
         super().__init__('puzzlebot_teleop')
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         
-        self.max_lin = 0.2
-        self.max_ang = 0.8 
+        # 1. ROS 2 Parameters for configurable speeds and acceleration
+        self.declare_parameter('max_lin', 0.8)
+        self.declare_parameter('max_ang', 0.8)
+        self.declare_parameter('accel_lin', 0.2)
+        self.declare_parameter('accel_ang', 0.05)
         
-        # Save terminal settings to restore on exit
-        self.old_settings = termios.tcgetattr(sys.stdin)
-        
-        # 50Hz update rate
-        self.timer = self.create_timer(0.02, self.teleop_loop)
-        
-        self.get_logger().info("Teleop Active: W/S (Linear), A/D (Angular). Press 'q' or CTRL+C to quit.")
+        self.max_lin = self.get_parameter('max_lin').value
+        self.max_ang = self.get_parameter('max_ang').value
+        self.accel_lin = self.get_parameter('accel_lin').value
+        self.accel_ang = self.get_parameter('accel_ang').value
 
-    def get_key(self):
-        """Non-blocking key read."""
+        # Target velocities (what the user wants based on key press)
+        self.target_lin = 0.0
+        self.target_ang = 0.0
+        
+        # Current velocities (what the robot is actually doing)
+        self.current_lin = 0.0
+        self.current_ang = 0.0
+        
+        # 50Hz update rate for smooth velocity publishing
+        self.timer = self.create_timer(0.02, self.publish_velocity)
+        
+        self.get_logger().info(
+            "\nTeleop Active:\n"
+            "---------------------------\n"
+            "  W / S : Linear Move\n"
+            "  A / D : Angular Turn\n"
+            "  Space : Emergency Stop\n"
+            "  'q' or CTRL+C to quit.\n"
+            "---------------------------"
+        )
+
+    def process_key(self, key):
+        """Map standard keystrokes to target velocities."""
+        key = key.lower()
+        if key == 'w':
+            self.target_lin = self.max_lin
+            self.target_ang = 0.0
+        elif key == 's':
+            self.target_lin = -self.max_lin
+            self.target_ang = 0.0
+        elif key == 'a':
+            self.target_lin = 0.0
+            self.target_ang = self.max_ang
+        elif key == 'd':
+            self.target_lin = 0.0
+            self.target_ang = -self.max_ang
+        elif key == ' ':
+            # Hard stop
+            self.target_lin = 0.0
+            self.target_ang = 0.0
+            self.current_lin = 0.0
+            self.current_ang = 0.0
+
+    def publish_velocity(self):
+        """Interpolate current velocity toward target velocity (Kinematic Smoothing)."""
+        # Smoothly ramp linear velocity
+        if self.target_lin > self.current_lin:
+            self.current_lin = min(self.target_lin, self.current_lin + self.accel_lin)
+        elif self.target_lin < self.current_lin:
+            self.current_lin = max(self.target_lin, self.current_lin - self.accel_lin)
+
+        # Smoothly ramp angular velocity
+        if self.target_ang > self.current_ang:
+            self.current_ang = min(self.target_ang, self.current_ang + self.accel_ang)
+        elif self.target_ang < self.current_ang:
+            self.current_ang = max(self.target_ang, self.current_ang - self.accel_ang)
+
+        # Publish
+        msg = Twist()
+        msg.linear.x = self.current_lin
+        msg.angular.z = self.current_ang
+        self.publisher_.publish(msg)
+
+    def key_loop(self):
+        """Dedicated loop to handle blocking terminal input safely."""
+        settings = termios.tcgetattr(sys.stdin)
         try:
             tty.setraw(sys.stdin.fileno())
-            # Use select with a tiny timeout for that "game" feel
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.04)
-            if rlist:
-                key = sys.stdin.read(1)
-            else:
-                key = ''
+            while rclpy.ok():
+                # 0.1s timeout acts as an automatic key-release detector
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if rlist:
+                    key = sys.stdin.read(1)
+                    if key == '\x03' or key.lower() == 'q': # CTRL+C or 'q'
+                        break
+                    self.process_key(key)
+                else:
+                    # Timeout reached (no keys pressed) -> coast to a stop
+                    self.target_lin = 0.0
+                    self.target_ang = 0.0
         finally:
-            # Restore settings immediately so CTRL+C works
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
-        return key
+            # Always guarantee terminal settings are restored upon exiting loop
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
-    def teleop_loop(self):
-        key = self.get_key()
+    def stop_robot(self):
+        """Final safety stop to zero out velocities before dying."""
         msg = Twist()
-
-        # FIXED INVERSION: 
-        # If 'w' and 's' were turning, we assign them to linear.x
-        # If 'a' and 'd' were moving forward, we assign them to angular.z
-        if key == 'w':
-            msg.linear.x = self.max_lin
-            msg.angular.z = 0.0
-        elif key == 's':
-            msg.linear.x = -self.max_lin
-            msg.angular.z = 0.0
-        elif key == 'a':
-            msg.linear.x = 0.0
-            msg.angular.z = self.max_ang
-        elif key == 'd':
-            msg.linear.x = 0.0
-            msg.angular.z = -self.max_ang
-        elif key == 'q' or key == '\x03': # 'q' or CTRL+C
-            self.get_logger().info("Exiting...")
-            rclpy.shutdown()
-        else:
-            # Release key = Stop
-            msg.linear.x = 0.0
-            msg.angular.z = 0.0
-
         self.publisher_.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)
     node = PuzzlebotTeleop()
+
+    # 2. Spin ROS 2 callbacks in a background thread to unblock terminal reading
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
     try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt):
+        # Run the blocking keyboard reader in the main thread
+        node.key_loop()
+    except KeyboardInterrupt:
         pass
     finally:
-        # Final safety stop
-        node.publisher_.publish(Twist())
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, node.old_settings)
+        # Graceful shutdown pipeline
+        print("\rExiting teleop node...         ")
+        node.stop_robot()
         node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
