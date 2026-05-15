@@ -28,11 +28,11 @@
 
 ## 🏭 Overview
 
-**TE3003B Final Project** is a comprehensive ROS2-based system for controlling a modified **Puzzlebot robot** in a real industrial warehouse environment. The implementation simulates the functionality of an **E80 LGV (Laser Guided Vehicle) forklift robot**, providing autonomous navigation, mapping, and task execution capabilities.
+**TE3003B Final Project** is a ROS2-based system for controlling a modified **Puzzlebot robot** with core functionalities for navigation and control. The implementation provides essential scripts for robot operation, including controller logic, goal navigation, odometry processing, and teleoperation capabilities.
 
-The system integrates multiple ROS2 nodes for perception, planning, and control, designed for deployment on physical hardware without simulation dependencies.
+The system is designed for deployment on physical Puzzlebot hardware, focusing on fundamental robotic control and navigation tasks.
 
-> **Objective:** Develop an intelligent robotic system capable of operating in warehouse settings, handling navigation challenges, and executing tasks autonomously using real-world sensors and actuators.
+> **Objective:** Implement basic robotic control systems for autonomous and manual operation of a mobile robot platform.
 
 ---
 
@@ -42,72 +42,49 @@ The system integrates multiple ROS2 nodes for perception, planning, and control,
 src/iolair/
 │
 ├── iolair/                 # Core ROS2 package
-│   ├── __init__.py
-│   ├── map_publisher_node.py    # Map publishing
-│   ├── mcl_node.py              # Monte Carlo Localization
-│   ├── odommetry_node.py        # Odometry processing
-│   ├── puzzlebot_teleop.py      # Teleoperation control
-│   ├── robot_controller.py      # Main robot controller
-│   └── slam_node.py             # SLAM implementation
+│   ├── puzzlebotController.py    # Main robot controller
+│   ├── puzzlebotGoToGoal.py      # Goal navigation
+│   ├── puzzlebotOdometry.py      # Odometry processing
+│   └── puzzlebotTeleop.py        # Teleoperation control
 │
 ├── launch/                 # Launch configurations
-│   ├── sim.launch.py       # Real-world deployment launch
-│   └── slamSim.launch.py   # SLAM launch
+│   └── teleop.launch.py    # Teleoperation launch
 │
-├── maps/                   # Warehouse maps
-│   └── puzzlebot_map.pgm
-│
-├── rviz/                   # Visualization configs
-│   └── puzzlebot.rviz
-│
-├── resource/               # Additional resources
-├── test/                   # Code quality tests
-└── package.xml             # ROS2 package manifest
+└── setup.py                # Package setup script
 ```
 
 | Directory | Purpose |
 |---|---|
-| `iolair/` | Python nodes for robot functionality |
-| `launch/` | ROS2 launch files for system startup |
-| `maps/` | Pre-built warehouse environment maps |
-| `rviz/` | RViz configuration for visualization |
-| `test/` | Automated testing and code quality checks |
+| `iolair/` | Python scripts for robot control and navigation |
+| `launch/` | ROS2 launch file for teleoperation |
+| `setup.py` | Python package configuration |
 
 ---
 
 ## ✨ Features
 
-- 🤖 **Autonomous Navigation** using SLAM and path planning
-- 📍 **Real-time Localization** with Monte Carlo methods
-- 🎮 **Manual Teleoperation** for direct control
-- 🗺️ **Map Generation** and publishing
-- 🔊 **Voice Command Recognition** for human-robot interaction
-- 🖥️ **Human-Machine Interface** for odometry visualization
-- 🔍 **Marker Detection** (ArUco and QR codes) for reference points
-- 📊 **Sensor Integration** for real-world operation
+- 🤖 **Robot Control** with main controller logic
+- 🎯 **Goal Navigation** for autonomous movement to targets
+- 📍 **Odometry Processing** for position tracking
+- 🎮 **Teleoperation** for manual control
+- 🚀 **Launch Configuration** for easy system startup
 
 ---
 
-## 🔧 Nodes
+## 🔧 Scripts
 
-The system comprises several ROS2 nodes, each handling specific aspects of robot operation:
+The package includes several Python scripts for robot operation:
 
-### Core Nodes
+| Script | Description |
+|---|---|
+| **puzzlebotController.py** | Main control logic for robot operation |
+| **puzzlebotGoToGoal.py** | Implements navigation to specified goals |
+| **puzzlebotOdometry.py** | Handles odometry calculations and publishing |
+| **puzzlebotTeleop.py** | Provides teleoperation capabilities |
 
-| Node | File | Description |
-|---|---|---|
-| **Map Publisher** | `map_publisher_node.py` | Publishes static and dynamic maps of the environment |
-| **MCL Node** | `mcl_node.py` | Implements Monte Carlo Localization for pose estimation |
-| **Odometry Node** | `odommetry_node.py` | Processes wheel encoder data for odometry |
-| **Teleop Node** | `puzzlebot_teleop.py` | Handles manual control inputs |
-| **Controller** | `robot_controller.py` | Main control logic and task execution |
-| **SLAM Node** | `slam_node.py` | Simultaneous Localization and Mapping |
+### Launch Files
 
-### Node Interfaces
-
-- **Topics:** Standard ROS2 topics for sensor data, commands, and state
-- **Services:** Configuration and status services
-- **Actions:** Long-running tasks like navigation goals
+- **teleop.launch.py**: Launches the teleoperation system
 
 ---
 
@@ -167,80 +144,28 @@ The system comprises several ROS2 nodes, each handling specific aspects of robot
    source ~/ros2_ws/install/setup.bash
    ```
 
-2. **Launch core system:**
+2. **Launch teleoperation:**
    ```bash
-   ros2 launch iolair sim.launch.py
+   ros2 launch iolair teleop.launch.py
    ```
 
-3. **Launch with SLAM:**
-   ```bash
-   ros2 launch iolair slamSim.launch.py
-   ```
+### Individual Scripts
 
-### Individual Nodes
-
-Run specific nodes for testing:
+Run specific scripts for testing:
 
 ```bash
+# Robot controller
+ros2 run iolair puzzlebotController
+
+# Goal navigation
+ros2 run iolair puzzlebotGoToGoal
+
+# Odometry
+ros2 run iolair puzzlebotOdometry
+
 # Teleoperation
-ros2 run iolair puzzlebot_teleop
-
-# Map publishing
-ros2 run iolair map_publisher_node
-
-# Localization
-ros2 run iolair mcl_node
+ros2 run iolair puzzlebotTeleop
 ```
-
-### Visualization
-
-Launch RViz for monitoring:
-```bash
-rviz2 -d src/iolair/rviz/puzzlebot.rviz
-```
-
----
-
-## 🔄 System Architecture
-
-```
-Physical Puzzlebot
-        │
-        ▼
-┌─────────────────────────────────────┐
-│         Sensor Inputs                │
-│  • LIDAR                            │
-│  • Wheel Encoders                   │
-│  • Camera (ArUco/QR)                │
-│  • Microphone (Voice)               │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│         ROS2 Nodes                  │
-│  ┌─────────────────────────────────┐ │
-│  │ Odometry Node ← Encoders        │ │
-│  └─────────────────────────────────┘ │
-│  ┌─────────────────────────────────┐ │
-│  │ SLAM Node ← LIDAR + Odometry    │ │
-│  └─────────────────────────────────┘ │
-│  ┌─────────────────────────────────┐ │
-│  │ MCL Node ← Map + LIDAR          │ │
-│  └─────────────────────────────────┘ │
-│  ┌─────────────────────────────────┐ │
-│  │ Controller ← Localization       │ │
-│  └─────────────────────────────────┘ │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│         Actuator Outputs            │
-│  • Motor Commands                   │
-│  • Status Feedback                  │
-└─────────────────────────────────────┘
-```
-
----
 
 ## 🤝 Contributing
 
