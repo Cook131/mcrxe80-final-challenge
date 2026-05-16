@@ -98,8 +98,8 @@ def generate_launch_description():
                     # beam_skip=0  → adaptive (auto sub-samples to target_beams).
                     # beam_skip=1  → all beams (best quality, most CPU).
                     # beam_skip=3  → recommended for slow Raspberry Pi.
-                    'beam_skip':       0,      # adaptive mode
-                    'target_beams':    180,    # beams used per scan in adaptive mode
+                    'beam_skip':       1,      # adaptive mode
+                    'target_beams':    360,    # beams used per scan in adaptive mode
 
                     # ── Log-odds update model ─────────────────────────────
                     'log_odds_occ':    0.85,
@@ -112,14 +112,14 @@ def generate_launch_description():
                     # scan-to-map).  Set use_icp: False if the Pi is overloaded
                     # (monitor /slam/diagnostics → avg_scan_ms).
                     'use_icp':            True,
-                    'icp_max_iter':       20,
+                    'icp_max_iter':       50,
                     'icp_tolerance':      1e-4,
                     'icp_max_correction': 0.4,  # m — discard wilder jumps
 
                     # ── Motion gate ───────────────────────────────────────
                     # Map is only updated when the robot has moved this much.
                     # Prevents noise accumulation when standing still.
-                    'min_travel_m':    0.05,   # metres
+                    'min_travel_m':    0.02,   # metres
                     'min_travel_rad':  0.02,   # radians (~1.1 °)
 
                     # ── Publishing ────────────────────────────────────────
