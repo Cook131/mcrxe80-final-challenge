@@ -107,7 +107,7 @@ class PuzzlebotController(Node):
 
     # Velocidad angular máxima que puede entregar el motor [rad/s]
     # ~200 rpm → 200/60 * 2π ≈ 21 rad/s
-    MAX_WHEEL_VEL = 21.0
+    MAX_WHEEL_VEL = 25.0
 
     def __init__(self):
         super().__init__('puzzlebot_main_controller')

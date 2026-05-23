@@ -127,7 +127,7 @@ def generate_launch_description():
                     'tf_rate':         20.0,   # Hz — map→odom TF
 
                     # ── Map save destination ──────────────────────────────
-                    'save_map_path':   '/tmp/slam_map',
+                    'save_map_path':   '/home/serch/mcrxe80-final-challenge/src/iolair/maps',
                 }],
             )
         ],

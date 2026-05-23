@@ -35,9 +35,9 @@ class PuzzlebotTeleop(Node):
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # ── Parámetros ROS 2 ──────────────────────────────────────────────
-        self.declare_parameter('max_lin',   0.4)
-        self.declare_parameter('max_ang',   0.8)
-        self.declare_parameter('accel_lin', 0.2)
+        self.declare_parameter('max_lin',   0.2)
+        self.declare_parameter('max_ang',   0.5)
+        self.declare_parameter('accel_lin', 0.05)
         self.declare_parameter('accel_ang', 0.05)
 
         self.max_lin   = self.get_parameter('max_lin').value
