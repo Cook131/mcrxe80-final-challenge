@@ -40,7 +40,8 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import Int32, String
+from std_msgs.msg import Int32, String, Float32
+import math
 
 # ─────────────────────────────────────────────────────────────────────
 # Mapas de IDs y etiquetas  (diccionario único 4X4_50)
@@ -197,6 +198,8 @@ class ArucoDetectorNode(Node):
         self.pub_image    = self.create_publisher(Image,       '/aruco/imagen',   10)
         self.pub_waypoint = self.create_publisher(PoseStamped, '/aruco/waypoint', 10)
         self.pub_qr       = self.create_publisher(String,      '/aruco/qr',       10)
+        self.pub_distance = self.create_publisher(Float32, '/aruco/distance', 10)
+        self.pub_angle    = self.create_publisher(Float32, '/aruco/angle',    10)
 
         self._prev_key = None
         self._prev_qr  = ""
@@ -289,6 +292,27 @@ class ArucoDetectorNode(Node):
             pm.header.frame_id = 'camera_optical_frame'
             self.pub_waypoint.publish(pm)
         return rv, tv
+    
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Ángulo y distancia desde tvec (frame de cámara)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _angle_distance(self, tvec):
+        """
+        tvec en frame óptico de cámara:
+            X → derecha, Y → abajo, Z → profundidad (hacia el marcador)
+
+        Retorna:
+            distance  float  metros (norma euclidiana)
+            angle_h   float  grados   positivo = marcador a la DERECHA
+            angle_v   float  grados   positivo = marcador ABAJO
+        """
+        tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+        distance = math.sqrt(tx*tx + ty*ty + tz*tz)
+        angle_h  = math.degrees(math.atan2(tx,  tz))   # bearing horizontal
+        angle_v  = math.degrees(math.atan2(-ty, tz))   # elevación (positivo = arriba)
+        return distance, angle_h, angle_v
 
     # ─────────────────────────────────────────────────────────────────
     # Anotación visual
@@ -302,13 +326,34 @@ class ArucoDetectorNode(Node):
 
         if rvec is not None and self.pose_ready:
             cv2.drawFrameAxes(out, self.camera_matrix, self.dist_coeffs,
-                              rvec, tvec, self.marker_size * 0.5)
-            label += f" [{np.linalg.norm(tvec):.2f}m]"
+                            rvec, tvec, self.marker_size * 0.5)
 
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-        cv2.rectangle(out, (cx-5, cy-th-8), (cx+tw+5, cy+4), (0,0,0), -1)
-        cv2.putText(out, label, (cx, cy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+            dist, angle_h, angle_v = self._angle_distance(tvec)
+            # Línea de mira al marcador
+            h, w = out.shape[:2]
+            cv2.line(out, (w // 2, h // 2), (cx, cy), color, 1, cv2.LINE_AA)
+
+            info_lines = [
+                label,
+                f"dist  {dist:.3f} m",
+                f"az  {angle_h:+.1f} deg",
+                f"el  {angle_v:+.1f} deg",
+            ]
+        else:
+            info_lines = [label]
+
+        # Caja de texto multilínea
+        font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1
+        line_h = 18
+        box_w  = max(cv2.getTextSize(l, font, scale, thick)[0][0] for l in info_lines) + 10
+        box_h  = line_h * len(info_lines) + 6
+        cv2.rectangle(out,
+                    (cx - 5, cy - box_h),
+                    (cx + box_w, cy + 4),
+                    (0, 0, 0), -1)
+        for i, line in enumerate(info_lines):
+            cv2.putText(out, line, (cx, cy - box_h + line_h * (i + 1)),
+                        font, scale, color, thick, cv2.LINE_AA)
 
     def _draw_qr(self, out, qr_data: str, qr_points):
         """Dibuja el bbox del QR usando los puntos ya detectados en _detect_all."""
@@ -346,7 +391,56 @@ class ArucoDetectorNode(Node):
         if qr_data:
             self._draw_qr(out, qr_data, qr_points)
 
+        self._draw_crosshair(out)
+
         return out
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # Crosshair / mira
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _draw_crosshair(self, out):
+        """
+        Mira táctica centrada:
+        - Cruz con gap central
+        - Círculo interno y externo
+        - Marcas de escala a 45 °
+        """
+        h, w = out.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        color_outer = (200, 200, 200)   # gris claro
+        color_inner = (0,   255, 255)   # cian
+        alpha_layer = out.copy()
+
+        R_outer = 40
+        R_inner = 18
+        gap     = 10   # píxeles sin línea al centro
+        arm_len = 30
+
+        # Círculos
+        cv2.circle(alpha_layer, (cx, cy), R_outer, color_outer, 1, cv2.LINE_AA)
+        cv2.circle(alpha_layer, (cx, cy), R_inner, color_inner, 1, cv2.LINE_AA)
+
+        # Cruz — 4 brazos con gap
+        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+            x0 = cx + dx * gap
+            y0 = cy + dy * gap
+            x1 = cx + dx * (gap + arm_len)
+            y1 = cy + dy * (gap + arm_len)
+            cv2.line(alpha_layer, (x0, y0), (x1, y1), color_inner, 1, cv2.LINE_AA)
+
+        # Ticks diagonales a 45° (en el círculo exterior)
+        for angle_deg in range(0, 360, 45):
+            rad   = math.radians(angle_deg)
+            tx0   = int(cx + R_outer       * math.cos(rad))
+            ty0   = int(cy + R_outer       * math.sin(rad))
+            tx1   = int(cx + (R_outer + 8) * math.cos(rad))
+            ty1   = int(cy + (R_outer + 8) * math.sin(rad))
+            cv2.line(alpha_layer, (tx0, ty0), (tx1, ty1), color_outer, 1, cv2.LINE_AA)
+
+        # Blend semi-transparente
+        cv2.addWeighted(alpha_layer, 0.75, out, 0.25, 0, out)
 
     # ─────────────────────────────────────────────────────────────────
     # Callback principal
@@ -455,6 +549,30 @@ class ArucoDetectorNode(Node):
                         f" → pub_id={waypoint_pub_id(mid)}{d}"
                     )
                 self._prev_key = curr_key
+
+            # ── Publica distancia y ángulo del marcador prioritario ───
+            # (mismo orden de prioridad: interno > externo > 6x6)
+            priority_tv = None
+            if internal_hits:
+                idx = 0
+                rv, tv = poses_int[idx]
+                if tv is not None:
+                    priority_tv = tv
+            elif external_hits:
+                idx = 0
+                rv, tv = poses_ext[idx]
+                if tv is not None:
+                    priority_tv = tv
+            elif wp6x6_hits:
+                idx = 0
+                rv, tv = poses_6x6[idx]
+                if tv is not None:
+                    priority_tv = tv
+
+            if priority_tv is not None:
+                dist, angle_h, _ = self._angle_distance(priority_tv)
+                self.pub_distance.publish(Float32(data=float(dist)))
+                self.pub_angle.publish(Float32(data=float(angle_h)))
 
         else:
             self.pub_id.publish(Int32(data=unknown_id))
