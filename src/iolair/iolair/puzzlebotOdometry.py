@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-puzzlebotOdometry_EKF.py — Full EKF Odometry with automatic MCL / ICP switching
+puzzlebotOdometry.py — Full EKF Odometry with automatic MCL / ICP switching
 =================================================================================
 
 Measurement source selection
 -----------------------------
 Two external pose sources are supported:
 
-  SOURCE A — /mcl/pose  (PoseWithCovarianceStamped)
+  SOURCE A — /mcl/pose   (PoseWithCovarianceStamped)
       Published by puzzlebotMCL.py when localising on a known map.
 
-  SOURCE B — /icp/pose  (PoseWithCovarianceStamped)
+  SOURCE B — /icp/pose   (PoseWithCovarianceStamped)
       Published by slam_node when building a map with ICP scan matching.
+
+  SOURCE C — /aruco/pose (PoseWithCovarianceStamped)
+      Published by aruco_localizer.py — triangulación de marcadores ArUco.
+      Tiene prioridad más baja que MCL pero más alta que ICP.
+      Útil cuando no hay mapa pero sí marcadores con posición conocida.
 
 The node monitors BOTH topics.  Whichever one has published a message
 within the last `source_timeout` seconds is considered **active**.
@@ -24,9 +29,11 @@ terminal which source the EKF is currently fusing.
 State machine
 -------------
   PREDICT_ONLY  → no external source alive
-  MCL_ACTIVE    → /mcl/pose  alive  (localisation mode)
-  ICP_ACTIVE    → /icp/pose  alive  (mapping mode)
-  MCL_PRIORITY  → both alive        (MCL wins)
+  MCL_ACTIVE    → /mcl/pose   alive  (localisation mode)
+  ICP_ACTIVE    → /icp/pose   alive  (mapping mode)
+  ARUCO_ACTIVE  → /aruco/pose alive  (ArUco triangulation mode)
+  MCL_PRIORITY  → both MCL + any other alive  (MCL wins)
+  ARUCO_PRIORITY→ ARUCO + ICP alive            (ARUCO wins over ICP)
 
 Fallback behaviour
 ------------------
@@ -73,6 +80,7 @@ Subscribes
   /VelocityEncR    (std_msgs/Float32)
   /mcl/pose        (geometry_msgs/PoseWithCovarianceStamped)
   /icp/pose        (geometry_msgs/PoseWithCovarianceStamped)
+  /aruco/pose      (geometry_msgs/PoseWithCovarianceStamped)
 """
 
 import math
@@ -118,10 +126,12 @@ def euler_to_quaternion(roll: float, pitch: float, yaw: float) -> Quaternion:
 # ── source state machine ───────────────────────────────────────────────────────
 
 class SourceState:
-    PREDICT_ONLY = 'PREDICT_ONLY'   # no external correction
-    MCL_ACTIVE   = 'MCL_ACTIVE'     # localisation mode
-    ICP_ACTIVE   = 'ICP_ACTIVE'     # mapping mode
-    MCL_PRIORITY = 'MCL_PRIORITY'   # both alive — MCL wins
+    PREDICT_ONLY   = 'PREDICT_ONLY'   # no external correction
+    MCL_ACTIVE     = 'MCL_ACTIVE'     # localisation mode
+    ICP_ACTIVE     = 'ICP_ACTIVE'     # mapping mode
+    ARUCO_ACTIVE   = 'ARUCO_ACTIVE'   # ArUco triangulation mode
+    MCL_PRIORITY   = 'MCL_PRIORITY'   # MCL + any other alive — MCL wins
+    ARUCO_PRIORITY = 'ARUCO_PRIORITY' # ARUCO + ICP alive — ARUCO wins
 
 
 # ── EKF node ───────────────────────────────────────────────────────────────────
@@ -168,8 +178,9 @@ class PuzzlebotOdometry(Node):
         # ── source tracking ───────────────────────────────────────────────
         # Wall-clock timestamps of the last message from each source.
         # -1.0 means "never received".
-        self._last_mcl_t: float = -1.0
-        self._last_icp_t: float = -1.0
+        self._last_mcl_t:   float = -1.0
+        self._last_icp_t:   float = -1.0
+        self._last_aruco_t: float = -1.0
 
         self._current_source = SourceState.PREDICT_ONLY
         self._prev_source    = SourceState.PREDICT_ONLY
@@ -191,6 +202,8 @@ class PuzzlebotOdometry(Node):
             PoseWithCovarianceStamped, '/mcl/pose', self._cb_mcl, 10)
         self.create_subscription(
             PoseWithCovarianceStamped, '/icp/pose', self._cb_icp, 10)
+        self.create_subscription(
+            PoseWithCovarianceStamped, '/aruco/pose', self._cb_aruco, 10)
 
         # ── publishers ────────────────────────────────────────────────────
         self._pub_odom   = self.create_publisher(Odometry, '/odom', 10)
@@ -206,7 +219,7 @@ class PuzzlebotOdometry(Node):
             f'EKF Odometry started — '
             f'r={self._R_wheel} m, L={self._L} m, '
             f'rate={self._rate} Hz, timeout={self._timeout} s\n'
-            f'Waiting for /mcl/pose or /icp/pose ...'
+            f'Waiting for /mcl/pose, /icp/pose or /aruco/pose ...'
         )
 
     # ── encoder callbacks ──────────────────────────────────────────────────────
@@ -233,6 +246,15 @@ class PuzzlebotOdometry(Node):
         if self._current_source == SourceState.ICP_ACTIVE:
             self._ekf_update(msg, 'ICP')
 
+    def _cb_aruco(self, msg: PoseWithCovarianceStamped):
+        """ArUco triangulated pose arrived — stamp it, re-evaluate state, fuse if selected."""
+        self._last_aruco_t = time.monotonic()
+        self._update_source_state()
+
+        if self._current_source in (SourceState.ARUCO_ACTIVE,
+                                    SourceState.ARUCO_PRIORITY):
+            self._ekf_update(msg, 'ARUCO')
+
     # ── source state machine ───────────────────────────────────────────────────
 
     def _update_source_state(self):
@@ -240,21 +262,27 @@ class PuzzlebotOdometry(Node):
         Decide which source is active based on recency of last messages.
 
         Priority rules:
-          1. MCL beats ICP when both are alive (MCL is more accurate on a
-             known map and should not be overridden by noisy scan matching).
-          2. Whichever single source is alive wins.
-          3. Neither alive → PREDICT_ONLY (pure dead-reckoning).
+          1. MCL beats everything when alive (most accurate on a known map).
+          2. ARUCO beats ICP when alive (global pose without full map).
+          3. ICP alone → ICP_ACTIVE.
+          4. Neither alive → PREDICT_ONLY (pure dead-reckoning).
         """
-        now    = time.monotonic()
-        mcl_ok = (self._last_mcl_t > 0 and
-                  now - self._last_mcl_t < self._timeout)
-        icp_ok = (self._last_icp_t > 0 and
-                  now - self._last_icp_t < self._timeout)
+        now      = time.monotonic()
+        mcl_ok   = (self._last_mcl_t   > 0 and
+                    now - self._last_mcl_t   < self._timeout)
+        icp_ok   = (self._last_icp_t   > 0 and
+                    now - self._last_icp_t   < self._timeout)
+        aruco_ok = (self._last_aruco_t > 0 and
+                    now - self._last_aruco_t < self._timeout)
 
-        if mcl_ok and icp_ok:
-            new_state = SourceState.MCL_PRIORITY
-        elif mcl_ok:
-            new_state = SourceState.MCL_ACTIVE
+        if mcl_ok:
+            # MCL siempre gana — PREDICT_ONLY, ICP y ARUCO quedan silenciados
+            new_state = SourceState.MCL_PRIORITY if (icp_ok or aruco_ok) \
+                        else SourceState.MCL_ACTIVE
+        elif aruco_ok and icp_ok:
+            new_state = SourceState.ARUCO_PRIORITY   # ARUCO gana sobre ICP
+        elif aruco_ok:
+            new_state = SourceState.ARUCO_ACTIVE
         elif icp_ok:
             new_state = SourceState.ICP_ACTIVE
         else:
@@ -277,10 +305,12 @@ class PuzzlebotOdometry(Node):
         self._prev_source = self._current_source
 
         labels = {
-            SourceState.PREDICT_ONLY: '⚠  PREDICT_ONLY  — no external correction (covariance growing)',
-            SourceState.MCL_ACTIVE:   '✓  MCL_ACTIVE    — localisation mode (/mcl/pose)',
-            SourceState.ICP_ACTIVE:   '✓  ICP_ACTIVE    — mapping mode (/icp/pose)',
-            SourceState.MCL_PRIORITY: '✓  MCL_PRIORITY  — both alive, MCL selected',
+            SourceState.PREDICT_ONLY:   '⚠  PREDICT_ONLY   — no external correction (covariance growing)',
+            SourceState.MCL_ACTIVE:     '✓  MCL_ACTIVE     — localisation mode (/mcl/pose)',
+            SourceState.ICP_ACTIVE:     '✓  ICP_ACTIVE     — mapping mode (/icp/pose)',
+            SourceState.ARUCO_ACTIVE:   '✓  ARUCO_ACTIVE   — ArUco triangulation (/aruco/pose)',
+            SourceState.MCL_PRIORITY:   '✓  MCL_PRIORITY   — MCL selected (beats ARUCO/ICP)',
+            SourceState.ARUCO_PRIORITY: '✓  ARUCO_PRIORITY — ARUCO selected (beats ICP)',
         }
         label = labels[self._current_source]
 
