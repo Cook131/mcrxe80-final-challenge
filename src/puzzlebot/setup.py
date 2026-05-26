@@ -10,6 +10,10 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('lib/python3.10/site-packages/puzzlebot', [   # ← aquí el cambio
+            'puzzlebot/camera_params.npz',
+            'puzzlebot/camera_params.json',
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -22,7 +26,8 @@ setup(
         'console_scripts': [
             # The format is: 'executable_name = package_name.file_name:main'
             'camera_node = puzzlebot.camera_node:main',
-            'aruco_detector = puzzlebot.aruco_detector:main'
+            'aruco_detector = puzzlebot.aruco_detector:main',
+            'yolo_vision = puzzlebot.yolo_vision:main',
         ],
     },
 )

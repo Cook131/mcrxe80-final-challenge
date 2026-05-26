@@ -1,0 +1,163 @@
+"""
+yolo_detector_node.py
+───────────────────────────────────────────────────────────────
+YOLOv8 Detector Node  —  Cookie / E80 Group R&D
+Se suscribe a /camera/image_raw y publica detecciones + imagen
+anotada (mismo estilo que aruco_detector).
+
+Topics:
+  SUB  /camera/image_raw        sensor_msgs/Image
+  PUB  /yolo/imagen             sensor_msgs/Image   (visualizacion)
+  PUB  /yolo/detecciones        std_msgs/String     (JSON)
+
+Uso:
+  ros2 run <paquete> yolo_detector_node
+───────────────────────────────────────────────────────────────
+"""
+
+# =============================================================
+# CONFIGURACION — edita solo este bloque
+# =============================================================
+WEIGHTS      = "/home/cookie/Documents/best.pt"       # <- pon aqui la ruta absoluta a best.pt
+CAMERA_TOPIC = "/camera/image_raw"
+CONF         = 0.85                    # confianza minima en vivo
+DEVICE       = "cpu"                     # "0" = GPU, "cpu" = CPU
+IMGSZ        = 320                     # resolucion de inferencia
+# =============================================================
+
+import json
+import rclpy
+from rclpy.node      import Node
+from rclpy.qos       import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from sensor_msgs.msg import Image
+from std_msgs.msg    import String
+from cv_bridge       import CvBridge
+from ultralytics     import YOLO
+import cv2
+
+# ── Colores por clase (BGR) — mismo estilo que aruco detector ──
+CLASS_COLORS = {
+    "nalmart" : (0,   255, 255),   # amarillo
+    "nemezon" : (255, 165, 0  ),   # naranja
+    "nepsi"   : (0,   255, 0  ),   # verde
+}
+DEFAULT_COLOR = (0, 200, 255)      # cyan para clases no listadas
+
+
+class YoloDetectorNode(Node):
+    def __init__(self):
+        super().__init__("yolo_detector")
+
+        # ── Modelo ────────────────────────────────────────────
+        self.model  = YOLO(WEIGHTS)
+        self.conf   = CONF
+        self.device = DEVICE
+        self.imgsz  = IMGSZ
+        self.bridge = CvBridge()
+
+        # ── QoS: BEST_EFFORT igual que el aruco detector ──────
+        qos_cam = QoSProfile(
+            reliability = QoSReliabilityPolicy.BEST_EFFORT,
+            history     = QoSHistoryPolicy.KEEP_LAST,
+            depth       = 1,
+        )
+
+        # ── Subscriber ────────────────────────────────────────
+        self.sub = self.create_subscription(
+            Image, CAMERA_TOPIC, self.image_callback, qos_cam)
+
+        # ── Publishers ────────────────────────────────────────
+        self.img_pub = self.create_publisher(Image,  "/yolo/imagen",      10)
+        self.det_pub = self.create_publisher(String, "/yolo/detecciones", 10)
+
+        self.get_logger().info(
+            f"YoloDetector listo | topic: {CAMERA_TOPIC} | "
+            f"modelo: {WEIGHTS} | conf: {CONF}"
+        )
+
+    # ─────────────────────────────────────────────────────────
+    def image_callback(self, msg: Image):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            self.get_logger().error(f"Error decodificando imagen: {e}")
+            return
+
+        results = self.model.predict(
+            frame,
+            conf    = self.conf,
+            device  = self.device,
+            verbose = False,
+            imgsz   = self.imgsz,
+        )
+
+        annotated  = frame.copy()
+        detections = []
+
+        for r in results:
+            for box in r.boxes:
+                cls_name = self.model.names[int(box.cls)]
+                conf_val = float(box.conf)
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+
+                color = CLASS_COLORS.get(cls_name, DEFAULT_COLOR)
+
+                # Bounding box
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+
+                # Label con fondo
+                label = f"{cls_name} {conf_val:.2f}"
+                (tw, th), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+                cv2.rectangle(
+                    annotated,
+                    (x1, y1 - th - 6),
+                    (x1 + tw + 4, y1),
+                    color, -1
+                )
+                cv2.putText(
+                    annotated, label,
+                    (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 0, 0), 1, cv2.LINE_AA
+                )
+
+                detections.append({
+                    "class" : cls_name,
+                    "conf"  : round(conf_val, 3),
+                    "bbox"  : [x1, y1, x2, y2],
+                })
+
+        # Publicar imagen anotada
+        try:
+            img_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
+            img_msg.header = msg.header
+            self.img_pub.publish(img_msg)
+        except Exception as e:
+            self.get_logger().error(f"Error publicando imagen: {e}")
+
+        # Publicar detecciones JSON
+        det_msg      = String()
+        det_msg.data = json.dumps(detections)
+        self.det_pub.publish(det_msg)
+
+        if detections:
+            clases = [d["class"] for d in detections]
+            self.get_logger().info(f"Detectado: {clases}")
+
+
+# ─────────────────────────────────────────────────────────────
+def main(args=None):
+    rclpy.init(args=args)
+    node = YoloDetectorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
