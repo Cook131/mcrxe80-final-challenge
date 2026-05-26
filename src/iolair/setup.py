@@ -34,6 +34,7 @@ setup(
             'controller = iolair.puzzlebotController:main',
             'teleop     = iolair.puzzlebotTeleop:main',
             'slam       = iolair.slam_node:main',
+            'mcl        = iolair.mcl_node:main',
         ],
     },
 )
