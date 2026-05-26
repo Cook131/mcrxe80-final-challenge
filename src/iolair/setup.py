@@ -34,6 +34,7 @@ setup(
             'controller = iolair.puzzlebotController:main',
             'teleop     = iolair.puzzlebotTeleop:main',
             'slam       = iolair.slam_node:main',
+            'go_to_goal  = iolair.puzzlebotGoToGoal:main',
         ],
     },
 )
