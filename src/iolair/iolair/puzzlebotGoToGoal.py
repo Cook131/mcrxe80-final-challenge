@@ -26,9 +26,9 @@ class GoToGoalNode(Node):
         self.kp_w, self.ki_w, self.kd_w = 1.0, 0.0, 0.0
 
         # --- LÍMITES DE SATURACIÓN ---
-        self.max_linear_velocity = 4.0  # m/s (Más rápido en recta)
-        self.max_angular_velocity = 1.0  # rad/s (Giro lento y controlado)
-        self.angle_threshold = 0.05      # Radianes (~17°). Si el error es mayor, prioriza giro.
+        self.max_linear_velocity = 0.22   # m/s — razonable para hardware real
+        self.max_angular_velocity = 1.0   # rad/s
+        self.angle_threshold = 0.15       # ~8.6° — punto de equilibrio entre
 
         # --- VARIABLES DE CONTROL ---
         self.error_dist_prev = 0.0
@@ -109,10 +109,11 @@ class GoToGoalNode(Node):
             # Segundo: Controlar el avance lineal según la alineación
             if abs(error_angle) > self.angle_threshold:
                 # Si está muy desalineado, casi no avanza (solo gira)
-                cmd.linear.x = 0.02
+                cmd.linear.x = 0.0
             else:
-                # Si está alineado, aplica la velocidad lineal (hasta 0.7 m/s)
-                cmd.linear.x = min(v_out, self.max_linear_velocity)
+                # Alineado: avanzar con corrección angular proporcional al alineamiento
+                align_factor = math.cos(error_angle)
+                cmd.linear.x = min(v_out * align_factor, self.max_linear_velocity)
 
             # Guardar errores para el siguiente ciclo
             self.error_dist_prev = dist
