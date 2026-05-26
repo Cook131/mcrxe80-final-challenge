@@ -20,8 +20,8 @@ Uso:
 # =============================================================
 WEIGHTS      = "/home/cookie/Documents/best.pt"       # <- pon aqui la ruta absoluta a best.pt
 CAMERA_TOPIC = "/camera/image_raw"
-CONF         = 0.85                    # confianza minima en vivo
-DEVICE       = "cpu"                     # "0" = GPU, "cpu" = CPU
+CONF         = 0.65                    # confianza minima en vivo
+DEVICE       = "0"                     # "0" = GPU, "cpu" = CPU
 IMGSZ        = 320                     # resolucion de inferencia
 # =============================================================
 
@@ -76,6 +76,42 @@ class YoloDetectorNode(Node):
         )
 
     # ─────────────────────────────────────────────────────────
+
+    def _draw_crosshair(self, out):
+        h, w = out.shape[:2]
+        cx, cy = w // 2, h // 2
+        color  = (0, 255, 255)
+        arm, gap = 12, 5
+        cv2.line(out, (cx - gap - arm, cy), (cx - gap,       cy), color, 1, cv2.LINE_AA)
+        cv2.line(out, (cx + gap,       cy), (cx + gap + arm, cy), color, 1, cv2.LINE_AA)
+        cv2.line(out, (cx, cy - gap - arm), (cx, cy - gap),       color, 1, cv2.LINE_AA)
+        cv2.line(out, (cx, cy + gap),       (cx, cy + gap + arm), color, 1, cv2.LINE_AA)
+        cv2.circle(out, (cx, cy), 2, color, -1, cv2.LINE_AA)
+
+    def _draw_alignment(self, out, x1, y1, x2, y2, color):
+        """Linea desde centro de imagen al centro del bbox + offset text"""
+        h, w   = out.shape[:2]
+        img_cx, img_cy = w // 2, h // 2
+        box_cx = (x1 + x2) // 2
+        box_cy = (y1 + y2) // 2
+
+        # Linea de alineamiento
+        cv2.line(out, (img_cx, img_cy), (box_cx, box_cy), color, 1, cv2.LINE_AA)
+        cv2.circle(out, (box_cx, box_cy), 3, color, -1, cv2.LINE_AA)
+
+        # Offset en pixeles respecto al centro
+        dx = box_cx - img_cx
+        dy = box_cy - img_cy
+        offset_text = f"dx:{dx:+d} dy:{dy:+d}"
+        (tw, th), _ = cv2.getTextSize(offset_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        mid_x = (img_cx + box_cx) // 2
+        mid_y = (img_cy + box_cy) // 2
+        cv2.rectangle(out, (mid_x - 2, mid_y - th - 4),
+                        (mid_x + tw + 2, mid_y + 2), (0, 0, 0), -1)
+        cv2.putText(out, offset_text, (mid_x, mid_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    # ─────────────────────────────────────────────────────────
     def image_callback(self, msg: Image):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -127,6 +163,15 @@ class YoloDetectorNode(Node):
                     "conf"  : round(conf_val, 3),
                     "bbox"  : [x1, y1, x2, y2],
                 })
+
+        # Crosshair siempre visible
+        self._draw_crosshair(annotated)
+
+        # Linea de alineamiento a TODOS los objetos detectados
+        for d in detections:
+            x1, y1, x2, y2 = d["bbox"]
+            color = CLASS_COLORS.get(d["class"], DEFAULT_COLOR)
+            self._draw_alignment(annotated, x1, y1, x2, y2, color)
 
         # Publicar imagen anotada
         try:
