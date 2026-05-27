@@ -36,6 +36,8 @@ setup(
             'slam       = iolair.slam_node:main',
             'go_to_goal  = iolair.puzzlebotGoToGoal:main',
             'mcl        = iolair.mcl_node:main',
+            'aruco_localizer       = iolair.aruco_localizer:main',
+            'bug_IBA       = iolair.bug_IBA:main',
         ],
     },
 )

@@ -25,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             # The format is: 'executable_name = package_name.file_name:main'
-            'camera_node = puzzlebot.camera_node:main',
             'aruco_detector = puzzlebot.aruco_detector:main',
             'yolo_vision = puzzlebot.yolo_vision:main',
         ],
