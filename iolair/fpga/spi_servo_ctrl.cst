@@ -1,0 +1,50 @@
+// ============================================================
+//  spi_servo_ctrl.cst
+//  Physical Constraints — Tang Nano 20K (GW2AR-18C QN88)
+// ============================================================
+
+// --- Reloj del sistema (oscilador 27 MHz onboard) -----------
+IO_LOC  "clk"        4;
+IO_PORT "clk"        PULL_MODE=NONE IO_TYPE=LVCMOS33;
+
+// --- DIP switch fallback (activo alto) ----------------------
+//  Lado izquierdo del header — sin cambio vs tu .cst original
+IO_LOC  "pb1"        25;   // IOB6A
+IO_PORT "pb1"        PULL_MODE=DOWN IO_TYPE=LVCMOS33;
+
+IO_LOC  "pb2"        26;   // IOB6B
+IO_PORT "pb2"        PULL_MODE=DOWN IO_TYPE=LVCMOS33;
+
+// --- Salidas PWM a los servos --------------------------------
+//  Lado izquierdo del header — sin cambio vs tu .cst original
+IO_LOC  "pwm1"       27;   // IOB8A
+IO_PORT "pwm1"       PULL_MODE=NONE IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC  "pwm2"       28;   // IOB8B
+IO_PORT "pwm2"       PULL_MODE=NONE IO_TYPE=LVCMOS33 DRIVE=8;
+
+// --- SPI slave + selector de modo ---------------------------
+//  Cluster lado DERECHO inferior del header (pines físicamente juntos)
+//
+//  IOR49A (49) ── spi_enable   → jumper/switch a 3V3 o GND
+//  IOR40B (72) ── sck          → Jetson Pin 23
+//  IOR44A (71) ── mosi         → Jetson Pin 19
+//  IOR38B (53) ── miso         → Jetson Pin 21
+//  IOR39A (52) ── cs_n         → Jetson Pin 24
+
+IO_LOC  "spi_enable" 49;   // IOR49A
+IO_PORT "spi_enable" PULL_MODE=DOWN IO_TYPE=LVCMOS33;
+//  DOWN → flota en 0 = modo DIP por defecto (seguro al arrancar)
+
+IO_LOC  "sck"        72;   // IOR40B
+IO_PORT "sck"        PULL_MODE=DOWN IO_TYPE=LVCMOS33;
+
+IO_LOC  "mosi"       71;   // IOR44A
+IO_PORT "mosi"       PULL_MODE=DOWN IO_TYPE=LVCMOS33;
+
+IO_LOC  "miso"       53;   // IOR38B
+IO_PORT "miso"       PULL_MODE=NONE IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC  "cs_n"       52;   // IOR39A
+IO_PORT "cs_n"       PULL_MODE=UP IO_TYPE=LVCMOS33;
+//  UP en CS_N → queda inactivo (alto) si el cable se desconecta
