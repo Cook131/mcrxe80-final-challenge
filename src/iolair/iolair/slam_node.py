@@ -282,10 +282,13 @@ class SLAMNode(Node):
         odom_y   = msg.pose.pose.position.y
         odom_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
 
+        # Transformación de posición usando la corrección calculada
         cos_c = math.cos(self._corr_yaw)
         sin_c = math.sin(self._corr_yaw)
         self.robot_x   = cos_c * odom_x - sin_c * odom_y + self._corr_x
         self.robot_y   = sin_c * odom_x + cos_c * odom_y + self._corr_y
+        
+        # CAMBIO AQUÍ: Asegurar consistencia en la dirección del ángulo compuesto
         self.robot_yaw = normalize_angle(odom_yaw + self._corr_yaw)
 
     def _cb_scan(self, msg: LaserScan):
@@ -309,7 +312,9 @@ class SLAMNode(Node):
                     new_corr_y = sin_d * self._corr_x + cos_d * self._corr_y + dy
                     self._corr_x = new_corr_x
                     self._corr_y = new_corr_y
-                    self._corr_yaw = normalize_angle(self._corr_yaw + dyaw)
+                    
+                    # CAMBIO AQUÍ: Ajustar el signo según la dirección del drift del ICP
+                    self._corr_yaw = normalize_angle(self._corr_yaw - dyaw)
                     
                     new_rx = cos_d * self.robot_x - sin_d * self.robot_y + dx
                     new_ry = sin_d * self.robot_x + cos_d * self.robot_y + dy
