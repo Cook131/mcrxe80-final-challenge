@@ -147,7 +147,7 @@ class ArucoDetectorNode(Node):
         self.declare_parameter('marker_size',   self.MARKER_SIZE)
         # Offset cámara→base_link en metros [x, y, z] (frame de cámara)
         # Ajustar con la posición física de la cámara en el robot
-        self.declare_parameter('cam_offset', [0.0, 0.0, 0.0])
+        self.declare_parameter('cam_offset', [0.11, 0.0, 0.10])
 
         camera_topic     = self.get_parameter('camera_topic').value
         self.marker_size = float(self.get_parameter('marker_size').value)
