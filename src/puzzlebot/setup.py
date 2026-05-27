@@ -21,7 +21,9 @@ setup(
     maintainer_email='serch@todo.todo',
     description='Camera and Aruco tracking nodes for Puzzlebot on Jetson Nano',
     license='Apache License 2.0',
-    tests_require=['pytest'],
+    extras_require={
+        'test': ['pytest'],
+    },
     entry_points={
         'console_scripts': [
             # The format is: 'executable_name = package_name.file_name:main'
