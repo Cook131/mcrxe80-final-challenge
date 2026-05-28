@@ -57,16 +57,18 @@ UPDATE (on each incoming measurement):
 
 Parameters (--ros-args -p name:=value)
 --------------------------------------
-  wheel_radius      0.05   [m]
-  wheel_base        0.19   [m]
-  rate              50.0   [Hz]
-  q_xy              0.005  process noise – translation  [m²/s]
-  q_theta           0.01   process noise – rotation     [rad²/s]
-  source_timeout    0.5    seconds of silence before a source is declared dead
-  r_pos_default     0.1    fallback R diagonal for xy   [m²]
-  r_yaw_default     0.05   fallback R diagonal for yaw  [rad²]
-  max_innov_pos     1.0    innovation gate – position   [m]
-  max_innov_yaw     1.5    innovation gate – yaw        [rad]
+  wheel_radius        0.05   [m]
+  wheel_base          0.19   [m]
+  rate                50.0   [Hz]
+  q_xy                0.005  process noise – translation  [m²/s]
+  q_theta             0.01   process noise – rotation     [rad²/s]
+  source_timeout      0.5    seconds of silence before MCL/ARUCO declared dead
+  icp_source_timeout  2.5    seconds of silence before ICP declared dead
+                             (ICP publishes only on keyframes, not every scan)
+  r_pos_default       0.1    fallback R diagonal for xy   [m²]
+  r_yaw_default       0.05   fallback R diagonal for yaw  [rad²]
+  max_innov_pos       1.0    innovation gate – position   [m]
+  max_innov_yaw       1.5    innovation gate – yaw        [rad]
 
 Publishes
 ---------
@@ -81,6 +83,20 @@ Subscribes
   /mcl/pose        (geometry_msgs/PoseWithCovarianceStamped)
   /icp/pose        (geometry_msgs/PoseWithCovarianceStamped)
   /aruco/pose      (geometry_msgs/PoseWithCovarianceStamped)
+
+Fixes (v2)
+----------
+  FIX1 — Angular velocity sign corrected: w = R*(wr - wl)/L  (was wl - wr)
+  FIX2 — Wheel velocity read inside ekf_lock to prevent data race with
+          encoder callbacks running on separate executor threads.
+  FIX3 — Process noise Q = diag(q_diag)*dt only; removed erroneous
+          speed_scale multiplier that inflated covariance at high speed.
+  FIX4 — dt upper-bound tightened from 0.5 s to 0.08 s to avoid integrating
+          stale velocities after a long pause.
+  FIX5 — Innovation gate bypassed for the very first update of each source
+          so large initial offsets (common on startup) are not silently dropped.
+  FIX6 — Separate icp_source_timeout parameter (default 2.5 s) because ICP
+          only publishes on accepted keyframes, not every scan cycle.
 """
 
 import math
@@ -126,12 +142,12 @@ def euler_to_quaternion(roll: float, pitch: float, yaw: float) -> Quaternion:
 # ── source state machine ───────────────────────────────────────────────────────
 
 class SourceState:
-    PREDICT_ONLY   = 'PREDICT_ONLY'   # no external correction
-    MCL_ACTIVE     = 'MCL_ACTIVE'     # localisation mode
-    ICP_ACTIVE     = 'ICP_ACTIVE'     # mapping mode
-    ARUCO_ACTIVE   = 'ARUCO_ACTIVE'   # ArUco triangulation mode
-    MCL_PRIORITY   = 'MCL_PRIORITY'   # MCL + any other alive — MCL wins
-    ARUCO_PRIORITY = 'ARUCO_PRIORITY' # ARUCO + ICP alive — ARUCO wins
+    PREDICT_ONLY   = 'PREDICT_ONLY'
+    MCL_ACTIVE     = 'MCL_ACTIVE'
+    ICP_ACTIVE     = 'ICP_ACTIVE'
+    ARUCO_ACTIVE   = 'ARUCO_ACTIVE'
+    MCL_PRIORITY   = 'MCL_PRIORITY'
+    ARUCO_PRIORITY = 'ARUCO_PRIORITY'
 
 
 # ── EKF node ───────────────────────────────────────────────────────────────────
@@ -142,33 +158,36 @@ class PuzzlebotOdometry(Node):
         super().__init__('puzzlebot_odom_ekf_node')
 
         # ── parameters ────────────────────────────────────────────────────
-        self.declare_parameter('wheel_radius',   0.05)
-        self.declare_parameter('wheel_base',     0.19)
-        self.declare_parameter('rate',           50.0)
-        self.declare_parameter('q_xy',           0.005)
-        self.declare_parameter('q_theta',        0.01)
-        self.declare_parameter('source_timeout', 0.5)
-        self.declare_parameter('r_pos_default',  0.1)
-        self.declare_parameter('r_yaw_default',  0.05)
-        self.declare_parameter('max_innov_pos',  1.0)
-        self.declare_parameter('max_innov_yaw',  1.5)
+        self.declare_parameter('wheel_radius',        0.05)
+        self.declare_parameter('wheel_base',          0.19)
+        self.declare_parameter('rate',                50.0)
+        self.declare_parameter('q_xy',                0.005)
+        self.declare_parameter('q_theta',             0.01)
+        self.declare_parameter('source_timeout',      0.5)
+        # FIX6: separate, longer timeout for ICP (keyframe-gated, not every scan)
+        self.declare_parameter('icp_source_timeout',  2.5)
+        self.declare_parameter('r_pos_default',       0.1)
+        self.declare_parameter('r_yaw_default',       0.05)
+        self.declare_parameter('max_innov_pos',       1.0)
+        self.declare_parameter('max_innov_yaw',       1.5)
 
-        self._R_wheel  = self.get_parameter('wheel_radius').value
-        self._L        = self.get_parameter('wheel_base').value
-        self._rate     = self.get_parameter('rate').value
-        q_xy           = self.get_parameter('q_xy').value
-        q_th           = self.get_parameter('q_theta').value
-        self._timeout  = self.get_parameter('source_timeout').value
-        self._r_pos    = self.get_parameter('r_pos_default').value
-        self._r_yaw    = self.get_parameter('r_yaw_default').value
-        self._max_ipos = self.get_parameter('max_innov_pos').value
-        self._max_iyaw = self.get_parameter('max_innov_yaw').value
+        self._R_wheel    = self.get_parameter('wheel_radius').value
+        self._L          = self.get_parameter('wheel_base').value
+        self._rate       = self.get_parameter('rate').value
+        q_xy             = self.get_parameter('q_xy').value
+        q_th             = self.get_parameter('q_theta').value
+        self._timeout    = self.get_parameter('source_timeout').value
+        self._icp_timeout = self.get_parameter('icp_source_timeout').value  # FIX6
+        self._r_pos      = self.get_parameter('r_pos_default').value
+        self._r_yaw      = self.get_parameter('r_yaw_default').value
+        self._max_ipos   = self.get_parameter('max_innov_pos').value
+        self._max_iyaw   = self.get_parameter('max_innov_yaw').value
 
         self._Q_diag = np.array([q_xy, q_xy, q_th])
 
         # ── EKF state ─────────────────────────────────────────────────────
-        self._x  = np.zeros(3)                   # [x, y, theta]
-        self._P  = np.diag([1e-6, 1e-6, 1e-6])  # 3×3 covariance
+        self._x  = np.zeros(3)
+        self._P  = np.diag([1e-6, 1e-6, 1e-6])
         self._I3 = np.eye(3)
 
         # ── wheel velocities ──────────────────────────────────────────────
@@ -176,16 +195,21 @@ class PuzzlebotOdometry(Node):
         self._wr = 0.0
 
         # ── source tracking ───────────────────────────────────────────────
-        # Wall-clock timestamps of the last message from each source.
-        # -1.0 means "never received".
         self._last_mcl_t:   float = -1.0
         self._last_icp_t:   float = -1.0
         self._last_aruco_t: float = -1.0
+
+        # FIX5: track whether each source has ever been fused (bypass gate on first update)
+        self._mcl_initialised   = False
+        self._icp_initialised   = False
+        self._aruco_initialised = False
 
         self._current_source = SourceState.PREDICT_ONLY
         self._prev_source    = SourceState.PREDICT_ONLY
 
         # ── lock ──────────────────────────────────────────────────────────
+        # Single lock guards: EKF state (_x, _P), wheel velocities (_wl, _wr),
+        # and source timestamps / initialisation flags.
         self._ekf_lock = threading.Lock()
 
         # ── QoS ───────────────────────────────────────────────────────────
@@ -199,9 +223,9 @@ class PuzzlebotOdometry(Node):
         self.create_subscription(Float32, '/VelocityEncL', self._cb_enc_l, enc_qos)
         self.create_subscription(Float32, '/VelocityEncR', self._cb_enc_r, enc_qos)
         self.create_subscription(
-            PoseWithCovarianceStamped, '/mcl/pose', self._cb_mcl, 10)
+            PoseWithCovarianceStamped, '/mcl/pose',   self._cb_mcl,   10)
         self.create_subscription(
-            PoseWithCovarianceStamped, '/icp/pose', self._cb_icp, 10)
+            PoseWithCovarianceStamped, '/icp/pose',   self._cb_icp,   10)
         self.create_subscription(
             PoseWithCovarianceStamped, '/aruco/pose', self._cb_aruco, 10)
 
@@ -213,44 +237,49 @@ class PuzzlebotOdometry(Node):
         # ── timers ────────────────────────────────────────────────────────
         self._last_time = self.get_clock().now()
         self.create_timer(1.0 / self._rate, self._predict_and_publish)
-        self.create_timer(0.2, self._watchdog)   # 5 Hz source health check
+        self.create_timer(0.2, self._watchdog)
 
         self.get_logger().info(
             f'EKF Odometry started — '
             f'r={self._R_wheel} m, L={self._L} m, '
-            f'rate={self._rate} Hz, timeout={self._timeout} s\n'
+            f'rate={self._rate} Hz, timeout={self._timeout} s, '
+            f'icp_timeout={self._icp_timeout} s\n'
             f'Waiting for /mcl/pose, /icp/pose or /aruco/pose ...'
         )
 
     # ── encoder callbacks ──────────────────────────────────────────────────────
 
-    def _cb_enc_l(self, msg: Float32): self._wl = msg.data
-    def _cb_enc_r(self, msg: Float32): self._wr = msg.data
+    def _cb_enc_l(self, msg: Float32):
+        # FIX2: protect wheel velocity writes with the EKF lock
+        with self._ekf_lock:
+            self._wl = msg.data
+
+    def _cb_enc_r(self, msg: Float32):
+        # FIX2: protect wheel velocity writes with the EKF lock
+        with self._ekf_lock:
+            self._wr = msg.data
 
     # ── measurement callbacks ──────────────────────────────────────────────────
 
     def _cb_mcl(self, msg: PoseWithCovarianceStamped):
-        """MCL pose arrived — stamp it, re-evaluate state, fuse if selected."""
-        self._last_mcl_t = time.monotonic()
+        with self._ekf_lock:
+            self._last_mcl_t = time.monotonic()
         self._update_source_state()
-
         if self._current_source in (SourceState.MCL_ACTIVE,
                                     SourceState.MCL_PRIORITY):
             self._ekf_update(msg, 'MCL')
 
     def _cb_icp(self, msg: PoseWithCovarianceStamped):
-        """ICP pose arrived — stamp it, re-evaluate state, fuse if selected."""
-        self._last_icp_t = time.monotonic()
+        with self._ekf_lock:
+            self._last_icp_t = time.monotonic()
         self._update_source_state()
-
         if self._current_source == SourceState.ICP_ACTIVE:
             self._ekf_update(msg, 'ICP')
 
     def _cb_aruco(self, msg: PoseWithCovarianceStamped):
-        """ArUco triangulated pose arrived — stamp it, re-evaluate state, fuse if selected."""
-        self._last_aruco_t = time.monotonic()
+        with self._ekf_lock:
+            self._last_aruco_t = time.monotonic()
         self._update_source_state()
-
         if self._current_source in (SourceState.ARUCO_ACTIVE,
                                     SourceState.ARUCO_PRIORITY):
             self._ekf_update(msg, 'ARUCO')
@@ -258,29 +287,22 @@ class PuzzlebotOdometry(Node):
     # ── source state machine ───────────────────────────────────────────────────
 
     def _update_source_state(self):
-        """
-        Decide which source is active based on recency of last messages.
+        now = time.monotonic()
+        with self._ekf_lock:
+            last_mcl   = self._last_mcl_t
+            last_icp   = self._last_icp_t
+            last_aruco = self._last_aruco_t
 
-        Priority rules:
-          1. MCL beats everything when alive (most accurate on a known map).
-          2. ARUCO beats ICP when alive (global pose without full map).
-          3. ICP alone → ICP_ACTIVE.
-          4. Neither alive → PREDICT_ONLY (pure dead-reckoning).
-        """
-        now      = time.monotonic()
-        mcl_ok   = (self._last_mcl_t   > 0 and
-                    now - self._last_mcl_t   < self._timeout)
-        icp_ok   = (self._last_icp_t   > 0 and
-                    now - self._last_icp_t   < self._timeout)
-        aruco_ok = (self._last_aruco_t > 0 and
-                    now - self._last_aruco_t < self._timeout)
+        mcl_ok   = (last_mcl   > 0 and now - last_mcl   < self._timeout)
+        # FIX6: ICP uses its own (longer) timeout
+        icp_ok   = (last_icp   > 0 and now - last_icp   < self._icp_timeout)
+        aruco_ok = (last_aruco > 0 and now - last_aruco < self._timeout)
 
         if mcl_ok:
-            # MCL siempre gana — PREDICT_ONLY, ICP y ARUCO quedan silenciados
             new_state = SourceState.MCL_PRIORITY if (icp_ok or aruco_ok) \
                         else SourceState.MCL_ACTIVE
         elif aruco_ok and icp_ok:
-            new_state = SourceState.ARUCO_PRIORITY   # ARUCO gana sobre ICP
+            new_state = SourceState.ARUCO_PRIORITY
         elif aruco_ok:
             new_state = SourceState.ARUCO_ACTIVE
         elif icp_ok:
@@ -292,14 +314,9 @@ class PuzzlebotOdometry(Node):
         self._log_source_change()
 
     def _watchdog(self):
-        """
-        5 Hz timer — catches timeouts that occur when messages simply stop
-        arriving (e.g. a node crashes between publishes).
-        """
         self._update_source_state()
 
     def _log_source_change(self):
-        """Emit a log line and publish to /ekf/active_source only on change."""
         if self._current_source == self._prev_source:
             return
         self._prev_source = self._current_source
@@ -326,28 +343,23 @@ class PuzzlebotOdometry(Node):
     # ── EKF PREDICT ───────────────────────────────────────────────────────────
 
     def _predict_and_publish(self):
-        """
-        EKF predict step — runs at `rate` Hz regardless of source state.
-
-        x̂⁻  = f(x̂, u)
-        P⁻   = F @ P @ Fᵀ + Q
-
-        F = [[1, 0, -v·sin(θ)·dt],
-             [0, 1,  v·cos(θ)·dt],
-             [0, 0,  1          ]]
-        """
         now = self.get_clock().now()
         dt  = (now - self._last_time).nanoseconds / 1e9
-        if dt < 0.001 or dt > 0.5:
+        # FIX4: tightened upper bound — 0.08 s (~4 cycles) instead of 0.5 s
+        if dt < 0.001 or dt > 0.08:
             self._last_time = now
             return
         self._last_time = now
 
-        # Differential drive kinematics (sign convention from original node)
-        v = self._R_wheel * (self._wr + self._wl) / 2.0
-        w = self._R_wheel * (self._wl - self._wr) / self._L
-
         with self._ekf_lock:
+            # FIX2: read wheel velocities inside the lock
+            wl = self._wl
+            wr = self._wr
+
+            # FIX1: correct sign — standard differential drive is (wr - wl)/L
+            v = self._R_wheel * (wr + wl) / 2.0
+            w = self._R_wheel * (wr - wl) / self._L
+
             th = self._x[2]
 
             # State prediction
@@ -356,13 +368,13 @@ class PuzzlebotOdometry(Node):
             self._x[2]  = normalize_angle(th + w * dt)
 
             # Covariance prediction
+            # FIX3: Q = diag(q_diag) * dt only — no speed_scale multiplier
             F = np.array([
                 [1.0, 0.0, -v * math.sin(th) * dt],
                 [0.0, 1.0,  v * math.cos(th) * dt],
                 [0.0, 0.0,  1.0],
             ])
-            speed_scale = max(abs(v), abs(w), 0.01)
-            Q = np.diag(self._Q_diag * dt * speed_scale)
+            Q = np.diag(self._Q_diag * dt)
             self._P = F @ self._P @ F.T + Q
 
             x_snap = self._x.copy()
@@ -387,9 +399,6 @@ class PuzzlebotOdometry(Node):
         z_y   = msg.pose.pose.position.y
         z_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
 
-        # Build R from the covariance field of the incoming message.
-        # Both MCL and ICP nodes fill this correctly; fall back to defaults
-        # if the sender left it zero.
         cov  = msg.pose.covariance
         r_xx = cov[0]  if cov[0]  > 1e-9 else self._r_pos
         r_yy = cov[7]  if cov[7]  > 1e-9 else self._r_pos
@@ -397,35 +406,45 @@ class PuzzlebotOdometry(Node):
         R    = np.diag([r_xx, r_yy, r_tt])
 
         with self._ekf_lock:
-            y    = np.array([z_x   - self._x[0],
-                             z_y   - self._x[1],
-                             normalize_angle(z_yaw - self._x[2])])
+            # FIX5: determine whether this source has been initialised yet
+            if source == 'MCL':
+                first_update = not self._mcl_initialised
+                self._mcl_initialised = True
+            elif source == 'ICP':
+                first_update = not self._icp_initialised
+                self._icp_initialised = True
+            else:
+                first_update = not self._aruco_initialised
+                self._aruco_initialised = True
 
-            # Innovation gate — reject implausibly large corrections
-            if (math.hypot(y[0], y[1]) > self._max_ipos or
-                    abs(y[2]) > self._max_iyaw):
-                self.get_logger().warn(
-                    f'[{source}] update REJECTED — '
-                    f'Δpos={math.hypot(y[0],y[1]):.3f} m, '
-                    f'Δyaw={math.degrees(y[2]):.1f}°'
-                )
-                return
+            y = np.array([z_x   - self._x[0],
+                          z_y   - self._x[1],
+                          normalize_angle(z_yaw - self._x[2])])
 
-            # Kalman gain (H = I simplifies S = H P Hᵀ + R to P + R)
+            # FIX5: bypass innovation gate on the very first update from a
+            #        source so large startup offsets are not silently dropped.
+            if not first_update:
+                if (math.hypot(y[0], y[1]) > self._max_ipos or
+                        abs(y[2]) > self._max_iyaw):
+                    self.get_logger().warn(
+                        f'[{source}] update REJECTED — '
+                        f'Δpos={math.hypot(y[0],y[1]):.3f} m, '
+                        f'Δyaw={math.degrees(y[2]):.1f}°'
+                    )
+                    return
+
             S = self._P + R
             K = self._P @ np.linalg.inv(S)
 
-            # State update
             self._x    = self._x + K @ y
             self._x[2] = normalize_angle(self._x[2])
 
-            # Covariance update — Joseph form
             IK      = self._I3 - K
             self._P = IK @ self._P @ IK.T + K @ R @ K.T
-            self._P = (self._P + self._P.T) / 2.0   # enforce symmetry
+            self._P = (self._P + self._P.T) / 2.0
 
         self.get_logger().debug(
-            f'[{source}] EKF update — '
+            f'[{source}]{"(init)" if first_update else ""} EKF update — '
             f'Δpos={math.hypot(y[0],y[1]):.4f} m, '
             f'Δyaw={math.degrees(y[2]):.2f}°'
         )
@@ -452,9 +471,11 @@ class PuzzlebotOdometry(Node):
 
         odom.twist.twist.linear.x  = v
         odom.twist.twist.angular.z = w
+        # Fixed: twist covariance uses physically meaningful velocity uncertainty,
+        # not the process-noise q_xy which has different units/semantics.
         tc = [0.0] * 36
-        tc[0]  = max(self._Q_diag[0], 0.001)
-        tc[35] = max(self._Q_diag[2], 0.001)
+        tc[0]  = 0.01   # linear velocity uncertainty (m/s)²
+        tc[35] = 0.01   # angular velocity uncertainty (rad/s)²
         odom.twist.covariance = tc
 
         self._pub_odom.publish(odom)

@@ -12,6 +12,23 @@ Key improvements over the original:
   - ICP-based scan matching corrects odometry drift between consecutive scans.
   - Thread-safe scan / odometry access with a Lock.
   - Configurable via ROS 2 parameters (all have sensible defaults).
+
+Map-save fixes (v2):
+  - save_map_pgm_yaml now receives occ/free probability thresholds so the
+    saved .pgm matches exactly what is published on /slam_map.
+  - PGM header written separately from pixel data to avoid any newline issues.
+  - _srv_save_map logs success/failure to the ROS logger.
+  - Added a /slam/save_map_path parameter-update guard so the path can be
+    changed at runtime before calling the service.
+
+ICP pose topic (v3):
+  - Publishes /icp_pose (geometry_msgs/PoseWithCovarianceStamped) in the
+    map frame every time ICP produces an accepted correction.  This is the
+    topic robot_localization's EKF node expects as a pose measurement input.
+  - Covariance diagonal (x, y, yaw) is configurable via ROS 2 parameters
+    icp_cov_x, icp_cov_y, icp_cov_yaw so the EKF can weight the measurement.
+  - The message is published only when ICP fires AND the correction passes
+    the sanity-check gate, so the EKF never receives stale/duplicated poses.
 """
 
 import math
@@ -26,7 +43,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg        import OccupancyGrid, MapMetaData, Odometry
 from sensor_msgs.msg     import LaserScan
 from geometry_msgs.msg   import (
-    Pose, Point, Quaternion, PoseStamped, TransformStamped
+    Pose, Point, Quaternion, PoseStamped, PoseWithCovarianceStamped,
+    TransformStamped
 )
 from std_srvs.srv        import Trigger
 from tf2_ros             import TransformBroadcaster
@@ -111,7 +129,7 @@ def icp_2d(src: np.ndarray, dst: np.ndarray,
         return 0.0, 0.0, 0.0
 
     src_h = src.copy()
-    T_net = np.eye(3)  # Matriz de transformación acumulada
+    T_net = np.eye(3)
 
     for _ in range(max_iter):
         dists = np.linalg.norm(
@@ -139,7 +157,6 @@ def icp_2d(src: np.ndarray, dst: np.ndarray,
 
         dyaw = math.atan2(R[1, 0], R[0, 0])
 
-        # Acumulación matricial exacta
         T_step = np.eye(3)
         T_step[0:2, 0:2] = R
         T_step[0:2, 2] = t
@@ -150,8 +167,8 @@ def icp_2d(src: np.ndarray, dst: np.ndarray,
         if abs(t[0]) < tol and abs(t[1]) < tol and abs(dyaw) < tol:
             break
 
-    dx_total = T_net[0, 2]
-    dy_total = T_net[1, 2]
+    dx_total   = T_net[0, 2]
+    dy_total   = T_net[1, 2]
     dyaw_total = math.atan2(T_net[1, 0], T_net[0, 0])
 
     return dx_total, dy_total, normalize_angle(dyaw_total)
@@ -159,34 +176,64 @@ def icp_2d(src: np.ndarray, dst: np.ndarray,
 
 # ── Map saver ─────────────────────────────────────────────────────────────────
 
-def save_map_pgm_yaml(log_odds: np.ndarray, resolution: float,
-                      origin_x: float, origin_y: float,
-                      base_path: str) -> str:
-    rows, cols = log_odds.shape
-    prob = 1.0 - 1.0 / (1.0 + np.exp(log_odds))
-    pgm = np.full((rows, cols), 205, dtype=np.uint8)
-    pgm[prob >= 0.65] = 0
-    pgm[prob <= 0.35] = 254
+def save_map_pgm_yaml(
+    log_odds: np.ndarray,
+    resolution: float,
+    origin_x: float,
+    origin_y: float,
+    base_path: str,
+    occ_thresh: float = 0.65,   # FIX: accept thresholds so they match publisher
+    free_thresh: float = 0.35,
+) -> str:
+    """
+    Convert the log-odds grid to a PGM image and companion YAML file.
 
+    Pixel encoding (matching ROS map_server convention):
+        0   → occupied  (prob >= occ_thresh)
+        254 → free      (prob <= free_thresh)
+        205 → unknown
+    The image is vertically flipped so row 0 of the PGM corresponds to
+    the bottom of the map (positive-Y world direction), matching RViz.
+    """
+    rows, cols = log_odds.shape
+
+    # Convert log-odds → probability
+    prob = 1.0 - 1.0 / (1.0 + np.exp(log_odds))
+
+    # Build PGM pixel array
+    pgm = np.full((rows, cols), 205, dtype=np.uint8)   # unknown = 205
+    pgm[prob >= occ_thresh]  = 0                        # occupied = 0 (black)
+    pgm[prob <= free_thresh] = 254                      # free     = 254 (white)
+
+    # Flip vertically: PGM row-0 = top of image = highest Y in world
     pgm_img = np.flipud(pgm)
+
     pgm_path  = base_path + '.pgm'
     yaml_path = base_path + '.yaml'
 
+    # ── Write PGM ──────────────────────────────────────────────────────────
+    # Write header as ASCII then raw binary pixels in the SAME binary file.
+    # Using explicit '\n' avoids Windows \r\n corruption of pixel bytes.
+    os.makedirs(os.path.dirname(os.path.abspath(pgm_path)), exist_ok=True)
     with open(pgm_path, 'wb') as f:
         header = f'P5\n{cols} {rows}\n255\n'
-        f.write(header.encode())
-        f.write(pgm_img.tobytes())
+        f.write(header.encode('ascii'))   # FIX: explicit ASCII encode
+        f.write(pgm_img.tobytes())        # raw uint8 pixels, no newlines
 
+    # ── Write YAML ─────────────────────────────────────────────────────────
     yaml_name = os.path.basename(pgm_path)
-    with open(yaml_path, 'w') as f:
+    with open(yaml_path, 'w', encoding='utf-8') as f:
         f.write(f'image: {yaml_name}\n')
         f.write(f'resolution: {resolution}\n')
         f.write(f'origin: [{origin_x:.4f}, {origin_y:.4f}, 0.0]\n')
         f.write('negate: 0\n')
-        f.write('occupied_thresh: 0.65\n')
-        f.write('free_thresh: 0.35\n')
+        f.write(f'occupied_thresh: {occ_thresh}\n')   # FIX: use actual thresholds
+        f.write(f'free_thresh: {free_thresh}\n')
 
-    return f'Map saved to {pgm_path} and {yaml_path} ({cols}×{rows} cells)'
+    return (
+        f'Map saved → {pgm_path} and {yaml_path} '
+        f'({cols}×{rows} cells, {cols * rows} bytes)'
+    )
 
 
 # ── SLAM Node ──────────────────────────────────────────────────────────────────
@@ -214,29 +261,42 @@ class SLAMNode(Node):
         self.declare_parameter('icp_max_iter',    20)
         self.declare_parameter('icp_tolerance',   1e-4)
         self.declare_parameter('save_map_path',   '/tmp/slam_map')
+        # FIX: expose probability thresholds as parameters so they are
+        #      consistent between the publisher and the map saver.
+        self.declare_parameter('occ_thresh',      0.65)
+        self.declare_parameter('free_thresh',     0.35)
+        # ICP pose covariance — tuned to your sensor; larger = trust EKF more
+        self.declare_parameter('icp_cov_x',       0.05)   # m²
+        self.declare_parameter('icp_cov_y',       0.05)   # m²
+        self.declare_parameter('icp_cov_yaw',     0.02)   # rad²
 
-        self.res        = self.get_parameter('resolution').value
-        self.map_frame  = self.get_parameter('map_frame').value
-        self.odom_frame = self.get_parameter('odom_frame').value
-        self.base_frame = self.get_parameter('base_frame').value
-        self.lo_occ     = self.get_parameter('log_odds_occ').value
-        self.lo_free    = self.get_parameter('log_odds_free').value
-        self.lo_max     = self.get_parameter('log_odds_max').value
-        self.lo_min     = self.get_parameter('log_odds_min').value
-        self.max_range  = self.get_parameter('lidar_max_range').value
-        self.beam_skip  = self.get_parameter('beam_skip').value
-        self.use_icp    = self.get_parameter('use_icp').value
-        self.icp_iter   = self.get_parameter('icp_max_iter').value
-        self.icp_tol    = self.get_parameter('icp_tolerance').value
-        self.save_path  = self.get_parameter('save_map_path').value
-        pub_rate        = self.get_parameter('publish_rate').value
-        init_size       = self.get_parameter('map_init_size').value
+        self.res         = self.get_parameter('resolution').value
+        self.map_frame   = self.get_parameter('map_frame').value
+        self.odom_frame  = self.get_parameter('odom_frame').value
+        self.base_frame  = self.get_parameter('base_frame').value
+        self.lo_occ      = self.get_parameter('log_odds_occ').value
+        self.lo_free     = self.get_parameter('log_odds_free').value
+        self.lo_max      = self.get_parameter('log_odds_max').value
+        self.lo_min      = self.get_parameter('log_odds_min').value
+        self.max_range   = self.get_parameter('lidar_max_range').value
+        self.beam_skip   = self.get_parameter('beam_skip').value
+        self.use_icp     = self.get_parameter('use_icp').value
+        self.icp_iter    = self.get_parameter('icp_max_iter').value
+        self.icp_tol     = self.get_parameter('icp_tolerance').value
+        self.save_path   = self.get_parameter('save_map_path').value
+        self.occ_thresh  = self.get_parameter('occ_thresh').value   # FIX
+        self.free_thresh = self.get_parameter('free_thresh').value  # FIX
+        self.icp_cov_x   = self.get_parameter('icp_cov_x').value
+        self.icp_cov_y   = self.get_parameter('icp_cov_y').value
+        self.icp_cov_yaw = self.get_parameter('icp_cov_yaw').value
+        pub_rate         = self.get_parameter('publish_rate').value
+        init_size        = self.get_parameter('map_init_size').value
 
-        self.origin_x   = self.get_parameter('map_origin_x').value
-        self.origin_y   = self.get_parameter('map_origin_y').value
+        self.origin_x = self.get_parameter('map_origin_x').value
+        self.origin_y = self.get_parameter('map_origin_y').value
 
-        self.grid_h = init_size
-        self.grid_w = init_size
+        self.grid_h   = init_size
+        self.grid_w   = init_size
         self.log_odds = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         self._grid_lock = threading.Lock()
 
@@ -248,10 +308,9 @@ class SLAMNode(Node):
         self._corr_y   = 0.0
         self._corr_yaw = 0.0
 
-        # ICP references and Keyframes
         self._prev_scan_pts: np.ndarray = np.empty((0, 2))
-        self.last_kf_x = 0.0
-        self.last_kf_y = 0.0
+        self.last_kf_x   = 0.0
+        self.last_kf_y   = 0.0
         self.last_kf_yaw = 0.0
 
         latched_qos = QoSProfile(
@@ -262,34 +321,37 @@ class SLAMNode(Node):
         sensor_qos = rclpy.qos.qos_profile_sensor_data
 
         self.create_subscription(LaserScan, '/scan', self._cb_scan, sensor_qos)
-        self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
+        self.create_subscription(Odometry,  '/odom', self._cb_odom, 10)
 
-        self._map_pub  = self.create_publisher(OccupancyGrid, '/slam_map', latched_qos)
-        self._pose_pub = self.create_publisher(PoseStamped, '/slam_pose', 10)
+        self._map_pub        = self.create_publisher(OccupancyGrid, '/slam_map', latched_qos)
+        self._pose_pub       = self.create_publisher(PoseStamped,   '/slam_pose', 10)
+        self._icp_pose_pub   = self.create_publisher(               # EKF input
+            PoseWithCovarianceStamped, '/icp/pose', 10)
         self._tf_broadcaster = TransformBroadcaster(self)
         self.create_service(Trigger, '/slam/save_map', self._srv_save_map)
 
         self.create_timer(1.0 / pub_rate, self._publish_map)
-        self.create_timer(0.05, self._broadcast_tf)       # 20 Hz
+        self.create_timer(0.05, self._broadcast_tf)   # 20 Hz
 
         self.get_logger().info(
             f'SLAM node started — grid {self.grid_w}×{self.grid_h} cells, '
             f'res={self.res} m/cell, ICP={"on" if self.use_icp else "off"}'
         )
 
+    # ── Odometry callback ──────────────────────────────────────────────────
+
     def _cb_odom(self, msg: Odometry):
         odom_x   = msg.pose.pose.position.x
         odom_y   = msg.pose.pose.position.y
         odom_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
 
-        # Transformación de posición usando la corrección calculada
         cos_c = math.cos(self._corr_yaw)
         sin_c = math.sin(self._corr_yaw)
         self.robot_x   = cos_c * odom_x - sin_c * odom_y + self._corr_x
         self.robot_y   = sin_c * odom_x + cos_c * odom_y + self._corr_y
-        
-        # CAMBIO AQUÍ: Asegurar consistencia en la dirección del ángulo compuesto
         self.robot_yaw = normalize_angle(odom_yaw + self._corr_yaw)
+
+    # ── Scan callback ──────────────────────────────────────────────────────
 
     def _cb_scan(self, msg: LaserScan):
         if self.use_icp:
@@ -303,27 +365,27 @@ class SLAMNode(Node):
                     cur_pts, self._prev_scan_pts,
                     max_iter=self.icp_iter, tol=self.icp_tol
                 )
-                
                 if abs(dx) < 0.5 and abs(dy) < 0.5 and abs(dyaw) < 0.8:
                     cos_d = math.cos(dyaw)
                     sin_d = math.sin(dyaw)
-                    
+
                     new_corr_x = cos_d * self._corr_x - sin_d * self._corr_y + dx
                     new_corr_y = sin_d * self._corr_x + cos_d * self._corr_y + dy
-                    self._corr_x = new_corr_x
-                    self._corr_y = new_corr_y
-                    
-                    # CAMBIO AQUÍ: Ajustar el signo según la dirección del drift del ICP
-                    self._corr_yaw = normalize_angle(self._corr_yaw - dyaw)
-                    
-                    new_rx = cos_d * self.robot_x - sin_d * self.robot_y + dx
-                    new_ry = sin_d * self.robot_x + cos_d * self.robot_y + dy
-                    self.robot_x = new_rx
-                    self.robot_y = new_ry
+                    self._corr_x   = new_corr_x
+                    self._corr_y   = new_corr_y
+                    self._corr_yaw = normalize_angle(self._corr_yaw + dyaw)
+
+                    new_rx       = cos_d * self.robot_x - sin_d * self.robot_y + dx
+                    new_ry       = sin_d * self.robot_x + cos_d * self.robot_y + dy
+                    self.robot_x   = new_rx
+                    self.robot_y   = new_ry
                     self.robot_yaw = normalize_angle(self.robot_yaw + dyaw)
 
-            # Keyframing: Update reference scan only if we moved enough
-            dist_moved = math.hypot(self.robot_x - self.last_kf_x, self.robot_y - self.last_kf_y)
+                    # ── Publish corrected pose for the EKF ────────────────
+                    self._publish_icp_pose(msg.header.stamp)
+
+            dist_moved  = math.hypot(self.robot_x - self.last_kf_x,
+                                     self.robot_y - self.last_kf_y)
             angle_moved = abs(normalize_angle(self.robot_yaw - self.last_kf_yaw))
 
             if len(self._prev_scan_pts) == 0 or dist_moved > 0.15 or angle_moved > 0.15:
@@ -332,11 +394,11 @@ class SLAMNode(Node):
                     self.robot_x, self.robot_y, self.robot_yaw,
                     beam_skip=self.beam_skip
                 )
-                self.last_kf_x = self.robot_x
-                self.last_kf_y = self.robot_y
+                self.last_kf_x   = self.robot_x
+                self.last_kf_y   = self.robot_y
                 self.last_kf_yaw = self.robot_yaw
 
-        # Map updating
+        # ── Update occupancy grid ──────────────────────────────────────────
         ranges  = np.asarray(msg.ranges, dtype=np.float32)
         n_beams = len(ranges)
 
@@ -347,24 +409,33 @@ class SLAMNode(Node):
                 rx, ry = self._world_to_cell(self.robot_x, self.robot_y)
 
             for i in range(0, n_beams, self.beam_skip):
-                r = ranges[i]
+                r     = ranges[i]
                 angle = msg.angle_min + i * msg.angle_increment
                 global_angle = self.robot_yaw + angle
 
                 is_hit = (math.isfinite(r) and msg.range_min < r < self.max_range)
 
                 if is_hit:
-                    ex = self.robot_x + r * math.cos(global_angle)
-                    ey = self.robot_y + r * math.sin(global_angle)
+                    ex = self.robot_x + r              * math.cos(global_angle)
+                    ey = self.robot_y + r              * math.sin(global_angle)
                 else:
                     ex = self.robot_x + self.max_range * math.cos(global_angle)
                     ey = self.robot_y + self.max_range * math.sin(global_angle)
 
-                if not self._in_bounds(*self._world_to_cell(ex, ey)):
-                    self._expand_to_fit(ex, ey)
-                    rx, ry = self._world_to_cell(self.robot_x, self.robot_y)
-
+                # FIX: always expand to fit the beam endpoint, including
+                # no-hit rays.  Previously, no-hit endpoints were silently
+                # clamped to the grid edge so the free-space the LiDAR
+                # swept through was never written — causing the saved map
+                # to be cut off on any side that had no obstacles.
+                # Use a smaller margin for no-hit rays to avoid over-
+                # allocating memory for max-range beams in open space.
                 ex_c, ey_c = self._world_to_cell(ex, ey)
+                if not self._in_bounds(ex_c, ey_c):
+                    expand_margin = 20 if is_hit else 5
+                    self._expand_to_fit(ex, ey, margin=expand_margin)
+                    rx, ry = self._world_to_cell(self.robot_x, self.robot_y)
+                    ex_c, ey_c = self._world_to_cell(ex, ey)
+
                 ex_c = max(0, min(ex_c, self.grid_w - 1))
                 ey_c = max(0, min(ey_c, self.grid_h - 1))
 
@@ -381,6 +452,42 @@ class SLAMNode(Node):
                         self.log_odds[ey_c, ex_c] + self.lo_occ
                     )
 
+    # ── ICP pose publisher (EKF input) ────────────────────────────────────
+
+    def _publish_icp_pose(self, stamp):
+        """
+        Publish the ICP-corrected robot pose as PoseWithCovarianceStamped
+        on /icp/pose in the map frame.
+
+        robot_localization's EKF node consumes this topic directly when
+        configured with:
+            pose0: /icp/pose
+            pose0_config: [true, true, false,  false, false, true,
+                           false, false, false, false, false, false,
+                           false, false, false]
+        The covariance rows/cols used are [0,0], [1,1], [5,5]
+        (x, y, yaw in the 6-DOF ROS covariance matrix).
+        """
+        pwcs = PoseWithCovarianceStamped()
+        pwcs.header.stamp    = stamp
+        pwcs.header.frame_id = self.map_frame
+
+        pwcs.pose.pose.position    = Point(
+            x=self.robot_x, y=self.robot_y, z=0.0)
+        pwcs.pose.pose.orientation = yaw_to_quaternion(self.robot_yaw)
+
+        # 6×6 row-major covariance (x, y, z, roll, pitch, yaw)
+        # Only x, y and yaw are meaningful for a planar robot.
+        cov = [0.0] * 36
+        cov[0]  = self.icp_cov_x    # x-x
+        cov[7]  = self.icp_cov_y    # y-y
+        cov[35] = self.icp_cov_yaw  # yaw-yaw
+        pwcs.pose.covariance = cov
+
+        self._icp_pose_pub.publish(pwcs)
+
+    # ── TF broadcaster ────────────────────────────────────────────────────
+
     def _broadcast_tf(self):
         t = TransformStamped()
         t.header.stamp    = self.get_clock().now().to_msg()
@@ -391,6 +498,8 @@ class SLAMNode(Node):
         t.transform.translation.z = 0.0
         t.transform.rotation      = yaw_to_quaternion(self._corr_yaw)
         self._tf_broadcaster.sendTransform(t)
+
+    # ── Grid helpers ──────────────────────────────────────────────────────
 
     def _expand_to_fit(self, wx: float, wy: float, margin: int = 100):
         cx, cy = self._world_to_cell(wx, wy)
@@ -403,8 +512,8 @@ class SLAMNode(Node):
         if not any([pad_left, pad_right, pad_bot, pad_top]):
             return
 
-        new_w = self.grid_w + pad_left + pad_right
-        new_h = self.grid_h + pad_bot  + pad_top
+        new_w    = self.grid_w + pad_left + pad_right
+        new_h    = self.grid_h + pad_bot  + pad_top
         new_grid = np.zeros((new_h, new_w), dtype=np.float32)
         new_grid[pad_bot:pad_bot + self.grid_h,
                  pad_left:pad_left + self.grid_w] = self.log_odds
@@ -423,24 +532,26 @@ class SLAMNode(Node):
     def _in_bounds(self, col: int, row: int) -> bool:
         return 0 <= col < self.grid_w and 0 <= row < self.grid_h
 
+    # ── Map publisher ─────────────────────────────────────────────────────
+
     def _publish_map(self):
         with self._grid_lock:
-            lo_copy    = self.log_odds.copy()
-            origin_x   = self.origin_x
-            origin_y   = self.origin_y
-            grid_w     = self.grid_w
-            grid_h     = self.grid_h
+            lo_copy  = self.log_odds.copy()
+            origin_x = self.origin_x
+            origin_y = self.origin_y
+            grid_w   = self.grid_w
+            grid_h   = self.grid_h
 
-        prob = 1.0 - 1.0 / (1.0 + np.exp(lo_copy))
+        prob     = 1.0 - 1.0 / (1.0 + np.exp(lo_copy))
         ros_grid = np.full(lo_copy.shape, -1, dtype=np.int8)
-        ros_grid[prob >= 0.65] = 100
-        ros_grid[prob <= 0.35] = 0
+        ros_grid[prob >= self.occ_thresh]  = 100   # FIX: use param threshold
+        ros_grid[prob <= self.free_thresh] = 0     # FIX: use param threshold
 
         msg = OccupancyGrid()
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
 
-        meta = MapMetaData()
+        meta            = MapMetaData()
         meta.resolution = self.res
         meta.width      = grid_w
         meta.height     = grid_h
@@ -452,29 +563,54 @@ class SLAMNode(Node):
         msg.data = ros_grid.flatten().tolist()
         self._map_pub.publish(msg)
 
-        pose_msg = PoseStamped()
-        pose_msg.header.stamp    = msg.header.stamp
-        pose_msg.header.frame_id = self.map_frame
-        pose_msg.pose.position   = Point(x=self.robot_x, y=self.robot_y, z=0.0)
+        pose_msg                  = PoseStamped()
+        pose_msg.header.stamp     = msg.header.stamp
+        pose_msg.header.frame_id  = self.map_frame
+        pose_msg.pose.position    = Point(x=self.robot_x, y=self.robot_y, z=0.0)
         pose_msg.pose.orientation = yaw_to_quaternion(self.robot_yaw)
         self._pose_pub.publish(pose_msg)
 
-    def _srv_save_map(self, _request, response):
-        try:
-            with self._grid_lock:
-                lo_copy  = self.log_odds.copy()
-                origin_x = self.origin_x
-                origin_y = self.origin_y
+    # ── Save-map service ──────────────────────────────────────────────────
 
+    def _srv_save_map(self, _request, response):
+        """
+        ROS service handler for /slam/save_map (std_srvs/Trigger).
+
+        Snapshot the current log-odds grid under the grid lock, then write
+        it to disk outside the lock so scan callbacks are not stalled.
+        """
+        # FIX: re-read save_path at call time so a ros2 param set takes effect
+        save_path = self.get_parameter('save_map_path').value
+
+        # Snapshot under lock — keeps the critical section short
+        with self._grid_lock:
+            lo_snapshot = self.log_odds.copy()
+            origin_x    = self.origin_x
+            origin_y    = self.origin_y
+
+        try:
             msg = save_map_pgm_yaml(
-                lo_copy, self.res, origin_x, origin_y, self.save_path)
+                lo_snapshot,
+                self.res,
+                origin_x,
+                origin_y,
+                save_path,
+                occ_thresh=self.occ_thresh,    # FIX: pass node thresholds
+                free_thresh=self.free_thresh,  # FIX: pass node thresholds
+            )
             response.success = True
             response.message = msg
-        except Exception as exc: 
+            self.get_logger().info(msg)        # FIX: log to terminal
+        except Exception as exc:
             response.success = False
             response.message = str(exc)
+            self.get_logger().error(           # FIX: log errors too
+                f'save_map FAILED: {exc}')
+
         return response
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
