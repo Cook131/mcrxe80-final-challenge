@@ -17,6 +17,9 @@ setup(
         # Launch files — every .py inside launch/ gets installed
         (os.path.join('share', package_name, 'launch'),
             glob.glob('launch/*.py')),
+        # Maps — every .yaml inside maps/ gets installed
+        (os.path.join('share', package_name, 'maps'),
+            glob.glob('maps/*')),  
     ],
     install_requires=['setuptools'],
     zip_safe=True,
