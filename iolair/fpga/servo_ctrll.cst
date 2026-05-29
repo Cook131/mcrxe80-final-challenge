@@ -1,0 +1,34 @@
+// ============================================================
+//  spi_slave_lift.cst
+//  Physical Constraints — Tang Nano 20K (GW2AR-18C QN88)
+// ============================================================
+
+// --- Reloj del sistema --------------------------------------
+IO_LOC  "clk"      4;
+IO_PORT "clk"      PULL_MODE=NONE IO_TYPE=LVCMOS33;
+
+// --- SPI slave -----------------------------------------------
+//  SCK  y MOSI: PULL_MODE=NONE (el Jetson ya los maneja;
+//               pull-downs internos distorsionan el flanco).
+//  CS_N:        PULL_MODE=UP   (inactivo = alto; evita arranques
+//               espurios si la línea flota).
+IO_LOC  "sck"      72;   // IOR40B  → Jetson J41-23 (SPI_CLK)
+IO_PORT "sck"      PULL_MODE=NONE IO_TYPE=LVCMOS33;
+
+IO_LOC  "mosi"     71;   // IOR44A  → Jetson J41-19 (SPI_MOSI)
+IO_PORT "mosi"     PULL_MODE=NONE IO_TYPE=LVCMOS33;
+
+IO_LOC  "cs_n"     49;   // IOR49A  → Jetson J41-24 (SPI_CE0_N)
+IO_PORT "cs_n"     PULL_MODE=UP IO_TYPE=LVCMOS33;
+
+// --- Salidas PWM ---------------------------------------------
+//  DRIVE=8 para señal limpia al servo (rango soportado: 4/8/16 mA).
+IO_LOC  "pwm1"     27;   // IOB8A   → señal naranja Servo 1
+IO_PORT "pwm1"     PULL_MODE=NONE IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC  "pwm2"     28;   // IOB8B   → señal naranja Servo 2
+IO_PORT "pwm2"     PULL_MODE=NONE IO_TYPE=LVCMOS33 DRIVE=8;
+
+// --- Debug ---------------------------------------------------
+IO_LOC  "cs_debug" 15;   // IOL47B  → osciloscopio / LED0 onboard
+IO_PORT "cs_debug" PULL_MODE=NONE IO_TYPE=LVCMOS33;
