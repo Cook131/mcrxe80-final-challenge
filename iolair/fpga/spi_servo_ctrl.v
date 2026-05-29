@@ -1,70 +1,45 @@
 // ============================================================
-//  spi_servo_ctrl.v
+//  spi_slave_lift.v
 //  Tang Nano 20K (GW2AR-18C) @ 27 MHz
-//  Dual Servo PWM Controller — SPI + DIP switch fallback
+//  Dual 360° Servo PWM via SPI MODE 0  —  MSB first
 //
-//  Modo de operación (pin spi_enable):
-//    spi_enable = 0  →  DIP switch  (pb1, pb2)  igual que tu .v original
-//    spi_enable = 1  →  SPI desde Jetson Nano    256 pasos continuos
+//  Protocolo (3 bytes):
+//    [0xAB] [servo1_byte] [servo2_byte]
+//     0x00  = reversa máx  (~1.0 ms)
+//     0x7F  = stop         (~1.5 ms)
+//     0xFF  = adelante máx (~2.0 ms)
 //
-//  Protocolo SPI (MODE 0, MSB first, 500 kHz):
-//    Trama: [0xAB][servo1_byte][servo2_byte]
-//    0x00 = reversa máx  |  0x7F = stop  |  0xFF = adelante máx
-//
-//  PWM estándar servo: 50 Hz (periodo 20 ms)
-//    1.0 ms → reversa máxima  (byte 0x00)
-//    1.5 ms → stop             (byte 0x7F)
-//    2.0 ms → adelante máximo  (byte 0xFF)
-//
-//  Tabla DIP (compatibilidad con servo_control.v original):
-//    pb1=0, pb2=1  →  1.0 ms  (reversa)
-//    pb1=0, pb2=0  →  1.5 ms  (stop / neutro)
-//    pb1=1, pb2=0  →  2.0 ms  (adelante)
+//  Funciona con:
+//    • CS único para los 3 bytes  (spidev.xfer2 normal)
+//    • CS por byte                (quirk de algunos kernels Jetson)
 // ============================================================
-
-module spi_servo_ctrl (
-    // ── Sistema ──────────────────────────────────────────────
-    input  wire clk,         // 27 MHz  (IO 4)
-    // ── DIP switch fallback (activo alto) ────────────────────
-    input  wire pb1,         // IO 25
-    input  wire pb2,         // IO 26
-    // ── Selector de modo ─────────────────────────────────────
-    input  wire spi_enable,  // IO libre (ver .cst) — 0=DIP, 1=SPI
-    // ── SPI slave (MODE 0: CPOL=0 CPHA=0) ───────────────────
-    input  wire sck,         // IO libre — Jetson Pin 23
-    input  wire mosi,        // IO libre — Jetson Pin 19
-    output wire miso,        // IO libre — Jetson Pin 21  (tied low)
-    input  wire cs_n,        // IO libre — Jetson Pin 24
-    // ── Salidas PWM ──────────────────────────────────────────
-    output wire pwm1,        // IO 27 — señal naranja Servo 1
-    output wire pwm2         // IO 28 — señal naranja Servo 2
+module spi_slave_lift (
+    input  wire clk,        // 27 MHz           — pin 4
+    input  wire sck,        // Jetson J41-23     — pin 72
+    input  wire mosi,       // Jetson J41-19     — pin 71
+    input  wire cs_n,       // Jetson J41-24     — pin 49  (activo bajo)
+    output wire pwm1,       // Servo 1 naranja   — pin 27
+    output wire pwm2,       // Servo 2 naranja   — pin 28
+    output wire cs_debug    // Debug / osciloscopio — pin 15
 );
 
 // ============================================================
-// 1.  Parámetros PWM  (idénticos a tu servo_control.v original)
+// 1.  PWM  50 Hz  —  rango 1.0 ms … 2.0 ms
+//     27 MHz × 1.0 ms = 27 000 ciclos  (0x00)
+//     27 MHz × 1.5 ms = 40 500 ciclos  (0x7F  → 127 × 106 + 27000 = 40 462 ≈ OK)
+//     27 MHz × 2.0 ms = 54 000 ciclos  (0xFF  → 255 × 106 + 27000 = 54 030 ≈ OK)
 // ============================================================
-localparam [19:0] PWM_PERIOD   = 20'd540_000;  // 20 ms @ 27 MHz
-localparam [19:0] PULSE_MIN    = 20'd27_000;   //  1.0 ms
-localparam [19:0] PULSE_NEUTRAL= 20'd40_500;   //  1.5 ms
-localparam [19:0] PULSE_MAX    = 20'd54_000;   //  2.0 ms
-// Paso SPI: (54 000 - 27 000) / 255 ≈ 106 ciclos/LSB
-localparam [19:0] PULSE_STEP   = 20'd106;
+localparam [19:0] PWM_PERIOD = 20'd540_000;  // 20 ms
+localparam [19:0] PULSE_MIN  = 20'd27_000;   //  1.0 ms
+localparam [19:0] PULSE_STEP = 20'd106;      //  (54000-27000) / 255 ≈ 105.9
 
-// ============================================================
-// 2.  Contador de periodo PWM  (mismo que tu versión original)
-// ============================================================
 reg [19:0] pwm_cnt;
-
-always @(posedge clk) begin
-    if (pwm_cnt >= PWM_PERIOD - 20'd1)
-        pwm_cnt <= 20'd0;
-    else
-        pwm_cnt <= pwm_cnt + 20'd1;
-end
+always @(posedge clk)
+    pwm_cnt <= (pwm_cnt >= PWM_PERIOD - 20'd1) ? 20'd0 : pwm_cnt + 20'd1;
 
 // ============================================================
-// 3.  Sincronizador SPI → dominio 27 MHz  (3 etapas)
-//     Necesario porque SCK/MOSI/CS_N vienen de un reloj externo
+// 2.  Sincronizador 3 etapas  (anti-metaestabilidad)
+//     Pipeline:  [0] = más nuevo  …  [2] = más viejo
 // ============================================================
 reg [2:0] sck_s, cs_s, mosi_s;
 
@@ -74,92 +49,75 @@ always @(posedge clk) begin
     mosi_s <= {mosi_s[1:0], mosi};
 end
 
-wire sck_r    = sck_s[2];
-wire cs_r     = cs_s[2];
-wire mosi_r   = mosi_s[2];
-wire sck_rise = (sck_s[2:1] == 2'b01);  // flanco subida SCK
-wire cs_fall  = (cs_s[2:1]  == 2'b10);  // CS activa (↓)
-wire cs_rise  = (cs_s[2:1]  == 2'b01);  // CS inactiva (↑) = abort
+wire cs_r     =  cs_s[2];              // CS sincronizado  (1 = inactivo)
+// ── FIX: usar etapa intermedia [1] para MOSI ──────────────
+// mosi_s[1] está muestreado en el mismo ciclo en que sck_s[1]
+// ya muestra el flanco subida → mejor alineación temporal.
+wire mosi_r   = mosi_s[1];
+wire sck_rise = (sck_s[2:1] == 2'b01); // flanco subida SCK
+wire cs_fall  = (cs_s[2:1]  == 2'b10); // CS baja  → inicio de trama / byte
+wire cs_rise  = (cs_s[2:1]  == 2'b01); // CS sube  → fin   de trama / byte
 
 // ============================================================
-// 4.  Receptor SPI  (3 bytes por trama)
+// 3.  Receptor SPI  —  shift register de 24 bits deslizante
+//
+//  ── Por qué NO se resetea shift_reg en cs_fall ─────────────
+//  Si el driver de Jetson rompe CS entre cada byte (comportamiento
+//  conocido de spidev en algunos kernels de Jetson Nano/TX2),
+//  necesitamos acumular los 3 bytes a través de 3 afirmaciones
+//  consecutivas de CS:
+//
+//    CS1 (0xAB)     → shift_reg = 0x00_00_AB
+//    CS2 (servo1)   → shift_reg = 0x00_AB_s1
+//    CS3 (servo2)   → shift_reg = 0xAB_s1_s2  ← validamos aquí ✓
+//
+//  Con CS único (xfer2 correcto) también funciona porque los
+//  24 bits llegan de corrido y el resultado final es el mismo.
+//
+//  ── Validación al subir CS ─────────────────────────────────
+//  bit_cnt cuenta los bits recibidos en ESTE ciclo de CS.
+//  Al subir CS, bit_cnt == 0  significa que se recibieron
+//  exactamente N × 8 bits (el contador es de 3 bits → wrap
+//  automático cada 8 pulsos). Esto descarta tramas truncadas.
 // ============================================================
-reg [7:0] shift_reg;
-reg [2:0] bit_cnt;
-reg [1:0] byte_cnt;
-reg [7:0] rx_buf [0:1];   // byte 0 (header) y byte 1 (servo1)
+reg [23:0] shift_reg;           // ventana deslizante de los últimos 24 bits
+reg [ 2:0] bit_cnt;             // bits recibidos en el CS activo actual
 
-reg [7:0] servo1_reg;
-reg [7:0] servo2_reg;
+reg [7:0] servo1_reg = 8'd127;  // stop al arrancar
+reg [7:0] servo2_reg = 8'd127;
 
 always @(posedge clk) begin
-    // Reset de estado: inicio de trama o abort por CS↑
-    if (cs_fall || cs_rise) begin
-        bit_cnt  <= 3'd0;
-        byte_cnt <= 2'd0;
-    end
 
-    // Muestrear MOSI en cada flanco ↑ de SCK mientras CS activo
-    else if (!cs_r && sck_rise) begin
-        shift_reg <= {shift_reg[6:0], mosi_r};
-        bit_cnt   <= bit_cnt + 3'd1;   // 3 bits → overflow 7→0
+    // ── Reset de bit_cnt al inicio de cada ciclo CS ────────
+    if (cs_fall)
+        bit_cnt <= 3'd0;
+    else if (!cs_r && sck_rise)
+        bit_cnt <= bit_cnt + 3'd1;  // wrap automático 7 → 0 cada 8 bits
 
-        if (&bit_cnt) begin  // bit_cnt == 7 → byte completo
-            case (byte_cnt)
-                2'd0: begin
-                    rx_buf[0] <= {shift_reg[6:0], mosi_r};  // header
-                    byte_cnt  <= 2'd1;
-                end
-                2'd1: begin
-                    rx_buf[1] <= {shift_reg[6:0], mosi_r};  // servo1
-                    byte_cnt  <= 2'd2;
-                end
-                2'd2: begin
-                    // Paquete completo: validar header antes de mover servos
-                    if (rx_buf[0] == 8'hAB) begin
-                        servo1_reg <= rx_buf[1];
-                        // byte 2 (servo2): leer valor combinacional directo
-                        // (non-blocking aún no committó rx_buf[2])
-                        servo2_reg <= {shift_reg[6:0], mosi_r};
-                    end
-                    byte_cnt <= 2'd0;
-                end
-                default: byte_cnt <= 2'd0;
-            endcase
+    // ── Desplazamiento: bit nuevo entra por el LSB ─────────
+    if (!cs_r && sck_rise)
+        shift_reg <= {shift_reg[22:0], mosi_r};
+
+    // ── Validación al subir CS ─────────────────────────────
+    // bit_cnt == 0  al subir CS  →  se recibió exactamente N×8 bits
+    // shift_reg[23:16] == 0xAB   →  header válido en los últimos 24 bits
+    if (cs_rise && (bit_cnt == 3'd0)) begin
+        if (shift_reg[23:16] == 8'hAB) begin
+            servo1_reg <= shift_reg[15:8];
+            servo2_reg <= shift_reg[7:0];
         end
     end
-end
 
-assign miso = 1'b0;  // sin readback en esta versión
-
-// ============================================================
-// 5.  Decodificador DIP  (idéntico a tu servo_control.v original)
-// ============================================================
-reg [19:0] pw_dip;
-
-always @(*) begin
-    casex ({pb1, pb2})
-        2'b01:   pw_dip = PULSE_MIN;     // reversa
-        2'b10:   pw_dip = PULSE_MAX;     // adelante
-        default: pw_dip = PULSE_NEUTRAL; // stop / neutro
-    endcase
 end
 
 // ============================================================
-// 6.  Cálculo de ancho de pulso SPI  (256 pasos continuos)
+// 4.  Salidas PWM
 // ============================================================
-wire [19:0] pw_spi1 = PULSE_MIN + ({12'd0, servo1_reg} * PULSE_STEP);
-wire [19:0] pw_spi2 = PULSE_MIN + ({12'd0, servo2_reg} * PULSE_STEP);
+wire [19:0] pw1 = PULSE_MIN + ({12'd0, servo1_reg} * PULSE_STEP);
+wire [19:0] pw2 = PULSE_MIN + ({12'd0, servo2_reg} * PULSE_STEP);
 
-// ============================================================
-// 7.  Mux modo  +  salidas PWM
-//     spi_enable=0 → ambos servos siguen DIP (control en paralelo)
-//     spi_enable=1 → cada servo sigue su byte SPI individual
-// ============================================================
-wire [19:0] pulse1 = spi_enable ? pw_spi1 : pw_dip;
-wire [19:0] pulse2 = spi_enable ? pw_spi2 : pw_dip;
-
-assign pwm1 = (pwm_cnt < pulse1);
-assign pwm2 = (pwm_cnt < pulse2);
+assign pwm1     = (pwm_cnt < pw1);
+assign pwm2     = (pwm_cnt < pw2);
+assign cs_debug = cs_r;           // 0 cuando CS activo → fácil de medir
 
 endmodule
