@@ -38,6 +38,7 @@ setup(
             'mcl        = iolair.mcl_node:main',
             'aruco_localizer       = iolair.aruco_localizer:main',
             'bug_IBA       = iolair.bug_IBA:main',
+            'astar_planner   = iolair.astar_planner:main',
         ],
     },
 )
