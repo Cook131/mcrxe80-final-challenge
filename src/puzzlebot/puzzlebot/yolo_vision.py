@@ -18,7 +18,7 @@ Uso:
 # =============================================================
 # CONFIGURACION — edita solo este bloque
 # =============================================================
-WEIGHTS      = "src/puzzlebot/WIEGHTS/best.pt"       # <- pon aqui la ruta absoluta a best.pt
+WEIGHTS      = "src/puzzlebot/weights/best.pt"       # <- pon aqui la ruta absoluta a best.pt
 CAMERA_TOPIC = "/camera/image_raw"
 CONF         = 0.65                    # confianza minima en vivo
 DEVICE       = "0"                     # "0" = GPU, "cpu" = CPU
