@@ -326,28 +326,15 @@ class AStarPlannerNode(Node):
 
     @staticmethod
     def _inflate(grid: np.ndarray, radius: int) -> np.ndarray:
-        inflated = grid.copy()
-        rows, cols = grid.shape
-        obstacle_cells = list(zip(*np.where(grid == 1)))
-
-        visited = set(obstacle_cells)
-        frontier = deque(obstacle_cells)
-
-        for _ in range(radius):
-            next_frontier = deque()
-            while frontier:
-                r, c = frontier.popleft()
-                for dr, dc in ((-1,0),(1,0),(0,-1),(0,1),
-                               (-1,-1),(-1,1),(1,-1),(1,1)):
-                    nr, nc = r + dr, c + dc
-                    if (0 <= nr < rows and 0 <= nc < cols and
-                            (nr, nc) not in visited):
-                        visited.add((nr, nc))
-                        inflated[nr, nc] = 1
-                        next_frontier.append((nr, nc))
-            frontier = next_frontier
-
-        return inflated
+        from scipy.ndimage import binary_dilation, generate_binary_structure
+        # Create a circular structuring element
+        y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
+        struct = (x**2 + y**2 <= radius**2).astype(np.uint8)
+        obstacles = (grid == 1)
+        inflated = binary_dilation(obstacles, structure=struct)
+        result = grid.copy()
+        result[inflated] = 1
+        return result
 
     @staticmethod
     def _shortcut(path: list, grid: np.ndarray) -> list:

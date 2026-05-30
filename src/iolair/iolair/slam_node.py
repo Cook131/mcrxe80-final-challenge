@@ -8,18 +8,9 @@ nav_msgs/OccupancyGrid so RViz and any other node can consume it.
 
 Key improvements over the original:
   - Publishes the map→odom TF transform directly (no MCL dependency).
-  - Supports saving the map to disk (.pgm + .yaml) via a ROS service.
   - ICP-based scan matching corrects odometry drift between consecutive scans.
   - Thread-safe scan / odometry access with a Lock.
   - Configurable via ROS 2 parameters (all have sensible defaults).
-
-Map-save fixes (v2):
-  - save_map_pgm_yaml now receives occ/free probability thresholds so the
-    saved .pgm matches exactly what is published on /slam_map.
-  - PGM header written separately from pixel data to avoid any newline issues.
-  - _srv_save_map logs success/failure to the ROS logger.
-  - Added a /slam/save_map_path parameter-update guard so the path can be
-    changed at runtime before calling the service.
 
 ICP pose topic (v3):
   - Publishes /icp_pose (geometry_msgs/PoseWithCovarianceStamped) in the
@@ -29,11 +20,13 @@ ICP pose topic (v3):
     icp_cov_x, icp_cov_y, icp_cov_yaw so the EKF can weight the measurement.
   - The message is published only when ICP fires AND the correction passes
     the sanity-check gate, so the EKF never receives stale/duplicated poses.
+
+Note: map saving (.pgm / .yaml) has been moved to map_merger_node.py.
+      Call the /map_merger/save_map service there to persist the map.
 """
 
 import math
 import threading
-import os
 
 import numpy as np
 import rclpy
@@ -46,7 +39,6 @@ from geometry_msgs.msg   import (
     Pose, Point, Quaternion, PoseStamped, PoseWithCovarianceStamped,
     TransformStamped
 )
-from std_srvs.srv        import Trigger
 from tf2_ros             import TransformBroadcaster
 
 
@@ -176,68 +168,6 @@ def icp_2d(src: np.ndarray, dst: np.ndarray,
     return dx_total, dy_total, normalize_angle(dyaw_total)
 
 
-# ── Map saver ─────────────────────────────────────────────────────────────────
-
-def save_map_pgm_yaml(
-    log_odds: np.ndarray,
-    resolution: float,
-    origin_x: float,
-    origin_y: float,
-    base_path: str,
-    occ_thresh: float = 0.65,   # FIX: accept thresholds so they match publisher
-    free_thresh: float = 0.35,
-) -> str:
-    """
-    Convert the log-odds grid to a PGM image and companion YAML file.
-
-    Pixel encoding (matching ROS map_server convention):
-        0   → occupied  (prob >= occ_thresh)
-        254 → free      (prob <= free_thresh)
-        205 → unknown
-    The image is vertically flipped so row 0 of the PGM corresponds to
-    the bottom of the map (positive-Y world direction), matching RViz.
-    """
-    rows, cols = log_odds.shape
-
-    # Convert log-odds → probability
-    prob = 1.0 - 1.0 / (1.0 + np.exp(log_odds))
-
-    # Build PGM pixel array
-    pgm = np.full((rows, cols), 205, dtype=np.uint8)   # unknown = 205
-    pgm[prob >= occ_thresh]  = 0                        # occupied = 0 (black)
-    pgm[prob <= free_thresh] = 254                      # free     = 254 (white)
-
-    # Flip vertically: PGM row-0 = top of image = highest Y in world
-    pgm_img = np.flipud(pgm)
-
-    pgm_path  = base_path + '.pgm'
-    yaml_path = base_path + '.yaml'
-
-    # ── Write PGM ──────────────────────────────────────────────────────────
-    # Write header as ASCII then raw binary pixels in the SAME binary file.
-    # Using explicit '\n' avoids Windows \r\n corruption of pixel bytes.
-    os.makedirs(os.path.dirname(os.path.abspath(pgm_path)), exist_ok=True)
-    with open(pgm_path, 'wb') as f:
-        header = f'P5\n{cols} {rows}\n255\n'
-        f.write(header.encode('ascii'))   # FIX: explicit ASCII encode
-        f.write(pgm_img.tobytes())        # raw uint8 pixels, no newlines
-
-    # ── Write YAML ─────────────────────────────────────────────────────────
-    yaml_name = os.path.basename(pgm_path)
-    with open(yaml_path, 'w', encoding='utf-8') as f:
-        f.write(f'image: {yaml_name}\n')
-        f.write(f'resolution: {resolution}\n')
-        f.write(f'origin: [{origin_x:.4f}, {origin_y:.4f}, 0.0]\n')
-        f.write('negate: 0\n')
-        f.write(f'occupied_thresh: {occ_thresh}\n')   # FIX: use actual thresholds
-        f.write(f'free_thresh: {free_thresh}\n')
-
-    return (
-        f'Map saved → {pgm_path} and {yaml_path} '
-        f'({cols}×{rows} cells, {cols * rows} bytes)'
-    )
-
-
 # ── SLAM Node ──────────────────────────────────────────────────────────────────
 
 class SLAMNode(Node):
@@ -263,9 +193,6 @@ class SLAMNode(Node):
         self.declare_parameter('use_icp',         True)
         self.declare_parameter('icp_max_iter',    20)
         self.declare_parameter('icp_tolerance',   1e-4)
-        self.declare_parameter('save_map_path',   '/tmp/slam_map')
-        # FIX: expose probability thresholds as parameters so they are
-        #      consistent between the publisher and the map saver.
         self.declare_parameter('occ_thresh',      0.65)
         self.declare_parameter('free_thresh',     0.35)
         # ICP pose covariance — tuned to your sensor; larger = trust EKF more
@@ -287,9 +214,8 @@ class SLAMNode(Node):
         self.use_icp     = self.get_parameter('use_icp').value
         self.icp_iter    = self.get_parameter('icp_max_iter').value
         self.icp_tol     = self.get_parameter('icp_tolerance').value
-        self.save_path   = self.get_parameter('save_map_path').value
-        self.occ_thresh  = self.get_parameter('occ_thresh').value   # FIX
-        self.free_thresh = self.get_parameter('free_thresh').value  # FIX
+        self.occ_thresh  = self.get_parameter('occ_thresh').value
+        self.free_thresh = self.get_parameter('free_thresh').value
         self.icp_cov_x   = self.get_parameter('icp_cov_x').value
         self.icp_cov_y   = self.get_parameter('icp_cov_y').value
         self.icp_cov_yaw = self.get_parameter('icp_cov_yaw').value
@@ -332,7 +258,6 @@ class SLAMNode(Node):
         self._icp_pose_pub   = self.create_publisher(               # EKF input
             PoseWithCovarianceStamped, '/icp/pose', 10)
         self._tf_broadcaster = TransformBroadcaster(self)
-        self.create_service(Trigger, '/slam/save_map', self._srv_save_map)
 
         self.create_timer(1.0 / pub_rate, self._publish_map)
         self.create_timer(0.05, self._broadcast_tf)   # 20 Hz
@@ -575,45 +500,6 @@ class SLAMNode(Node):
         pose_msg.pose.position    = Point(x=self.robot_x, y=self.robot_y, z=0.0)
         pose_msg.pose.orientation = yaw_to_quaternion(self.robot_yaw)
         self._pose_pub.publish(pose_msg)
-
-    # ── Save-map service ──────────────────────────────────────────────────
-
-    def _srv_save_map(self, _request, response):
-        """
-        ROS service handler for /slam/save_map (std_srvs/Trigger).
-
-        Snapshot the current log-odds grid under the grid lock, then write
-        it to disk outside the lock so scan callbacks are not stalled.
-        """
-        # FIX: re-read save_path at call time so a ros2 param set takes effect
-        save_path = self.get_parameter('save_map_path').value
-
-        # Snapshot under lock — keeps the critical section short
-        with self._grid_lock:
-            lo_snapshot = self.log_odds.copy()
-            origin_x    = self.origin_x
-            origin_y    = self.origin_y
-
-        try:
-            msg = save_map_pgm_yaml(
-                lo_snapshot,
-                self.res,
-                origin_x,
-                origin_y,
-                save_path,
-                occ_thresh=self.occ_thresh,    # FIX: pass node thresholds
-                free_thresh=self.free_thresh,  # FIX: pass node thresholds
-            )
-            response.success = True
-            response.message = msg
-            self.get_logger().info(msg)        # FIX: log to terminal
-        except Exception as exc:
-            response.success = False
-            response.message = str(exc)
-            self.get_logger().error(           # FIX: log errors too
-                f'save_map FAILED: {exc}')
-
-        return response
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

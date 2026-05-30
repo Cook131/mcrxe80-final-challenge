@@ -79,9 +79,9 @@ def generate_launch_description():
             'odom_topic':         '/odom',
             'goal_in_topic':      '/astar/goal',
             'goal_out_topic':     '/goal',
-            'inflation_radius':   0.15,
-            'waypoint_threshold': 0.10,
-            'occupied_threshold': 65,
+            'inflation_radius':   0.35,
+            'waypoint_threshold': 0.12,
+            'occupied_threshold': 50,
             'allow_diagonal':     False,
         }]
     )
