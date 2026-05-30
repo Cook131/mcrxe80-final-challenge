@@ -3,25 +3,27 @@
 Map Merger Node
 ===============
 Subscribes to the SLAM map topic (nav_msgs/OccupancyGrid) and accumulates
-every incoming snapshot into a single, ever-growing merged map using a
-log-odds Bayesian update.  The result is published as a latched
-nav_msgs/OccupancyGrid on /merged_map and can be saved to disk (.pgm + .yaml)
-via the /map_merger/save_map service (std_srvs/Trigger).
+every incoming snapshot into a single, ever-growing persistent map.
 
-Design rationale
-----------------
-The SLAM node already does the hard work of building the map.  This node
-just *integrates* successive published snapshots so that:
-  - Cells confirmed occupied across many scans accumulate evidence.
-  - Cells seen as free across many scans become more confidently free.
-  - Unknown cells (-1 in ROS convention) contribute no evidence.
-  - The merged grid expands automatically when incoming maps extend beyond
-    the current merged-map boundary.
+Design rationale — max-occupancy strategy
+------------------------------------------
+Cells are NEVER un-occupied.  The merged grid stores the maximum occupancy
+value ever seen for each cell across all incoming snapshots:
+
+  - A cell seen as occupied (100) stays occupied forever.
+  - A cell seen as free (0) is written only if it has never been occupied.
+  - Unknown cells (-1) contribute no information.
+  - The merged grid expands automatically when incoming maps grow beyond
+    the current boundary.
+
+This is the right strategy for map saving: the goal is a conservative,
+complete record of every obstacle ever detected, not a live probabilistic
+estimate that can erase walls when a scan misses them.
 
 Topic / service summary
 -----------------------
   Subscriptions:
-    /slam_map        nav_msgs/OccupancyGrid   (input — any latched QoS)
+    /slam_map        nav_msgs/OccupancyGrid   (input — latched QoS)
 
   Publications:
     /merged_map      nav_msgs/OccupancyGrid   (latched, 1 Hz by default)
@@ -34,15 +36,8 @@ Parameters
   source_map_topic   str    '/slam_map'
   publish_rate       float   1.0          [Hz]
   map_frame          str    'map'
-  resolution         float   0.05         [m/cell]  — used only for the very
-                                           first map; subsequent maps must
-                                           match this resolution.
-  lo_occ             float   0.85         log-odds increment for occupied
-  lo_free            float   0.40         log-odds decrement for free
-  lo_max             float   5.0          log-odds saturation max
-  lo_min             float  -5.0          log-odds saturation min
-  occ_thresh         float   0.65         prob → 100 (occupied)
-  free_thresh        float   0.35         prob → 0   (free)
+  resolution         float   0.05         [m/cell]  — must match SLAM node
+  occ_thresh         int     50           cells >= this value → occupied in .pgm
   save_map_path      str    '/tmp/merged_map'
 """
 
@@ -74,30 +69,33 @@ def _yaw_to_quaternion(yaw: float) -> Quaternion:
 # ── PGM / YAML saver (mirrors slam_node.py convention exactly) ────────────────
 
 def save_map_pgm_yaml(
-    log_odds: np.ndarray,
+    grid: np.ndarray,
     resolution: float,
     origin_x: float,
     origin_y: float,
     base_path: str,
-    occ_thresh: float = 0.65,
-    free_thresh: float = 0.35,
+    occ_thresh: int = 50,
 ) -> str:
     """
-    Write the log-odds grid as a .pgm image + .yaml metadata file.
+    Write the max-occupancy int8 grid as a .pgm image + .yaml metadata file.
+
+    Input grid uses ROS OccupancyGrid convention:
+        100 → occupied
+          0 → free
+         -1 → unknown
 
     Pixel encoding (ROS map_server convention):
-        0   → occupied  (prob >= occ_thresh)
-        254 → free      (prob <= free_thresh)
-        205 → unknown
+          0 → occupied  (value >= occ_thresh)
+        254 → free      (value == 0)
+        205 → unknown   (value == -1)
     Row 0 of the PGM = bottom of the map (positive-Y world direction).
     """
-    rows, cols = log_odds.shape
+    rows, cols = grid.shape
 
-    prob = 1.0 - 1.0 / (1.0 + np.exp(log_odds))
+    pgm = np.full((rows, cols), 205, dtype=np.uint8)          # unknown
+    pgm[grid == 0]             = 254                           # free
+    pgm[grid >= occ_thresh]    = 0                             # occupied
 
-    pgm = np.full((rows, cols), 205, dtype=np.uint8)
-    pgm[prob >= occ_thresh]  = 0
-    pgm[prob <= free_thresh] = 254
     pgm_img = np.flipud(pgm)
 
     pgm_path  = base_path + '.pgm'
@@ -115,8 +113,8 @@ def save_map_pgm_yaml(
         fh.write(f'resolution: {resolution}\n')
         fh.write(f'origin: [{origin_x:.4f}, {origin_y:.4f}, 0.0]\n')
         fh.write('negate: 0\n')
-        fh.write(f'occupied_thresh: {occ_thresh}\n')
-        fh.write(f'free_thresh: {free_thresh}\n')
+        fh.write('occupied_thresh: 0.65\n')
+        fh.write('free_thresh: 0.35\n')
 
     return (
         f'Merged map saved → {pgm_path}  and  {yaml_path} '
@@ -140,28 +138,21 @@ class MapMergerNode(Node):
         self.declare_parameter('publish_rate',      1.0)
         self.declare_parameter('map_frame',        'map')
         self.declare_parameter('resolution',        0.05)
-        self.declare_parameter('lo_occ',            0.85)
-        self.declare_parameter('lo_free',           0.40)
-        self.declare_parameter('lo_max',            5.0)
-        self.declare_parameter('lo_min',           -5.0)
-        self.declare_parameter('occ_thresh',        0.65)
-        self.declare_parameter('free_thresh',       0.35)
+        self.declare_parameter('occ_thresh',        50)           # int8 threshold
         self.declare_parameter('save_map_path',    '/tmp/merged_map')
 
         self._source_topic = self.get_parameter('source_map_topic').value
         self._map_frame    = self.get_parameter('map_frame').value
         self._res          = self.get_parameter('resolution').value
-        self._lo_occ       = self.get_parameter('lo_occ').value
-        self._lo_free      = self.get_parameter('lo_free').value
-        self._lo_max       = self.get_parameter('lo_max').value
-        self._lo_min       = self.get_parameter('lo_min').value
         self._occ_thresh   = self.get_parameter('occ_thresh').value
-        self._free_thresh  = self.get_parameter('free_thresh').value
         pub_rate           = self.get_parameter('publish_rate').value
 
         # ── Internal merged grid state ─────────────────────────────────────
+        # Stores the maximum occupancy value ever seen per cell.
+        # dtype int8, same convention as ROS OccupancyGrid:
+        #   -1 = unknown, 0 = free, 100 = occupied.
         # Initialised lazily on the first incoming map.
-        self._log_odds: np.ndarray | None = None
+        self._grid: np.ndarray | None = None
         self._origin_x: float = 0.0
         self._origin_y: float = 0.0
         self._grid_w:   int   = 0
@@ -204,12 +195,17 @@ class MapMergerNode(Node):
 
     def _cb_map(self, msg: OccupancyGrid):
         """
-        Integrate a new OccupancyGrid snapshot into the merged log-odds grid.
+        Merge a new OccupancyGrid snapshot using a max-occupancy strategy.
 
         ROS OccupancyGrid convention:
             -1  → unknown
              0  → free
             100 → occupied
+
+        Rules applied per cell:
+            incoming occupied  → cell becomes occupied, permanently
+            incoming free      → cell becomes free only if currently unknown
+            incoming unknown   → cell unchanged
         """
         info = msg.info
         inc_w    = info.width
@@ -218,7 +214,6 @@ class MapMergerNode(Node):
         inc_ox   = info.origin.position.x
         inc_oy   = info.origin.position.y
 
-        # Sanity check resolution
         if abs(inc_res - self._res) > 1e-5:
             self.get_logger().warn(
                 f'Incoming map resolution {inc_res:.4f} != expected '
@@ -230,23 +225,20 @@ class MapMergerNode(Node):
 
         with self._lock:
             # ── Lazy initialisation from first map ────────────────────────
-            if self._log_odds is None:
+            if self._grid is None:
                 self._origin_x = inc_ox
                 self._origin_y = inc_oy
                 self._grid_w   = inc_w
                 self._grid_h   = inc_h
-                self._log_odds = np.zeros((inc_h, inc_w), dtype=np.float32)
+                self._grid     = np.full((inc_h, inc_w), -1, dtype=np.int8)
                 self.get_logger().info(
                     f'Merged grid initialised: {inc_w}×{inc_h} cells, '
                     f'origin=({inc_ox:.2f}, {inc_oy:.2f})'
                 )
 
             # ── Expand merged grid if needed ──────────────────────────────
-            # World extent of incoming map
             inc_right = inc_ox + inc_w * self._res
             inc_top   = inc_oy + inc_h * self._res
-
-            # World extent of current merged grid
             cur_right = self._origin_x + self._grid_w * self._res
             cur_top   = self._origin_y + self._grid_h * self._res
 
@@ -266,33 +258,26 @@ class MapMergerNode(Node):
             col_off = int(round((inc_ox - self._origin_x) / self._res))
             row_off = int(round((inc_oy - self._origin_y) / self._res))
 
-            # ── Apply Bayesian log-odds update cell by cell ───────────────
-            # Vectorised for performance.
-            #
-            # Only cells that are NOT unknown (-1) contribute evidence.
-            # occupied (100) → +lo_occ
-            # free     (  0) → -lo_free
-            known_mask = data != -1
-            occ_mask   = known_mask & (data >= 50)
-            free_mask  = known_mask & (data <  50)
-
-            # Slice view into the merged grid where the incoming map lands
+            # ── Clamp slice to merged-grid bounds (defensive) ─────────────
             r0, r1 = row_off, row_off + inc_h
             c0, c1 = col_off, col_off + inc_w
-
-            # Clamp slice to actual merged-grid bounds (defensive)
             r0c = max(r0, 0);  r1c = min(r1, self._grid_h)
             c0c = max(c0, 0);  c1c = min(c1, self._grid_w)
             dr0 = r0c - r0;    dc0 = c0c - c0
             dr1 = dr0 + (r1c - r0c)
             dc1 = dc0 + (c1c - c0c)
 
-            target = self._log_odds[r0c:r1c, c0c:c1c]
-            occ    = occ_mask [dr0:dr1, dc0:dc1]
-            free   = free_mask[dr0:dr1, dc0:dc1]
+            target = self._grid[r0c:r1c, c0c:c1c]
+            patch  = data[dr0:dr1, dc0:dc1]
 
-            target[occ]  = np.minimum(target[occ]  + self._lo_occ,  self._lo_max)
-            target[free] = np.maximum(target[free] - self._lo_free, self._lo_min)
+            # ── Max-occupancy merge ───────────────────────────────────────
+            # 1. Mark free: only where merged cell is still unknown (-1)
+            free_mask = (patch == 0) & (target == -1)
+            target[free_mask] = 0
+
+            # 2. Mark occupied: always — occupied cells never get erased
+            occ_mask = patch >= self._occ_thresh
+            target[occ_mask] = 100
 
             self._map_count += 1
 
@@ -307,18 +292,19 @@ class MapMergerNode(Node):
     def _expand_grid(self, pad_left: int, pad_bot: int,
                      pad_right: int, pad_top: int):
         """
-        Grow the log-odds array by the requested number of cells on each side.
+        Grow the int8 grid by the requested number of cells on each side.
+        New cells are initialised to -1 (unknown).
         Must be called while _lock is held.
         """
         new_w = self._grid_w + pad_left + pad_right
         new_h = self._grid_h + pad_bot  + pad_top
-        new_grid = np.zeros((new_h, new_w), dtype=np.float32)
+        new_grid = np.full((new_h, new_w), -1, dtype=np.int8)
         new_grid[
             pad_bot : pad_bot + self._grid_h,
             pad_left: pad_left + self._grid_w
-        ] = self._log_odds
+        ] = self._grid
 
-        self._log_odds  = new_grid
+        self._grid      = new_grid
         self._grid_w    = new_w
         self._grid_h    = new_h
         self._origin_x -= pad_left * self._res
@@ -333,20 +319,14 @@ class MapMergerNode(Node):
 
     def _publish_merged_map(self):
         with self._lock:
-            if self._log_odds is None:
+            if self._grid is None:
                 return  # Nothing received yet
 
-            lo_copy  = self._log_odds.copy()
-            origin_x = self._origin_x
-            origin_y = self._origin_y
-            grid_w   = self._grid_w
-            grid_h   = self._grid_h
-
-        # Convert log-odds → ROS OccupancyGrid values
-        prob     = 1.0 - 1.0 / (1.0 + np.exp(lo_copy))
-        ros_grid = np.full(lo_copy.shape, -1, dtype=np.int8)
-        ros_grid[prob >= self._occ_thresh]  = 100
-        ros_grid[prob <= self._free_thresh] = 0
+            grid_copy = self._grid.copy()
+            origin_x  = self._origin_x
+            origin_y  = self._origin_y
+            grid_w    = self._grid_w
+            grid_h    = self._grid_h
 
         msg = OccupancyGrid()
         msg.header.stamp    = self.get_clock().now().to_msg()
@@ -361,7 +341,7 @@ class MapMergerNode(Node):
             orientation=_yaw_to_quaternion(0.0),
         )
         msg.info = meta
-        msg.data = ros_grid.flatten().tolist()
+        msg.data = grid_copy.flatten().tolist()
 
         self._merged_pub.publish(msg)
 
@@ -371,31 +351,30 @@ class MapMergerNode(Node):
         """
         /map_merger/save_map  (std_srvs/Trigger)
 
-        Snapshots the current merged log-odds grid and writes it to disk as
+        Snapshots the current merged grid and writes it to disk as
         <save_map_path>.pgm  +  <save_map_path>.yaml
         """
         save_path = self.get_parameter('save_map_path').value
 
         with self._lock:
-            if self._log_odds is None:
+            if self._grid is None:
                 response.success = False
                 response.message = 'No map data received yet — nothing to save.'
                 self.get_logger().warn(response.message)
                 return response
 
-            lo_snap  = self._log_odds.copy()
-            origin_x = self._origin_x
-            origin_y = self._origin_y
+            grid_snap = self._grid.copy()
+            origin_x  = self._origin_x
+            origin_y  = self._origin_y
 
         try:
             msg = save_map_pgm_yaml(
-                lo_snap,
+                grid_snap,
                 self._res,
                 origin_x,
                 origin_y,
                 save_path,
                 occ_thresh=self._occ_thresh,
-                free_thresh=self._free_thresh,
             )
             response.success = True
             response.message = msg

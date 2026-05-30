@@ -102,7 +102,7 @@ def generate_launch_description():
                     'icp_tolerance':     1e-4,
                     'publish_rate':      1.0,
                     'tf_rate':           20.0,
-                    'occ_thresh':        0.65,
+                    'occ_thresh':        0.85,
                     'free_thresh':       0.35,
                 }]
             )
@@ -118,20 +118,15 @@ def generate_launch_description():
         actions=[
             Node(
                 package='iolair',
-                executable='map_merger',
-                name='map_merger_node',
+                executable='mapping_node',
+                name='mappping_node',
                 output='screen',
                 parameters=[{
                     'source_map_topic':  '/slam_map',
                     'publish_rate':       1.0,
                     'map_frame':         'map',
                     'resolution':         0.05,
-                    'lo_occ':             0.85,
-                    'lo_free':            0.40,
-                    'lo_max':             5.0,
-                    'lo_min':            -5.0,
-                    'occ_thresh':         0.65,
-                    'free_thresh':        0.35,
+                    'occ_thresh':         50,
                     'save_map_path':     '/home/serch/mcrxe80-final-challenge/src/iolair/maps/SLAM_map',
                 }]
             )
