@@ -215,6 +215,7 @@ class PuzzlebotMCL(Node):
         self.declare_parameter('laser_z_max',      0.05)
         self.declare_parameter('laser_max_range',  8.0)
         self.declare_parameter('beam_skip',        6)
+        self.declare_parameter('lidar_yaw_offset', 0.0)
 
         # Motion thresholds before updating
         self.declare_parameter('min_trans', 0.05)
@@ -245,7 +246,8 @@ class PuzzlebotMCL(Node):
         self._z_rand     = self.get_parameter('laser_z_rand').value
         self._z_max      = self.get_parameter('laser_z_max').value
         self._max_range  = self.get_parameter('laser_max_range').value
-        self._beam_skip  = self.get_parameter('beam_skip').value
+        self._beam_skip        = self.get_parameter('beam_skip').value
+        self._lidar_yaw_offset = self.get_parameter('lidar_yaw_offset').value
         self._min_trans  = self.get_parameter('min_trans').value
         self._min_rot    = self.get_parameter('min_rot').value
         self._resample_interval = self.get_parameter('resample_interval').value
@@ -538,7 +540,8 @@ class PuzzlebotMCL(Node):
         """
         ranges     = np.asarray(scan.ranges, dtype=np.float32)
         angles     = (scan.angle_min
-                      + np.arange(len(ranges)) * scan.angle_increment)
+                      + np.arange(len(ranges)) * scan.angle_increment
+                      + self._lidar_yaw_offset)
 
         # Sub-sample beams for speed
         idx    = np.arange(0, len(ranges), self._beam_skip)

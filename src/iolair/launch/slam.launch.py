@@ -35,6 +35,7 @@ How to use
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import TimerAction
+import math
 
 
 def generate_launch_description():
@@ -46,7 +47,7 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         name='static_tf_lidar',
-        arguments=['0', '0', '0.17', '3.1419', '0', '0', 'base_link', 'lidar_link'],
+        arguments=['0', '0', '0.14', '0', '0', '0', 'base_link', 'lidar_link'],
     )
 
     # ── 2. Odometry node ──────────────────────────────────────────────────
@@ -57,6 +58,7 @@ def generate_launch_description():
         executable='odometry',
         name='puzzlebot_odom_node',
         output='screen',
+        parameters=[{'initial_yaw': math.pi}],
     )
 
     # ── 3. Controller node ────────────────────────────────────────────────

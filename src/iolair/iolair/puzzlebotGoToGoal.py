@@ -1,125 +1,153 @@
+#!/usr/bin/env python3
+"""
+puzzlebotGoToGoal.py — PID Go-To-Goal controller
+=================================================
+Sits in the pipeline:
+  A* ──/goal──► GoToGoal ──/cmd_raw──► bug_IBA ──/cmd_vel──► Controller
+
+Publishes to /cmd_raw (NOT /cmd_vel) so the bug_IBA reflex layer
+can override commands when obstacles are detected.
+"""
+
+import math
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, Pose2D
-import math
+
 
 class GoToGoalNode(Node):
+
     def __init__(self):
         super().__init__('go_to_goal_node')
-        
-        # --- COMUNICACIÓN ROS 2 ---
-        self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
-        self.sub_goal = self.create_subscription(Pose2D, '/goal', self.goal_callback, 10)
-        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
 
-        # --- ESTADO DEL ROBOT ---
-        self.x, self.y, self.th = 0.0, 0.0, 0.0
-        self.target_x, self.target_y = 0.0, 0.0
-        self.active = False
+        # ── Parameters ────────────────────────────────────────────────────
+        self.declare_parameter('kp_v',                  1.8)
+        self.declare_parameter('ki_v',                  0.02)
+        self.declare_parameter('kd_v',                  0.1)
+        self.declare_parameter('kp_w',                  1.0)
+        self.declare_parameter('ki_w',                  0.0)
+        self.declare_parameter('kd_w',                  0.0)
+        self.declare_parameter('max_linear_velocity',   0.22)
+        self.declare_parameter('max_angular_velocity',  0.5)
+        self.declare_parameter('angle_threshold',       0.15)
+        self.declare_parameter('goal_reached_dist',     0.10)  # 10 cm — realistic for hardware
 
-        # --- PARÁMETROS PID (AJUSTADOS PARA LINEAL RÁPIDO / GIRO LENTO) ---
-        # PID para Velocidad Lineal (Agresivo)
-        self.kp_v, self.ki_v, self.kd_v = 1.8, 0.02, 0.1
-        
-        # PID para Velocidad Angular (Suave)
-        self.kp_w, self.ki_w, self.kd_w = 1.0, 0.0, 0.0
+        self.kp_v   = self.get_parameter('kp_v').value
+        self.ki_v   = self.get_parameter('ki_v').value
+        self.kd_v   = self.get_parameter('kd_v').value
+        self.kp_w   = self.get_parameter('kp_w').value
+        self.ki_w   = self.get_parameter('ki_w').value
+        self.kd_w   = self.get_parameter('kd_w').value
+        self.max_v  = self.get_parameter('max_linear_velocity').value
+        self.max_w  = self.get_parameter('max_angular_velocity').value
+        self.angle_threshold  = self.get_parameter('angle_threshold').value
+        self.goal_reached_dist = self.get_parameter('goal_reached_dist').value
 
-        # --- LÍMITES DE SATURACIÓN ---
-        self.max_linear_velocity = 0.22   # m/s — razonable para hardware real
-        self.max_angular_velocity = 1.0   # rad/s
-        self.angle_threshold = 0.15       # ~8.6° — punto de equilibrio entre
+        # ── State ─────────────────────────────────────────────────────────
+        self.x   = 0.0
+        self.y   = 0.0
+        self.th  = 0.0
+        self.target_x = 0.0
+        self.target_y = 0.0
+        self.active   = False
 
-        # --- VARIABLES DE CONTROL ---
-        self.error_dist_prev = 0.0
+        self.error_dist_prev  = 0.0
         self.error_angle_prev = 0.0
-        self.integral_dist = 0.0
-        self.integral_angle = 0.0
-        
-        self.last_time = self.get_clock().now()
+        self.integral_dist    = 0.0
+        self.integral_angle   = 0.0
+        self.last_time        = self.get_clock().now()
 
-        self.get_logger().info("Nodo Go-to-Goal PID iniciado.")
-        self.get_logger().info(f"Configuración: V_MAX={self.max_linear_velocity}, W_MAX={self.max_angular_velocity}")
+        # ── Subscribers ───────────────────────────────────────────────────
+        self.create_subscription(Odometry, '/odom',  self._cb_odom, 10)
+        self.create_subscription(Pose2D,   '/goal',  self._cb_goal, 10)
 
-    def odom_callback(self, msg):
-        # 1. Extraer posición
-        self.x = msg.pose.pose.position.x
-        self.y = msg.pose.pose.position.y
-        
-        # 2. Convertir Cuaternión a Euler (Yaw)
+        # ── Publisher → /cmd_raw so bug_IBA can intercept ─────────────────
+        self._pub_cmd = self.create_publisher(Twist, '/cmd_raw', 10)
+
+        self.get_logger().info(
+            f'GoToGoal started — goal_reached_dist={self.goal_reached_dist} m, '
+            f'publishing to /cmd_raw'
+        )
+
+    # ── Callbacks ─────────────────────────────────────────────────────────
+
+    def _cb_odom(self, msg: Odometry):
+        self.x  = msg.pose.pose.position.x
+        self.y  = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        self.th = math.atan2(siny_cosp, cosy_cosp)
-
+        self.th = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
         if self.active:
-            self.control_loop()
+            self._control_loop()
 
-    def goal_callback(self, msg):
+    def _cb_goal(self, msg: Pose2D):
         self.target_x = msg.x
         self.target_y = msg.y
-        self.active = True
-        
-        # Reiniciar errores acumulados para el nuevo trayecto
-        self.integral_dist = 0.0
-        self.integral_angle = 0.0
-        self.error_dist_prev = 0.0
+        self.active   = True
+
+        # Reset integrators on new goal
+        self.integral_dist    = 0.0
+        self.integral_angle   = 0.0
+        self.error_dist_prev  = 0.0
         self.error_angle_prev = 0.0
-        
-        self.get_logger().info(f"📍 Nuevo objetivo: x={self.target_x}, y={self.target_y}")
 
-    def control_loop(self):
-        # Cálculo de tiempo (Delta Time)
-        current_time = self.get_clock().now()
-        dt = (current_time - self.last_time).nanoseconds / 1e9
-        if dt <= 0: return
-        self.last_time = current_time
+        self.get_logger().info(
+            f'New goal: ({self.target_x:.2f}, {self.target_y:.2f})'
+        )
 
-        # 1. Calcular errores actuales
-        dist = math.sqrt((self.target_x - self.x)**2 + (self.target_y - self.y)**2)
-        angle_to_goal = math.atan2(self.target_y - self.y, self.target_x - self.x)
-        error_angle = angle_to_goal - self.th
-        
-        # Normalizar ángulo entre -pi y pi
-        error_angle = math.atan2(math.sin(error_angle), math.cos(error_angle))
+    # ── Control loop ──────────────────────────────────────────────────────
+
+    def _control_loop(self):
+        now = self.get_clock().now()
+        dt  = (now - self.last_time).nanoseconds / 1e9
+        if dt <= 0.0:
+            return
+        self.last_time = now
+
+        dist        = math.hypot(self.target_x - self.x, self.target_y - self.y)
+        angle_goal  = math.atan2(self.target_y - self.y, self.target_x - self.x)
+        error_angle = math.atan2(
+            math.sin(angle_goal - self.th),
+            math.cos(angle_goal - self.th)
+        )
 
         cmd = Twist()
 
-        # Condición de parada (Llegada al punto)
-        if dist < 0.02:
+        if dist < self.goal_reached_dist:
+            # Stop and deactivate — A* will send next waypoint if any
             self.active = False
-            self.get_logger().info("✅ Objetivo alcanzado")
+            self.get_logger().info('✅ Goal reached')
+            self._pub_cmd.publish(cmd)
+            return
+
+        # ── Angular PID ───────────────────────────────────────────────────
+        self.integral_angle   += error_angle * dt
+        derivative_angle       = (error_angle - self.error_angle_prev) / dt
+        w_out = (self.kp_w * error_angle
+                 + self.ki_w * self.integral_angle
+                 + self.kd_w * derivative_angle)
+        cmd.angular.z = max(min(w_out, self.max_w), -self.max_w)
+
+        # ── Linear PID — only drive forward when roughly aligned ──────────
+        if abs(error_angle) > self.angle_threshold:
             cmd.linear.x = 0.0
-            cmd.angular.z = 0.0
         else:
-            # 2. PID Lineal (Distancia)
-            self.integral_dist += dist * dt
-            derivative_dist = (dist - self.error_dist_prev) / dt
-            v_out = (self.kp_v * dist) + (self.ki_v * self.integral_dist) + (self.kd_v * derivative_dist)
-            
-            # 3. PID Angular (Orientación)
-            self.integral_angle += error_angle * dt
-            derivative_angle = (error_angle - self.error_angle_prev) / dt
-            w_out = (self.kp_w * error_angle) + (self.ki_w * self.integral_angle) + (self.kd_w * derivative_angle)
+            self.integral_dist  += dist * dt
+            derivative_dist      = (dist - self.error_dist_prev) / dt
+            v_out = (self.kp_v * dist
+                     + self.ki_v * self.integral_dist
+                     + self.kd_v * derivative_dist)
+            align_factor   = math.cos(error_angle)
+            cmd.linear.x   = min(v_out * align_factor, self.max_v)
 
-            # 4. Lógica de Movimiento y Saturación
-            # Primero: Limitar la rotación para que sea lenta
-            cmd.angular.z = max(min(w_out, self.max_angular_velocity), -self.max_angular_velocity)
-            
-            # Segundo: Controlar el avance lineal según la alineación
-            if abs(error_angle) > self.angle_threshold:
-                # Si está muy desalineado, casi no avanza (solo gira)
-                cmd.linear.x = 0.0
-            else:
-                # Alineado: avanzar con corrección angular proporcional al alineamiento
-                align_factor = math.cos(error_angle)
-                cmd.linear.x = min(v_out * align_factor, self.max_linear_velocity)
+        self.error_dist_prev  = dist
+        self.error_angle_prev = error_angle
 
-            # Guardar errores para el siguiente ciclo
-            self.error_dist_prev = dist
-            self.error_angle_prev = error_angle
+        self._pub_cmd.publish(cmd)
 
-        self.pub_cmd.publish(cmd)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -131,6 +159,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

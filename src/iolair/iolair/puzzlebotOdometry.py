@@ -158,6 +158,7 @@ class PuzzlebotOdometry(Node):
         super().__init__('puzzlebot_odom_ekf_node')
 
         # ── parameters ────────────────────────────────────────────────────
+        self.declare_parameter('initial_yaw',         0.0)
         self.declare_parameter('wheel_radius',        0.05)
         self.declare_parameter('wheel_base',          0.19)
         self.declare_parameter('rate',                50.0)
@@ -187,6 +188,7 @@ class PuzzlebotOdometry(Node):
 
         # ── EKF state ─────────────────────────────────────────────────────
         self._x  = np.zeros(3)
+        self._x[2] = self.get_parameter('initial_yaw').value
         self._P  = np.diag([1e-6, 1e-6, 1e-6])
         self._I3 = np.eye(3)
 

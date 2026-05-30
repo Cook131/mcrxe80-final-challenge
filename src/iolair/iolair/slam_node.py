@@ -99,10 +99,12 @@ def bresenham(x0: int, y0: int, x1: int, y1: int):
 
 def scan_to_points(scan: LaserScan, max_range: float,
                    robot_x: float, robot_y: float, robot_yaw: float,
-                   beam_skip: int = 1) -> np.ndarray:
+                   beam_skip: int = 1,
+                   lidar_yaw_offset: float = 0.0) -> np.ndarray:
     """
     Convert a LaserScan into a (N, 2) array of world-frame XY hit points.
     Returns an empty array when the scan has no valid beams.
+    lidar_yaw_offset corrects for physical LiDAR mounting rotation.
     """
     pts = []
     ranges = scan.ranges
@@ -110,7 +112,7 @@ def scan_to_points(scan: LaserScan, max_range: float,
         r = ranges[i]
         if not math.isfinite(r) or r < scan.range_min or r >= max_range:
             continue
-        angle = scan.angle_min + i * scan.angle_increment + robot_yaw
+        angle = scan.angle_min + i * scan.angle_increment + robot_yaw + lidar_yaw_offset
         pts.append([
             robot_x + r * math.cos(angle),
             robot_y + r * math.sin(angle),
@@ -254,6 +256,7 @@ class SLAMNode(Node):
         self.declare_parameter('log_odds_min',   -3.5)
         self.declare_parameter('lidar_max_range', 10.0)
         self.declare_parameter('beam_skip',       3)
+        self.declare_parameter('lidar_yaw_offset', 0.0)
         self.declare_parameter('map_init_size',   400)
         self.declare_parameter('map_origin_x',   -10.0)
         self.declare_parameter('map_origin_y',   -10.0)
@@ -279,7 +282,8 @@ class SLAMNode(Node):
         self.lo_max      = self.get_parameter('log_odds_max').value
         self.lo_min      = self.get_parameter('log_odds_min').value
         self.max_range   = self.get_parameter('lidar_max_range').value
-        self.beam_skip   = self.get_parameter('beam_skip').value
+        self.beam_skip        = self.get_parameter('beam_skip').value
+        self.lidar_yaw_offset = self.get_parameter('lidar_yaw_offset').value
         self.use_icp     = self.get_parameter('use_icp').value
         self.icp_iter    = self.get_parameter('icp_max_iter').value
         self.icp_tol     = self.get_parameter('icp_tolerance').value
@@ -358,7 +362,8 @@ class SLAMNode(Node):
             cur_pts = scan_to_points(
                 msg, self.max_range,
                 self.robot_x, self.robot_y, self.robot_yaw,
-                beam_skip=self.beam_skip
+                beam_skip=self.beam_skip,
+                lidar_yaw_offset=self.lidar_yaw_offset
             )
             if len(self._prev_scan_pts) > 10 and len(cur_pts) > 10:
                 dx, dy, dyaw = icp_2d(
@@ -392,7 +397,8 @@ class SLAMNode(Node):
                 self._prev_scan_pts = scan_to_points(
                     msg, self.max_range,
                     self.robot_x, self.robot_y, self.robot_yaw,
-                    beam_skip=self.beam_skip
+                    beam_skip=self.beam_skip,
+                    lidar_yaw_offset=self.lidar_yaw_offset
                 )
                 self.last_kf_x   = self.robot_x
                 self.last_kf_y   = self.robot_y
@@ -411,7 +417,7 @@ class SLAMNode(Node):
             for i in range(0, n_beams, self.beam_skip):
                 r     = ranges[i]
                 angle = msg.angle_min + i * msg.angle_increment
-                global_angle = self.robot_yaw + angle
+                global_angle = self.robot_yaw + angle + self.lidar_yaw_offset
 
                 is_hit = (math.isfinite(r) and msg.range_min < r < self.max_range)
 
