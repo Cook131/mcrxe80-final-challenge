@@ -138,21 +138,25 @@ class MapMergerNode(Node):
         self.declare_parameter('publish_rate',      1.0)
         self.declare_parameter('map_frame',        'map')
         self.declare_parameter('resolution',        0.05)
-        self.declare_parameter('occ_thresh',        50)           # int8 threshold
+        self.declare_parameter('occ_thresh',        0.99)   # fraction of 100
+        self.declare_parameter('min_hits',          3)      # confirmations needed
         self.declare_parameter('save_map_path',    '/tmp/merged_map')
 
         self._source_topic = self.get_parameter('source_map_topic').value
         self._map_frame    = self.get_parameter('map_frame').value
         self._res          = self.get_parameter('resolution').value
         self._occ_thresh   = self.get_parameter('occ_thresh').value
+        self._min_hits     = self.get_parameter('min_hits').value
         pub_rate           = self.get_parameter('publish_rate').value
 
         # ── Internal merged grid state ─────────────────────────────────────
-        # Stores the maximum occupancy value ever seen per cell.
-        # dtype int8, same convention as ROS OccupancyGrid:
-        #   -1 = unknown, 0 = free, 100 = occupied.
+        # _grid:      int8  — published OccupancyGrid values (-1 / 0 / 100)
+        # _hit_count: uint8 — how many snapshots marked this cell occupied.
+        #             A cell is committed as occupied only when
+        #             _hit_count >= _min_hits, filtering out spurious hits.
         # Initialised lazily on the first incoming map.
-        self._grid: np.ndarray | None = None
+        self._grid:      np.ndarray | None = None
+        self._hit_count: np.ndarray | None = None
         self._origin_x: float = 0.0
         self._origin_y: float = 0.0
         self._grid_w:   int   = 0
@@ -226,14 +230,16 @@ class MapMergerNode(Node):
         with self._lock:
             # ── Lazy initialisation from first map ────────────────────────
             if self._grid is None:
-                self._origin_x = inc_ox
-                self._origin_y = inc_oy
-                self._grid_w   = inc_w
-                self._grid_h   = inc_h
-                self._grid     = np.full((inc_h, inc_w), -1, dtype=np.int8)
+                self._origin_x  = inc_ox
+                self._origin_y  = inc_oy
+                self._grid_w    = inc_w
+                self._grid_h    = inc_h
+                self._grid      = np.full((inc_h, inc_w), -1, dtype=np.int8)
+                self._hit_count = np.zeros((inc_h, inc_w), dtype=np.uint8)
                 self.get_logger().info(
                     f'Merged grid initialised: {inc_w}×{inc_h} cells, '
-                    f'origin=({inc_ox:.2f}, {inc_oy:.2f})'
+                    f'origin=({inc_ox:.2f}, {inc_oy:.2f}), '
+                    f'min_hits={self._min_hits}'
                 )
 
             # ── Expand merged grid if needed ──────────────────────────────
@@ -267,17 +273,27 @@ class MapMergerNode(Node):
             dr1 = dr0 + (r1c - r0c)
             dc1 = dc0 + (c1c - c0c)
 
-            target = self._grid[r0c:r1c, c0c:c1c]
-            patch  = data[dr0:dr1, dc0:dc1]
+            target     = self._grid[r0c:r1c, c0c:c1c]
+            hit_target = self._hit_count[r0c:r1c, c0c:c1c]
+            patch      = data[dr0:dr1, dc0:dc1]
 
-            # ── Max-occupancy merge ───────────────────────────────────────
-            # 1. Mark free: only where merged cell is still unknown (-1)
-            free_mask = (patch == 0) & (target == -1)
+            # ── Confirmation-based merge ──────────────────────────────────
+            # Step 1 — increment hit counter for every cell the incoming map
+            #          considers occupied, capping at 255 to avoid overflow.
+            raw_occ = patch >= int(self._occ_thresh * 100)
+            hit_target[raw_occ] = np.minimum(
+                hit_target[raw_occ].astype(np.uint16) + 1, 255
+            ).astype(np.uint8)
+
+            # Step 2 — commit as occupied only once confirmed >= min_hits times.
+            #          Once a cell is committed it stays occupied forever.
+            confirmed = (hit_target >= self._min_hits) & (target != 100)
+            target[confirmed] = 100
+
+            # Step 3 — mark free only if the cell has never had a hit at all
+            #          and the incoming map sees it as free.
+            free_mask = (patch == 0) & (target == -1) & (hit_target == 0)
             target[free_mask] = 0
-
-            # 2. Mark occupied: always — occupied cells never get erased
-            occ_mask = patch >= self._occ_thresh
-            target[occ_mask] = 100
 
             self._map_count += 1
 
@@ -304,7 +320,14 @@ class MapMergerNode(Node):
             pad_left: pad_left + self._grid_w
         ] = self._grid
 
+        new_hits = np.zeros((new_h, new_w), dtype=np.uint8)
+        new_hits[
+            pad_bot : pad_bot + self._grid_h,
+            pad_left: pad_left + self._grid_w
+        ] = self._hit_count
+
         self._grid      = new_grid
+        self._hit_count = new_hits
         self._grid_w    = new_w
         self._grid_h    = new_h
         self._origin_x -= pad_left * self._res
@@ -374,7 +397,7 @@ class MapMergerNode(Node):
                 origin_x,
                 origin_y,
                 save_path,
-                occ_thresh=self._occ_thresh,
+                occ_thresh=int(self._occ_thresh * 100),
             )
             response.success = True
             response.message = msg

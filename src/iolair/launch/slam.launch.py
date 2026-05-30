@@ -102,7 +102,7 @@ def generate_launch_description():
                     'icp_tolerance':     1e-4,
                     'publish_rate':      1.0,
                     'tf_rate':           20.0,
-                    'occ_thresh':        0.85,
+                    'occ_thresh':        0.65,
                     'free_thresh':       0.35,
                 }]
             )
@@ -119,14 +119,15 @@ def generate_launch_description():
             Node(
                 package='iolair',
                 executable='mapping_node',
-                name='mappping_node',
+                name='mapping_node',
                 output='screen',
                 parameters=[{
                     'source_map_topic':  '/slam_map',
                     'publish_rate':       1.0,
                     'map_frame':         'map',
                     'resolution':         0.05,
-                    'occ_thresh':         50,
+                    'occ_thresh':         0.99,
+                    'min_hits':           3,
                     'save_map_path':     '/home/serch/mcrxe80-final-challenge/src/iolair/maps/SLAM_map',
                 }]
             )

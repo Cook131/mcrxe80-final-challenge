@@ -28,7 +28,7 @@ def generate_launch_description():
             # Aquí puedes sobreescribir los parámetros declarados en tu script si lo requieres
             parameters=[{
                 'camera_to_base_x': 0.10,
-                'camera_to_base_y': 0.00,
+                'camera_to_base_y': 0.05,
                 'camera_to_base_z': 0.13,
                 'anchor_min_dist': 0.20,
                 'anchor_max_dist': 3.50,
