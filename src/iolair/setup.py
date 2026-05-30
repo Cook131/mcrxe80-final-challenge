@@ -42,6 +42,7 @@ setup(
             'aruco_localizer       = iolair.aruco_localizer:main',
             'bug_IBA       = iolair.bug_IBA:main',
             'astar_planner   = iolair.astar_planner:main',
+            'rviz_goal_bridge = iolair.goal_bridge:main',
         ],
     },
 )

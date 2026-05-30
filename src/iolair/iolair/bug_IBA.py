@@ -1,197 +1,369 @@
 #!/usr/bin/env python3
 """
-bug_reflex.py  —  Capa Reflejo de Seguridad v2
-================================================
-Nodo intermedio entre nav_fsm y puzzlebotController.
-Actúa como "reflex arc" del robot: reacciona a colisiones inminentes
-sin esperar a la FSM.
+iba_explorer.py — Explorador Autónomo por Fronteras (IBA-style)
+================================================================
+Nodo de exploración autónoma para mapeo SLAM sin teleop.
 
-Pipeline:
-  nav_fsm → /cmd_raw → [bug_reflex] → /cmd_vel → puzzlebotController
-                              ▲
-                         /scan (alta frecuencia)
+Estrategia (Frontier-Based Exploration):
+  1. Escucha /slam_map (OccupancyGrid en tiempo real).
+  2. Detecta celdas "frontera": libres (0) adyacentes a desconocidas (-1).
+  3. Agrupa fronteras por conectividad y elige la más cercana al robot.
+  4. Publica el centroide de esa frontera como objetivo en /goal (Pose2D).
+  5. El GoToGoal + BugReflex navegan hacia allá mientras el SLAM actualiza.
+  6. Cuando el robot llega (señal de /go_to_goal_status o timeout), elige
+     la siguiente frontera.
+  7. Al agotar fronteras, publica /slam/save_map y se detiene.
 
-Tres modos en cascada de prioridad fija:
+Pipeline de seguridad (subsumption):
+  IBA Explorer → /goal → GoToGoal → /cmd_raw → BugReflex → /cmd_vel → Controller
 
-  PASS_THROUGH   frente > emergency_dist
-                 → cmd_raw pasa sin cambios
+Tópicos consumidos:
+  /slam_map        (nav_msgs/OccupancyGrid)   mapa en construcción
+  /odom            (nav_msgs/Odometry)         pose del robot
+  /astar/status    (std_msgs/String)           estado del planner A*
+  /reflex_status   (std_msgs/String)           estado del reflex layer
 
-  PREDICTIVE_BRAKE  warn_dist > frente > emergency_dist
-                 → escala v lineal hacia 0 (sin tocar angular)
-                   da tiempo a la FSM de reaccionar antes del reflejo
+Tópicos publicados:
+  /astar/goal      (geometry_msgs/Pose2D)      objetivo para A* planner
+  /iba/status      (std_msgs/String)           estado del explorador
+  /iba/frontier    (geometry_msgs/PoseArray)   fronteras detectadas (RViz)
 
-  REFLEX_TURN    frente ≤ emergency_dist (y no stop_dist)
-                 → curva de escape: pequeña v_lin + w hacia espacio libre
-                   NO es rotación pura — el robot sigue moviéndose
-                   para no atascarse
-
-  REFLEX_STOP    frente ≤ stop_dist
-                 → Twist cero (colisión inminente inevitable)
-
-Diferencias vs v1:
-  - Zona PREDICTIVE_BRAKE entre PASS y REFLEX (transición suave)
-  - REFLEX_TURN usa arco de escape (v > 0) en vez de rotación pura
-  - Dirección de giro elegida por lado con más espacio (no fijo)
-  - Hysteresis separada por zona para evitar flicker
+Servicios llamados:
+  /slam/save_map   (std_srvs/Trigger)          guardar mapa al terminar
 """
 
 import math
+import threading
 import time
+
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+
+from nav_msgs.msg      import OccupancyGrid, Odometry
+from geometry_msgs.msg import Pose2D, PoseArray, Pose, Point, Quaternion
+from std_msgs.msg      import String
+from std_srvs.srv      import Trigger
 
 
-PASS_THROUGH      = "PASS"
-PREDICTIVE_BRAKE  = "BRAKE"
-REFLEX_TURN       = "REFLEX_TURN"
-REFLEX_STOP       = "REFLEX_STOP"
+# ── Estados del explorador ────────────────────────────────────────────────────
+
+IDLE          = "IDLE"
+DETECTING     = "DETECTING"
+NAVIGATING    = "NAVIGATING"
+WAITING       = "WAITING"
+MAPPING_DONE  = "MAPPING_DONE"
+SAVING_MAP    = "SAVING_MAP"
 
 
-class BugReflex(Node):
-    """Subsumption safety layer con braking predictivo y escape en arco."""
+class IBAExplorer(Node):
+    """
+    Explorador de fronteras que dirige el SLAM autónomo del Puzzlebot.
+    Compatible con el pipeline: GoToGoal → /cmd_raw → BugReflex → /cmd_vel.
+    """
 
     def __init__(self):
-        super().__init__('bug_reflex')
+        super().__init__('iba_explorer')
 
         # ── Parámetros ────────────────────────────────────────────────────
-        self.declare_parameter('warn_dist',       0.55)   # inicio brake zone [m]
-        self.declare_parameter('emergency_dist',  0.22)   # activación REFLEX_TURN [m]
-        self.declare_parameter('stop_dist',       0.10)   # activación REFLEX_STOP [m]
-        self.declare_parameter('reflex_v',        0.04)   # v lineal en arco de escape [m/s]
-        self.declare_parameter('reflex_w',        0.65)   # w angular en escape [rad/s]
-        self.declare_parameter('reflex_hold_ms',  350)    # hold mínimo del reflejo [ms]
-        self.declare_parameter('front_half_deg',  30.0)   # semisector frontal [deg]
-        self.declare_parameter('side_half_deg',   35.0)   # semisector lateral [deg]
-        self.declare_parameter('hysteresis',      0.06)   # margen de desactivación [m]
+        self.declare_parameter('min_frontier_size',   8)      # celdas mín. para considerar frontera
+        self.declare_parameter('goal_reached_dist',   0.25)   # [m] distancia para considerar llegada
+        self.declare_parameter('nav_timeout_s',       30.0)   # timeout por waypoint [s]
+        self.declare_parameter('replan_interval_s',   8.0)    # replanning periódico [s]
+        self.declare_parameter('occupied_threshold',  65)     # umbral ocupación OccupancyGrid
+        self.declare_parameter('map_done_ratio',      0.0)    # ratio libre/total para terminar (0=solo fronteras)
+        self.declare_parameter('inflation_cells',     3)      # celdas de inflado para seguridad
+        self.declare_parameter('auto_save',           True)   # guardar mapa al terminar
 
-        self.warn_d   = float(self.get_parameter('warn_dist').value)
-        self.emg_d    = float(self.get_parameter('emergency_dist').value)
-        self.stop_d   = float(self.get_parameter('stop_dist').value)
-        self.ref_v    = float(self.get_parameter('reflex_v').value)
-        self.ref_w    = float(self.get_parameter('reflex_w').value)
-        self.hold_s   = float(self.get_parameter('reflex_hold_ms').value) / 1000.0
-        self.front_h  = math.radians(self.get_parameter('front_half_deg').value)
-        self.side_h   = math.radians(self.get_parameter('side_half_deg').value)
-        self.hyst     = float(self.get_parameter('hysteresis').value)
+        self.min_frontier  = self.get_parameter('min_frontier_size').value
+        self.goal_dist     = self.get_parameter('goal_reached_dist').value
+        self.nav_timeout   = self.get_parameter('nav_timeout_s').value
+        self.replan_iv     = self.get_parameter('replan_interval_s').value
+        self.occ_thresh    = self.get_parameter('occupied_threshold').value
+        self.auto_save     = self.get_parameter('auto_save').value
 
         # ── Estado interno ────────────────────────────────────────────────
-        self._mode        = PASS_THROUGH
-        self._reflex_ts   = 0.0
-        self._last_cmd    = Twist()
-        self.scan: LaserScan | None = None
+        self._state          = IDLE
+        self._map_msg        = None
+        self._map_lock       = threading.Lock()
+        self.robot_x         = 0.0
+        self.robot_y         = 0.0
+        self._current_goal   = None     # (gx, gy)
+        self._goal_sent_time = 0.0
+        self._last_replan    = 0.0
+        self._visited_goals  = []       # evitar revisitar fronteras idénticas
+        self._astar_status   = "IDLE"
 
-        # ── QoS best-effort para LiDAR ────────────────────────────────────
-        scan_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=5)
+        # ── QoS para mapa latched ─────────────────────────────────────────
+        map_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
-        self.create_subscription(Twist,     '/cmd_raw', self._cb_cmd,  10)
-        self.create_subscription(LaserScan, '/scan',    self._cb_scan, scan_qos)
+        # ── Subscriptores ─────────────────────────────────────────────────
+        self.create_subscription(OccupancyGrid, '/slam_map',    self._cb_map,    map_qos)
+        self.create_subscription(Odometry,      '/odom',        self._cb_odom,   10)
+        self.create_subscription(String,        '/astar/status', self._cb_astar, 10)
 
-        self._pub_cmd    = self.create_publisher(Twist,  '/cmd_vel',      10)
-        self._pub_status = self.create_publisher(String, '/reflex_status', 10)
+        # ── Publicadores ──────────────────────────────────────────────────
+        self._pub_goal     = self.create_publisher(Pose2D,    '/astar/goal',    10)
+        self._pub_status   = self.create_publisher(String,    '/iba/status',    10)
+        self._pub_frontier = self.create_publisher(PoseArray, '/iba/frontier',  10)
 
-        self.create_timer(0.05, self._loop)   # 20 Hz
+        # ── Cliente de servicio save_map ──────────────────────────────────
+        self._save_client = self.create_client(Trigger, '/slam/save_map')
 
-        self.get_logger().info(
-            f'[BugReflex v2] Lista | '
-            f'warn={self.warn_d:.2f}m | '
-            f'emg={self.emg_d:.2f}m | '
-            f'stop={self.stop_d:.2f}m')
+        # ── Timer principal ───────────────────────────────────────────────
+        self.create_timer(1.0, self._loop)
 
-    # ── Callbacks ─────────────────────────────────────────────────────────
+        self.get_logger().info('[IBAExplorer] Listo. Esperando primer mapa en /slam_map...')
+        self._set_state(IDLE)
 
-    def _cb_cmd(self, msg: Twist):
-        self._last_cmd = msg
+    # ── Callbacks ─────────────────────────────────────────────────────────────
 
-    def _cb_scan(self, msg: LaserScan):
-        self.scan = msg
+    def _cb_map(self, msg: OccupancyGrid):
+        with self._map_lock:
+            self._map_msg = msg
+        if self._state == IDLE:
+            self.get_logger().info('[IBAExplorer] Mapa recibido — iniciando exploración.')
+            self._set_state(DETECTING)
 
-    # ── Loop principal ────────────────────────────────────────────────────
+    def _cb_odom(self, msg: Odometry):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+
+    def _cb_astar(self, msg: String):
+        self._astar_status = msg.data
+
+    # ── Loop principal ─────────────────────────────────────────────────────────
 
     def _loop(self):
-        if self.scan is None:
-            self._publish(self._last_cmd, PASS_THROUGH)
+        now = time.monotonic()
+
+        if self._state == IDLE or self._state == MAPPING_DONE:
             return
 
-        front = self._sector_min(0.0,              self.front_h)
-        left  = self._sector_min(math.radians(90), self.side_h)
-        right = self._sector_min(math.radians(-90), self.side_h)
-
-        now         = time.monotonic()
-        hold_active = (now - self._reflex_ts) < self.hold_s
-
-        # ── P1: REFLEX_STOP (colisión inminente) ──────────────────────────
-        if front <= self.stop_d:
-            if self._mode != REFLEX_STOP:
-                self._reflex_ts = now
-            self._publish(Twist(), REFLEX_STOP)
+        if self._state == SAVING_MAP:
             return
 
-        # ── P2: REFLEX_TURN (escape en arco) ──────────────────────────────
-        emg_clear = self.emg_d + self.hyst
-        if front <= self.emg_d or (hold_active and self._mode == REFLEX_TURN):
-            if self._mode != REFLEX_TURN:
-                self._reflex_ts = now
+        # ── Comprobar si llegamos al objetivo ─────────────────────────────
+        if self._state == NAVIGATING and self._current_goal:
+            gx, gy = self._current_goal
+            dist = math.hypot(gx - self.robot_x, gy - self.robot_y)
 
-            # Elige dirección hacia el lado con más espacio
-            turn_sign = +1.0 if left >= right else -1.0
+            goal_reached = (
+                dist < self.goal_dist or
+                self._astar_status == 'GOAL_REACHED'
+            )
+            timed_out = (now - self._goal_sent_time) > self.nav_timeout
 
-            cmd = Twist()
-            cmd.linear.x  = self.ref_v             # arco, no rotación pura
-            cmd.angular.z = turn_sign * self.ref_w
-            self._publish(cmd, REFLEX_TURN)
-            return
+            if goal_reached:
+                self.get_logger().info(
+                    f'[IBAExplorer] ✅ Frontera alcanzada ({gx:.2f}, {gy:.2f}). '
+                    f'Buscando siguiente...')
+                self._visited_goals.append(self._current_goal)
+                self._current_goal = None
+                self._set_state(DETECTING)
 
-        # ── P3: PREDICTIVE_BRAKE (desacelerar suavemente) ─────────────────
-        # Solo actúa si el robot se mueve hacia adelante
-        warn_clear = self.warn_d + self.hyst
-        incoming_v = self._last_cmd.linear.x
-        if front <= self.warn_d and incoming_v > 0.0:
-            # Fracción de frenado: 0.0 en warn_dist, 1.0 en emergency_dist
-            t = 1.0 - (front - self.emg_d) / max(self.warn_d - self.emg_d, 1e-6)
-            t = max(0.0, min(1.0, t))
-            scale = 1.0 - t   # escala de velocidad: 1.0 → 0.0
-
-            cmd = Twist()
-            cmd.linear.x  = incoming_v * scale
-            cmd.angular.z = self._last_cmd.angular.z   # angular sin cambio
-            self._publish(cmd, PREDICTIVE_BRAKE)
-            return
-
-        # ── P4: PASS_THROUGH ──────────────────────────────────────────────
-        if self._mode not in (PASS_THROUGH, PREDICTIVE_BRAKE):
-            self.get_logger().info(
-                f'[BugReflex] Reflejo terminado — frente libre ({front:.2f}m)')
-        self._publish(self._last_cmd, PASS_THROUGH)
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    def _sector_min(self, center_rad: float, half_rad: float) -> float:
-        mn = float('inf')
-        for i, r in enumerate(self.scan.ranges):
-            a = self.scan.angle_min + i * self.scan.angle_increment
-            if abs(math.atan2(math.sin(a - center_rad),
-                              math.cos(a - center_rad))) <= half_rad:
-                if self.scan.range_min < r < self.scan.range_max:
-                    mn = min(mn, r)
-        return mn
-
-    def _publish(self, cmd: Twist, mode: str):
-        if mode != self._mode:
-            if mode not in (PASS_THROUGH, PREDICTIVE_BRAKE):
+            elif timed_out:
                 self.get_logger().warn(
-                    f'[BugReflex] {self._mode} → {mode}',
-                    throttle_duration_sec=0.4)
-            self._mode = mode
+                    f'[IBAExplorer] ⏱ Timeout navegando a ({gx:.2f}, {gy:.2f}). '
+                    f'Marcando como visitada y replanificando.')
+                self._visited_goals.append(self._current_goal)
+                self._current_goal = None
+                self._set_state(DETECTING)
 
-        self._pub_cmd.publish(cmd)
-        s = String(); s.data = mode
+        # ── Replanning periódico (mapa cambia → fronteras cambian) ────────
+        if self._state == NAVIGATING:
+            if (now - self._last_replan) > self.replan_iv:
+                self.get_logger().info('[IBAExplorer] Replanificación periódica...')
+                self._set_state(DETECTING)
+
+        # ── Detectar y enviar nueva frontera ──────────────────────────────
+        if self._state == DETECTING:
+            self._detect_and_send()
+
+    # ── Detección de fronteras ─────────────────────────────────────────────────
+
+    def _detect_and_send(self):
+        with self._map_lock:
+            if self._map_msg is None:
+                return
+            map_msg = self._map_msg
+
+        meta   = map_msg.info
+        res    = meta.resolution
+        ox     = meta.origin.position.x
+        oy     = meta.origin.position.y
+        w      = meta.width
+        h      = meta.height
+
+        grid = np.array(map_msg.data, dtype=np.int8).reshape((h, w))
+
+        # ── 1. Máscara de celdas libres y desconocidas ────────────────────
+        free    = (grid == 0)
+        unknown = (grid == -1)
+        occ     = (grid >= self.occ_thresh)
+
+        # ── 2. Detectar fronteras: libre con vecino desconocido ───────────
+        frontier_mask = np.zeros((h, w), dtype=bool)
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            shifted_unk = np.roll(unknown, (dr, dc), axis=(0, 1))
+            frontier_mask |= (free & shifted_unk)
+
+        # Excluir celdas cerca de obstáculos (inflado de seguridad)
+        infl = self.get_parameter('inflation_cells').value
+        danger = np.zeros((h, w), dtype=bool)
+        for dr in range(-infl, infl+1):
+            for dc in range(-infl, infl+1):
+                danger |= np.roll(occ, (dr, dc), axis=(0, 1))
+        frontier_mask &= ~danger
+
+        frontier_cells = list(zip(*np.where(frontier_mask)))
+        if not frontier_cells:
+            self.get_logger().info('[IBAExplorer] ✅ Sin fronteras — mapa completo.')
+            self._set_state(MAPPING_DONE)
+            if self.auto_save:
+                self._trigger_save()
+            return
+
+        # ── 3. Agrupar fronteras por conectividad (BFS simple) ────────────
+        visited  = set()
+        clusters = []
+
+        for seed in frontier_cells:
+            if seed in visited:
+                continue
+            cluster = []
+            queue   = [seed]
+            visited.add(seed)
+            while queue:
+                r, c = queue.pop()
+                cluster.append((r, c))
+                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1),
+                                (-1,-1),(-1,1),(1,-1),(1,1)]:
+                    nr, nc = r+dr, c+dc
+                    nb = (nr, nc)
+                    if (0 <= nr < h and 0 <= nc < w and
+                            nb not in visited and frontier_mask[nr, nc]):
+                        visited.add(nb)
+                        queue.append(nb)
+            if len(cluster) >= self.min_frontier:
+                clusters.append(cluster)
+
+        if not clusters:
+            self.get_logger().warn('[IBAExplorer] Fronteras muy pequeñas — posiblemente mapa casi completo.')
+            self._set_state(MAPPING_DONE)
+            if self.auto_save:
+                self._trigger_save()
+            return
+
+        # ── 4. Calcular centroides y elegir la más cercana ────────────────
+        robot_col = int((self.robot_x - ox) / res)
+        robot_row = int((self.robot_y - oy) / res)
+
+        best_goal  = None
+        best_dist  = float('inf')
+        best_size  = 0
+        centroids  = []
+
+        for cluster in clusters:
+            rows = [r for r, c in cluster]
+            cols = [c for r, c in cluster]
+            cr   = int(np.mean(rows))
+            cc   = int(np.mean(cols))
+
+            gx = ox + (cc + 0.5) * res
+            gy = oy + (cr + 0.5) * res
+            centroids.append((gx, gy))
+
+            # Saltar fronteras ya visitadas (radio de tolerancia)
+            already_visited = any(
+                math.hypot(gx - vx, gy - vy) < 0.40
+                for vx, vy in self._visited_goals
+            )
+            if already_visited:
+                continue
+
+            d = math.hypot(cc - robot_col, cr - robot_row) * res
+            # Prefiere fronteras grandes y cercanas
+            score = d - 0.3 * len(cluster) * res
+            if score < best_dist:
+                best_dist  = score
+                best_goal  = (gx, gy)
+                best_size  = len(cluster)
+
+        # ── 5. Publicar fronteras en RViz ─────────────────────────────────
+        self._publish_frontiers(centroids, map_msg.header.frame_id)
+
+        if best_goal is None:
+            self.get_logger().info('[IBAExplorer] Todas las fronteras ya visitadas — mapa completo.')
+            self._set_state(MAPPING_DONE)
+            if self.auto_save:
+                self._trigger_save()
+            return
+
+        gx, gy = best_goal
+        self.get_logger().info(
+            f'[IBAExplorer] → Frontera seleccionada: ({gx:.2f}, {gy:.2f}) '
+            f'| tamaño={best_size} celdas | dist={best_dist:.2f}m')
+
+        # ── 6. Enviar objetivo ────────────────────────────────────────────
+        goal_msg = Pose2D()
+        goal_msg.x = gx
+        goal_msg.y = gy
+        self._pub_goal.publish(goal_msg)
+
+        self._current_goal   = best_goal
+        self._goal_sent_time = time.monotonic()
+        self._last_replan    = time.monotonic()
+        self._set_state(NAVIGATING)
+
+    # ── Guardar mapa ──────────────────────────────────────────────────────────
+
+    def _trigger_save(self):
+        self._set_state(SAVING_MAP)
+        if not self._save_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error('[IBAExplorer] Servicio /slam/save_map no disponible.')
+            return
+
+        req = Trigger.Request()
+        future = self._save_client.call_async(req)
+        future.add_done_callback(self._cb_save_done)
+
+    def _cb_save_done(self, future):
+        try:
+            resp = future.result()
+            if resp.success:
+                self.get_logger().info(f'[IBAExplorer] 💾 Mapa guardado: {resp.message}')
+            else:
+                self.get_logger().error(f'[IBAExplorer] Error guardando mapa: {resp.message}')
+        except Exception as e:
+            self.get_logger().error(f'[IBAExplorer] Excepción en save_map: {e}')
+        self._set_state(MAPPING_DONE)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _publish_frontiers(self, centroids, frame_id):
+        msg = PoseArray()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id if frame_id else 'map'
+        for gx, gy in centroids:
+            p = Pose()
+            p.position.x = gx
+            p.position.y = gy
+            p.orientation.w = 1.0
+            msg.poses.append(p)
+        self._pub_frontier.publish(msg)
+
+    def _set_state(self, state: str):
+        if state != self._state:
+            self.get_logger().info(f'[IBAExplorer] Estado: {self._state} → {state}')
+            self._state = state
+        s = String()
+        s.data = state
         self._pub_status.publish(s)
 
 
@@ -199,13 +371,12 @@ class BugReflex(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = BugReflex()
+    node = IBAExplorer()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node._pub_cmd.publish(Twist())
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
