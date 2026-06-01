@@ -5,67 +5,55 @@ puzzlebotMCL.py — Monte Carlo Localization for the Puzzlebot
 
 Architecture
 ------------
-This node fuses two sources of information:
+  EKF odometry (/odom)        → motion model  (velocity odometry, Thrun Alg. 5.3)
+  LiDAR scan   (/scan)        → sensor model  (likelihood field, vectorised)
+  nav2_map_server (/map)      → occupancy grid (TRANSIENT_LOCAL, started by launch)
 
-  1. EKF odometry (/odom)  — motion model (predicts where particles moved)
-  2. LiDAR scan (/scan)    — sensor model (weights particles by scan likelihood)
+Outputs
+-------
+  /mcl/pose  (PoseWithCovarianceStamped, map frame)
+  TF: map → odom  at 20 Hz
 
-It outputs a corrected pose on /mcl/pose and broadcasts the map→odom TF
-so the rest of the stack (RViz, controller, etc.) sees a globally
-consistent frame without touching any existing node.
+Algorithm: SIR Particle Filter
+  Predict  — full rot1/trans/rot2 decomposition + Gaussian noise
+  Update   — likelihood-field sensor model (vectorised over particles)
+  Resample — low-variance (systematic) resampling
+  Estimate — weighted circular mean
 
-Algorithm: SIR Particle Filter (Sequential Importance Resampling)
-  Predict  → sample motion from odometry delta + Gaussian noise
-  Update   → weight each particle with a beam-based sensor model
-  Resample → low-variance (systematic) resampling to avoid degeneracy
-  Estimate → weighted mean/covariance of surviving particles
+Integration (launch context)
+-----------------------------
+  nav2_map_server + lifecycle_manager → /map  (autostart, TRANSIENT_LOCAL)
+  puzzlebotOdometry                   → /odom → MCL motion model
+  puzzlebotMCL                        → /mcl/pose + map→odom TF
+  puzzlebotController                 → consumes /mcl/pose
+  TF tree: map ──(MCL)──> odom ──(odom node)──> base_link
 
-Integration with existing nodes
---------------------------------
-  puzzlebotOdometry  → publishes /odom  (used as motion model)
-  puzzlebotMCL       → subscribes /odom + /scan, publishes /mcl/pose
-                       and broadcasts map→odom TF
-  slam_node          → can be disabled or kept as a map provider
+TF note
+-------
+  The map→odom transform is computed from a snapshot of the odom pose taken
+  at the same iteration that produced the MCL pose estimate.  The 20 Hz timer
+  re-broadcasts the *last computed* transform — it does NOT read live odom
+  state, so there is no race between the timer and _cb_odom.
 
-  TF tree:   map ──(MCL)──> odom ──(odometry node)──> base_link
-
-Parameters (override via --ros-args -p name:=value)
-----------------------------------------------------
-  num_particles      : 300      — trade-off quality vs CPU
-  resample_interval  : 1        — resample every N scans
-  odom_alpha1..4     : noise model coefficients (see below)
-  laser_sigma_hit    : 0.2      — std-dev of Gaussian hit model [m]
-  laser_z_hit        : 0.90     — weight of hit model
-  laser_z_rand       : 0.05     — weight of random model
-  laser_z_max        : 0.05     — weight of max-range model
-  laser_max_range    : 8.0      — discard beams beyond this [m]
-  beam_skip          : 6        — use every Nth beam (speed vs accuracy)
-  min_trans          : 0.05     — motion threshold to trigger update [m]
-  min_rot            : 0.05     — motion threshold to trigger update [rad]
-  initial_x/y/yaw    : 0.0      — initial pose mean
-  initial_cov_x/y/yaw: 0.5/0.5/0.2 — initial pose spread (σ)
-  map_frame          : 'map'
-  odom_frame         : 'odom'
-  base_frame         : 'base_link'
-
-Odometry noise model (probabilistic robotics, Table 5.3)
----------------------------------------------------------
-  alpha1 — rotation noise from rotation
-  alpha2 — rotation noise from translation
-  alpha3 — translation noise from translation
-  alpha4 — translation noise from rotation
-  Defaults tuned for the Puzzlebot differential drive.
-
-Sensor model
-------------
-  Per-beam likelihood  p = z_hit * N(r; d, sigma_hit)
-                         + z_rand / laser_max_range
-                         + z_max  * [r >= max_range]
-  where d is the expected range from a ray-cast into the occupancy map.
-
-  NOTE: ray-casting requires a nav_msgs/OccupancyGrid on /map.
-  If no map is available the node falls back to a simple inverse-distance
-  model that still works reasonably well for localisation in known spaces.
+Parameters (--ros-args -p name:=value)
+--------------------------------------
+  num_particles        300      trade quality vs CPU
+  resample_interval    1        resample every N scans
+  alpha1..4            0.05     odometry noise (Thrun Table 5.3)
+  z_hit                0.80     Gaussian hit weight
+  z_rand               0.15     uniform random weight
+  z_max                0.05     max-range weight
+  sigma_hit            0.2      std dev of beam hit [m]
+  lidar_max_range      8.0      discard beams beyond this [m]
+  beam_skip            6        use every Nth beam
+  lidar_yaw_offset     0.0      static LiDAR mount correction [rad]
+  min_trans            0.05     motion threshold [m]
+  min_rot              0.05     motion threshold [rad]
+  initial_x/y/yaw      0.0      initial pose mean
+  initial_cov_x/y/yaw  0.5/0.5/0.2  initial spread (σ)
+  map_frame            'map'
+  odom_frame           'odom'
+  base_frame           'base_link'
 """
 
 import math
@@ -74,7 +62,9 @@ import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.qos import (
+    QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+)
 
 from nav_msgs.msg      import Odometry, OccupancyGrid
 from sensor_msgs.msg   import LaserScan
@@ -105,89 +95,54 @@ def yaw_to_quaternion(yaw: float) -> Quaternion:
     return q
 
 
-def euler_to_quaternion(roll, pitch, yaw) -> Quaternion:
-    cy, sy = math.cos(yaw * 0.5),   math.sin(yaw * 0.5)
-    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
-    cr, sr = math.cos(roll * 0.5),  math.sin(roll * 0.5)
-    q = Quaternion()
-    q.w = cr * cp * cy + sr * sp * sy
-    q.x = sr * cp * cy - cr * sp * sy
-    q.y = cr * sp * cy + sr * cp * sy
-    q.z = cr * cp * sy - sr * sp * cy
-    return q
-
-
-# ── occupancy grid ray-caster ──────────────────────────────────────────────────
+# ── occupancy map (kept from puzzlebotMCL for ray-cast fallback) ──────────────
 
 class OccupancyMap:
     """
-    Thin wrapper around nav_msgs/OccupancyGrid that provides:
-      - is_occupied(wx, wy)         → bool
-      - ray_cast(ox,oy,angle,max_r) → float  (expected range)
+    Wraps nav_msgs/OccupancyGrid.
+    Exposes the 2-D grid array directly for the likelihood-field update
+    and provides ray_cast() as a sensor-model fallback when needed.
     """
 
     def __init__(self):
-        self._grid      = None   # np.ndarray int8 row-major
-        self._width     = 0
-        self._height    = 0
-        self._res       = 0.05
-        self._origin_x  = 0.0
-        self._origin_y  = 0.0
-        self._lock      = threading.Lock()
+        self.grid      = None          # np.ndarray int8, shape (H, W)
+        self.width     = 0
+        self.height    = 0
+        self.res       = 0.05
+        self.origin_x  = 0.0
+        self.origin_y  = 0.0
+        self._lock     = threading.Lock()
 
     def update(self, msg: OccupancyGrid):
         with self._lock:
-            self._width    = msg.info.width
-            self._height   = msg.info.height
-            self._res      = msg.info.resolution
-            self._origin_x = msg.info.origin.position.x
-            self._origin_y = msg.info.origin.position.y
-            self._grid     = np.array(msg.data, dtype=np.int8).reshape(
-                self._height, self._width)
+            self.width    = msg.info.width
+            self.height   = msg.info.height
+            self.res      = msg.info.resolution
+            self.origin_x = msg.info.origin.position.x
+            self.origin_y = msg.info.origin.position.y
+            self.grid     = np.array(msg.data, dtype=np.int8).reshape(
+                self.height, self.width)
 
     def ready(self) -> bool:
-        return self._grid is not None
-
-    def _world_to_cell(self, wx, wy):
-        col = int((wx - self._origin_x) / self._res)
-        row = int((wy - self._origin_y) / self._res)
-        return col, row
-
-    def _in_bounds(self, col, row) -> bool:
-        return 0 <= col < self._width and 0 <= row < self._height
-
-    def is_occupied(self, wx: float, wy: float) -> bool:
-        with self._lock:
-            if self._grid is None:
-                return False
-            col, row = self._world_to_cell(wx, wy)
-            if not self._in_bounds(col, row):
-                return True   # treat out-of-bounds as occupied (wall)
-            return self._grid[row, col] > 50
+        return self.grid is not None
 
     def ray_cast(self, ox: float, oy: float,
                  angle: float, max_range: float) -> float:
-        """
-        Step along the ray until hitting an occupied cell or max_range.
-        Returns the estimated range to the first obstacle.
-        """
+        """Step along the ray until hitting an occupied cell or max_range."""
         with self._lock:
-            if self._grid is None:
+            if self.grid is None:
                 return max_range
-
-            step   = self._res * 0.7      # slightly smaller than cell size
+            step = self.res * 0.7
             ca, sa = math.cos(angle), math.sin(angle)
-            r      = 0.0
-
+            r = 0.0
             while r < max_range:
-                r   += step
-                col  = int((ox + r * ca - self._origin_x) / self._res)
-                row  = int((oy + r * sa - self._origin_y) / self._res)
-                if not self._in_bounds(col, row):
+                r  += step
+                col = int((ox + r * ca - self.origin_x) / self.res)
+                row = int((oy + r * sa - self.origin_y) / self.res)
+                if not (0 <= col < self.width and 0 <= row < self.height):
                     return r
-                if self._grid[row, col] > 50:
+                if self.grid[row, col] > 50:
                     return r
-
         return max_range
 
 
@@ -198,26 +153,26 @@ class PuzzlebotMCL(Node):
     def __init__(self):
         super().__init__('puzzlebot_mcl')
 
-        # ── declare parameters ────────────────────────────────────────────
+        # ── parameters ────────────────────────────────────────────────────
         self.declare_parameter('num_particles',       300)
         self.declare_parameter('resample_interval',   1)
 
-        # Odometry noise (probabilistic robotics model)
-        self.declare_parameter('odom_alpha1', 0.1)   # rot  noise from rot
-        self.declare_parameter('odom_alpha2', 0.1)   # rot  noise from trans
-        self.declare_parameter('odom_alpha3', 0.1)   # trans noise from trans
-        self.declare_parameter('odom_alpha4', 0.05)  # trans noise from rot
+        # Odometry noise — Thrun, Probabilistic Robotics Table 5.3
+        self.declare_parameter('alpha1', 0.05)   # rot  noise from rot
+        self.declare_parameter('alpha2', 0.05)   # rot  noise from trans
+        self.declare_parameter('alpha3', 0.05)   # trans noise from trans
+        self.declare_parameter('alpha4', 0.05)   # trans noise from rot
 
         # Sensor model
-        self.declare_parameter('laser_sigma_hit',  0.2)
-        self.declare_parameter('laser_z_hit',      0.90)
-        self.declare_parameter('laser_z_rand',     0.05)
-        self.declare_parameter('laser_z_max',      0.05)
-        self.declare_parameter('laser_max_range',  8.0)
-        self.declare_parameter('beam_skip',        6)
+        self.declare_parameter('z_hit',           0.80)
+        self.declare_parameter('z_rand',          0.15)
+        self.declare_parameter('z_max',           0.05)
+        self.declare_parameter('sigma_hit',       0.2)
+        self.declare_parameter('lidar_max_range', 8.0)
+        self.declare_parameter('beam_skip',       6)
         self.declare_parameter('lidar_yaw_offset', 0.0)
 
-        # Motion thresholds before updating
+        # Motion thresholds
         self.declare_parameter('min_trans', 0.05)
         self.declare_parameter('min_rot',   0.05)
 
@@ -235,37 +190,38 @@ class PuzzlebotMCL(Node):
         self.declare_parameter('base_frame', 'base_link')
 
         # ── load params ───────────────────────────────────────────────────
-        N   = self.get_parameter('num_particles').value
-        a1  = self.get_parameter('odom_alpha1').value
-        a2  = self.get_parameter('odom_alpha2').value
-        a3  = self.get_parameter('odom_alpha3').value
-        a4  = self.get_parameter('odom_alpha4').value
-
-        self._sigma_hit  = self.get_parameter('laser_sigma_hit').value
-        self._z_hit      = self.get_parameter('laser_z_hit').value
-        self._z_rand     = self.get_parameter('laser_z_rand').value
-        self._z_max      = self.get_parameter('laser_z_max').value
-        self._max_range  = self.get_parameter('laser_max_range').value
-        self._beam_skip        = self.get_parameter('beam_skip').value
-        self._lidar_yaw_offset = self.get_parameter('lidar_yaw_offset').value
-        self._min_trans  = self.get_parameter('min_trans').value
-        self._min_rot    = self.get_parameter('min_rot').value
+        N  = self.get_parameter('num_particles').value
         self._resample_interval = self.get_parameter('resample_interval').value
 
-        self._map_frame  = self.get_parameter('map_frame').value
-        self._odom_frame = self.get_parameter('odom_frame').value
-        self._base_frame = self.get_parameter('base_frame').value
+        self._alpha = np.array([
+            self.get_parameter('alpha1').value,
+            self.get_parameter('alpha2').value,
+            self.get_parameter('alpha3').value,
+            self.get_parameter('alpha4').value,
+        ])
 
-        self._alpha = np.array([a1, a2, a3, a4])
+        self._z_hit        = self.get_parameter('z_hit').value
+        self._z_rand       = self.get_parameter('z_rand').value
+        self._z_max        = self.get_parameter('z_max').value
+        self._sigma_hit    = self.get_parameter('sigma_hit').value
+        self._max_range    = self.get_parameter('lidar_max_range').value
+        self._beam_skip    = self.get_parameter('beam_skip').value
+        self._yaw_offset   = self.get_parameter('lidar_yaw_offset').value
+        self._min_trans    = self.get_parameter('min_trans').value
+        self._min_rot      = self.get_parameter('min_rot').value
 
-        # ── particle set: (N,3) array of [x, y, yaw] ─────────────────────
-        ix  = self.get_parameter('initial_x').value
-        iy  = self.get_parameter('initial_y').value
-        iya = self.get_parameter('initial_yaw').value
-        sx  = self.get_parameter('initial_cov_x').value
-        sy  = self.get_parameter('initial_cov_y').value
-        sya = self.get_parameter('initial_cov_yaw').value
+        self._map_frame    = self.get_parameter('map_frame').value
+        self._odom_frame   = self.get_parameter('odom_frame').value
+        self._base_frame   = self.get_parameter('base_frame').value
 
+        ix   = self.get_parameter('initial_x').value
+        iy   = self.get_parameter('initial_y').value
+        iya  = self.get_parameter('initial_yaw').value
+        sx   = self.get_parameter('initial_cov_x').value
+        sy   = self.get_parameter('initial_cov_y').value
+        sya  = self.get_parameter('initial_cov_yaw').value
+
+        # ── particle array: (N, 3) — columns: x, y, yaw ──────────────────
         rng = np.random.default_rng()
         self._particles = np.column_stack([
             rng.normal(ix,  sx,  N),
@@ -281,34 +237,48 @@ class PuzzlebotMCL(Node):
         self._pose_y   = iy
         self._pose_yaw = iya
 
-        # ── odometry tracking ─────────────────────────────────────────────
-        # We store the *previous* odometry reading in the odom frame.
-        # The delta between consecutive readings drives the motion model.
-        self._prev_odom_x   = None
-        self._prev_odom_y   = None
-        self._prev_odom_yaw = None
+        # ── cached map→odom transform (updated atomically with pose) ──────
+        # Snapshot of the odom pose that was current when _pose_* was last
+        # computed.  _broadcast_tf() reads only these — never live _prev_*.
+        self._tf_lock  = threading.Lock()
+        self._tf_tx    = 0.0   # translation x of map→odom
+        self._tf_ty    = 0.0   # translation y of map→odom
+        self._tf_yaw   = 0.0   # rotation yaw  of map→odom
 
-        # Accumulated motion since last update
+        # ── odometry state (EKF /odom feed) ──────────────────────────────
+        # prev_* : last odometry reading used to compute the delta
+        # These are in the odom frame — used only to derive (dx, dy, dyaw).
+        self._prev_x    = None
+        self._prev_y    = None
+        self._prev_yaw  = None
+
+        # Accumulated motion since the last MCL update cycle
         self._accum_trans = 0.0
         self._accum_rot   = 0.0
+
+        # Delta snapshot consumed by _predict(); set in _cb_odom and
+        # reset in _mcl_update().
+        self._delta_dx   = 0.0
+        self._delta_dy   = 0.0
+        self._delta_dyaw = 0.0
 
         # ── map ───────────────────────────────────────────────────────────
         self._occ_map = OccupancyMap()
 
-        # ── scan counter (for resampling interval) ────────────────────────
+        # ── scan counter ──────────────────────────────────────────────────
         self._scan_count = 0
 
         # ── locks ─────────────────────────────────────────────────────────
         self._odom_lock = threading.Lock()
         self._scan_lock = threading.Lock()
 
-        # ── current scan (set in cb, consumed in update) ──────────────────
+        # ── latest scan ───────────────────────────────────────────────────
         self._latest_scan: LaserScan | None = None
 
-        # ── TF broadcaster (map → odom) ───────────────────────────────────
+        # ── TF broadcaster ────────────────────────────────────────────────
         self._tf_broadcaster = TransformBroadcaster(self)
 
-        # ── QoS profiles ──────────────────────────────────────────────────
+        # ── QoS ───────────────────────────────────────────────────────────
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -322,78 +292,79 @@ class PuzzlebotMCL(Node):
         )
 
         # ── subscribers ───────────────────────────────────────────────────
-        self.create_subscription(Odometry,      '/odom',  self._cb_odom,  10)
-        self.create_subscription(LaserScan,     '/scan',  self._cb_scan,  sensor_qos)
-        self.create_subscription(OccupancyGrid, '/map',   self._cb_map,   latched_qos)
-
-        # Allow external pose initialization (e.g. from RViz "2D Pose Estimate")
+        self.create_subscription(Odometry,      '/odom',        self._cb_odom,        10)
+        self.create_subscription(LaserScan,     '/scan',        self._cb_scan,        sensor_qos)
+        self.create_subscription(OccupancyGrid, '/map',         self._cb_map,         latched_qos)
         self.create_subscription(
-            PoseWithCovarianceStamped,
-            '/initialpose',
-            self._cb_initialpose,
-            10,
-        )
+            PoseWithCovarianceStamped, '/initialpose', self._cb_initialpose, 10)
 
         # ── publishers ────────────────────────────────────────────────────
         self._pub_pose = self.create_publisher(
             PoseWithCovarianceStamped, '/mcl/pose', 10)
 
-        # ── timers ────────────────────────────────────────────────────────
-        # TF at 20 Hz so RViz stays smooth even when no scan arrives
+        # ── TF timer: broadcast at 20 Hz so RViz stays smooth ─────────────
         self.create_timer(0.05, self._broadcast_tf)
 
         self.get_logger().info(
-            f'MCL started — {N} particles, '
-            f'beam_skip={self._beam_skip}, '
-            f'min_trans={self._min_trans} m, min_rot={self._min_rot} rad'
+            f'MCL ready — {N} particles | '
+            f'beam_skip={self._beam_skip} | '
+            f'min_trans={self._min_trans} m | min_rot={self._min_rot} rad'
         )
 
     # ── callbacks ──────────────────────────────────────────────────────────────
 
     def _cb_map(self, msg: OccupancyGrid):
         self._occ_map.update(msg)
-        self.get_logger().info('Occupancy map received — sensor model active.')
+        self.get_logger().info(
+            f'Map received: {msg.info.width}×{msg.info.height} cells, '
+            f'res={msg.info.resolution} m/cell'
+        )
 
     def _cb_odom(self, msg: Odometry):
         """
-        Store the latest odometry reading.
-        The actual particle propagation happens when a scan arrives,
-        so we only accumulate the delta here.
+        Accumulate the odometry delta (from EKF /odom) between MCL cycles.
+        Stores the raw (dx, dy, dyaw) increment in the odom frame so that
+        _predict() can apply the full Thrun rot1/trans/rot2 decomposition.
         """
         x   = msg.pose.pose.position.x
         y   = msg.pose.pose.position.y
         yaw = yaw_from_quaternion(msg.pose.pose.orientation)
 
         with self._odom_lock:
-            if self._prev_odom_x is None:
-                self._prev_odom_x   = x
-                self._prev_odom_y   = y
-                self._prev_odom_yaw = yaw
+            if self._prev_x is None:
+                self._prev_x   = x
+                self._prev_y   = y
+                self._prev_yaw = yaw
                 return
 
-            dx   = x   - self._prev_odom_x
-            dy   = y   - self._prev_odom_y
-            dyaw = normalize_angle(yaw - self._prev_odom_yaw)
+            dx   = x   - self._prev_x
+            dy   = y   - self._prev_y
+            dyaw = normalize_angle(yaw - self._prev_yaw)
 
-            self._accum_trans += math.hypot(dx, dy)
-            self._accum_rot   += abs(dyaw)
+            # Accumulate for threshold check
+            self._accum_trans  += math.hypot(dx, dy)
+            self._accum_rot    += abs(dyaw)
 
-            self._prev_odom_x   = x
-            self._prev_odom_y   = y
-            self._prev_odom_yaw = yaw
+            # Accumulate Cartesian delta for predict step
+            self._delta_dx   += dx
+            self._delta_dy   += dy
+            self._delta_dyaw  = normalize_angle(self._delta_dyaw + dyaw)
+
+            self._prev_x   = x
+            self._prev_y   = y
+            self._prev_yaw = yaw
 
     def _cb_scan(self, msg: LaserScan):
-        """Buffer the latest scan; trigger the MCL update step."""
         with self._scan_lock:
             self._latest_scan = msg
         self._mcl_update()
 
     def _cb_initialpose(self, msg: PoseWithCovarianceStamped):
-        """Re-initialize the particle cloud around a user-supplied pose."""
+        """Re-scatter particles around a user-supplied pose (RViz 2D Pose Estimate)."""
         x   = msg.pose.pose.position.x
         y   = msg.pose.pose.position.y
         yaw = yaw_from_quaternion(msg.pose.pose.orientation)
-        cov = msg.pose.covariance   # 6×6 row-major
+        cov = msg.pose.covariance
 
         sx  = math.sqrt(max(cov[0],  1e-6))
         sy  = math.sqrt(max(cov[7],  1e-6))
@@ -405,273 +376,318 @@ class PuzzlebotMCL(Node):
         self._weights[:]      = 1.0 / self._N
 
         self.get_logger().info(
-            f'Particle cloud re-initialized at ({x:.2f},{y:.2f},{yaw:.2f})'
+            f'Particles re-initialized at ({x:.2f}, {y:.2f}, {math.degrees(yaw):.1f}°)'
         )
 
     # ── MCL core ───────────────────────────────────────────────────────────────
 
     def _mcl_update(self):
-        """
-        Full MCL iteration:
-          1. Check motion thresholds
-          2. Predict (sample_motion_model_odometry)
-          3. Update  (beam_range_finder_model)
-          4. Estimate pose
-          5. Resample (systematic)
-          6. Publish & broadcast TF
-        """
-        with self._odom_lock:
-            accum_trans = self._accum_trans
-            accum_rot   = self._accum_rot
+        """One full SIR iteration: predict → update → estimate → resample."""
 
-        # Skip if the robot hasn't moved enough (avoids filter lock-up)
-        if (accum_trans < self._min_trans and
-                accum_rot < self._min_rot and
-                self._scan_count > 0):
-            return
-
-        # Snapshot odometry delta for this cycle
+        # ── 0. Motion threshold guard ─────────────────────────────────────
         with self._odom_lock:
-            dx   = self._prev_odom_x   - (self._prev_odom_x   - 0.0)  # placeholder
-            # We use the raw accumulated delta as a scalar proxy; for
-            # a proper motion model we need the actual delta (x,y,yaw)
-            # which we reconstruct from prev values captured here.
-            prev_x   = self._prev_odom_x
-            prev_y   = self._prev_odom_y
-            prev_yaw = self._prev_odom_yaw
+            if (self._accum_trans < self._min_trans and
+                    self._accum_rot   < self._min_rot and
+                    self._scan_count  > 0):
+                return
+
+            # Snapshot and reset accumulators
+            dx           = self._delta_dx
+            dy           = self._delta_dy
+            dyaw         = self._delta_dyaw
+            prev_yaw_snap = self._prev_yaw if self._prev_yaw is not None else 0.0
+            # Full odom pose snapshot for TF computation
+            odom_snap = (
+                self._prev_x   if self._prev_x   is not None else 0.0,
+                self._prev_y   if self._prev_y   is not None else 0.0,
+                self._prev_yaw if self._prev_yaw is not None else 0.0,
+            )
+
             self._accum_trans = 0.0
             self._accum_rot   = 0.0
+            self._delta_dx    = 0.0
+            self._delta_dy    = 0.0
+            self._delta_dyaw  = 0.0
 
         with self._scan_lock:
             scan = self._latest_scan
-
         if scan is None:
             return
 
-        # ── 1. Predict ────────────────────────────────────────────────────
-        self._particles = self._motion_model(
-            self._particles, accum_trans, prev_yaw
-        )
+        # ── 1. Predict (sample motion model) ─────────────────────────────
+        self._predict(dx, dy, dyaw, prev_yaw_snap)
 
-        # ── 2. Update weights ─────────────────────────────────────────────
+        # ── 2. Update weights (likelihood-field sensor model) ────────────
         if self._occ_map.ready():
-            log_weights = self._sensor_model(self._particles, scan)
-            # Normalize in log-space for numerical stability
-            log_weights -= log_weights.max()
-            w = np.exp(log_weights)
+            log_w = self._update(scan)
+            log_w -= log_w.max()               # numerical stability
+            w      = np.exp(log_w)
         else:
-            # No map: keep uniform weights (pure odometry MCL)
+            # No map yet → keep uniform (pure odometry)
             w = self._weights.copy()
 
         total = w.sum()
         if total < 1e-300:
-            # Weight collapse → reinitialize from current best estimate
+            self.get_logger().warn('Weight collapse — reinitializing weights.')
             w[:] = 1.0
         self._weights = w / w.sum()
 
-        # ── 3. Estimate pose (weighted mean) ──────────────────────────────
-        self._pose_x   = float(np.sum(self._weights * self._particles[:, 0]))
-        self._pose_y   = float(np.sum(self._weights * self._particles[:, 1]))
+        # ── 3. Estimate pose (weighted circular mean) ─────────────────────
+        self._pose_x   = float(np.dot(self._weights, self._particles[:, 0]))
+        self._pose_y   = float(np.dot(self._weights, self._particles[:, 1]))
+        sin_s = float(np.dot(self._weights, np.sin(self._particles[:, 2])))
+        cos_s = float(np.dot(self._weights, np.cos(self._particles[:, 2])))
+        self._pose_yaw = math.atan2(sin_s, cos_s)
 
-        # Circular mean for yaw
-        sin_mean = float(np.sum(self._weights * np.sin(self._particles[:, 2])))
-        cos_mean = float(np.sum(self._weights * np.cos(self._particles[:, 2])))
-        self._pose_yaw = math.atan2(sin_mean, cos_mean)
-
-        # ── 4. Resample (systematic) ──────────────────────────────────────
+        # ── 4. Resample (systematic / low-variance) ───────────────────────
         self._scan_count += 1
         if self._scan_count % self._resample_interval == 0:
-            self._particles, self._weights = self._systematic_resample(
-                self._particles, self._weights
-            )
+            self._resample()
 
-        # ── 5. Publish & TF ───────────────────────────────────────────────
-        self._publish_pose(scan.header.stamp)
+        # ── 5. Publish ────────────────────────────────────────────────────
+        self._publish_pose(scan.header.stamp, odom_snap)
 
-    # ── motion model ──────────────────────────────────────────────────────────
+    # ── Step 1: Predict ───────────────────────────────────────────────────────
 
-    def _motion_model(self, particles: np.ndarray,
-                      delta_trans: float, prev_yaw: float) -> np.ndarray:
+    def _predict(self, dx: float, dy: float, dyaw: float, prev_yaw: float):
         """
-        Sample-based odometry motion model.
-        (Thrun, Burgard, Fox — Probabilistic Robotics, Algorithm 5.3)
+        Velocity motion model — Thrun et al., Probabilistic Robotics Alg. 5.3.
 
-        We approximate the full (delta_rot1, delta_trans, delta_rot2)
-        decomposition using the accumulated translation and the heading
-        direction from the odometry.
-
-        Noise scales with motion magnitude via alpha coefficients.
+        Decomposes the odometry increment (dx, dy, dyaw) into:
+          rot1  — initial rotation to face the displacement direction
+          trans — translation magnitude
+          rot2  — residual rotation (dyaw - rot1)
+        Then samples noisy versions for every particle simultaneously.
         """
         a1, a2, a3, a4 = self._alpha
-        N = len(particles)
+        N = self._N
 
-        if delta_trans < 1e-6:
-            # Pure rotation or no movement — add only yaw noise
-            noise_yaw = self._rng.normal(0, math.sqrt(a1 * 1e-4 + a2 * 1e-4), N)
-            new_p = particles.copy()
-            new_p[:, 2] = np.vectorize(normalize_angle)(
-                particles[:, 2] + noise_yaw)
-            return new_p
+        trans = math.hypot(dx, dy)
+        rot1  = (math.atan2(dy, dx) - prev_yaw) if trans > 1e-4 else 0.0
+        rot2  = normalize_angle(dyaw - rot1)
 
-        # Rotation component: how much yaw changed per unit displacement
-        # Use prev_yaw as the approximate heading
-        sigma_trans = math.sqrt(a3 * delta_trans ** 2 + a4 * delta_trans ** 2)
-        sigma_rot   = math.sqrt(a1 * delta_trans ** 2 + a2 * delta_trans ** 2)
+        # Vectorised noise sampling
+        rot1_hat  = rot1  - self._rng.normal(
+            0.0, math.sqrt(a1 * rot1**2  + a2 * trans**2), N)
+        trans_hat = trans - self._rng.normal(
+            0.0, math.sqrt(a3 * trans**2 + a4 * (rot1**2 + rot2**2)), N)
+        rot2_hat  = rot2  - self._rng.normal(
+            0.0, math.sqrt(a1 * rot2**2  + a2 * trans**2), N)
 
-        noisy_trans = delta_trans + self._rng.normal(0, sigma_trans, N)
-        noisy_rot   = self._rng.normal(0, sigma_rot, N)
+        heading = self._particles[:, 2]
+        self._particles[:, 0] += trans_hat * np.cos(heading + rot1_hat)
+        self._particles[:, 1] += trans_hat * np.sin(heading + rot1_hat)
+        self._particles[:, 2]  = np.arctan2(
+            np.sin(heading + rot1_hat + rot2_hat),
+            np.cos(heading + rot1_hat + rot2_hat),
+        )
 
-        new_p = particles.copy()
-        heading = particles[:, 2]    # each particle's current yaw
+    # ── Step 2: Update ────────────────────────────────────────────────────────
 
-        new_p[:, 0] += noisy_trans * np.cos(heading)
-        new_p[:, 1] += noisy_trans * np.sin(heading)
-        new_p[:, 2] = np.vectorize(normalize_angle)(heading + noisy_rot)
-
-        return new_p
-
-    # ── sensor model ──────────────────────────────────────────────────────────
-
-    def _sensor_model(self, particles: np.ndarray,
-                      scan: LaserScan) -> np.ndarray:
+    def _update(self, scan: LaserScan) -> np.ndarray:
         """
-        Beam-range-finder model (log-likelihood, vectorised over particles).
-        Returns an (N,) array of log-weights.
-        """
-        ranges     = np.asarray(scan.ranges, dtype=np.float32)
-        angles     = (scan.angle_min
-                      + np.arange(len(ranges)) * scan.angle_increment
-                      + self._lidar_yaw_offset)
+        Likelihood-field sensor model — vectorised over all particles.
 
-        # Sub-sample beams for speed
+        For each particle, projects beam endpoints into map coordinates and
+        looks up the nearest-obstacle distance.  Returns an (N,) array of
+        log-weights.
+        """
+        omap = self._occ_map
+        with omap._lock:
+            if omap.grid is None:
+                return np.zeros(self._N)
+            grid      = omap.grid
+            origin_x  = omap.origin_x
+            origin_y  = omap.origin_y
+            res       = omap.res
+            width     = omap.width
+            height    = omap.height
+
+        ranges = np.asarray(scan.ranges, dtype=np.float32)
+        angles = (scan.angle_min
+                  + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
+                  + self._yaw_offset)
+
+        # Sub-sample
         idx    = np.arange(0, len(ranges), self._beam_skip)
         ranges = ranges[idx]
         angles = angles[idx]
 
-        # Valid beams only
-        valid  = np.isfinite(ranges) & (ranges >= scan.range_min) & \
-                 (ranges < self._max_range)
+        # Valid beams
+        valid  = np.isfinite(ranges) & (ranges > scan.range_min) & (ranges < self._max_range)
         ranges = ranges[valid]
         angles = angles[valid]
 
         if len(ranges) == 0:
-            return np.zeros(len(particles))
+            return np.zeros(self._N)
 
-        N    = len(particles)
-        M    = len(ranges)
-        logs = np.zeros(N)
+        sigma     = self._sigma_hit
+        z_hit     = self._z_hit
+        z_rand    = self._z_rand
+        z_max     = self._z_max
+        max_range = self._max_range
+        norm_k    = 1.0 / (sigma * math.sqrt(2.0 * math.pi))
+        log_weights = np.zeros(self._N)
 
-        z_hit   = self._z_hit
-        z_rand  = self._z_rand
-        z_max   = self._z_max
-        sigma   = self._sigma_hit
-        max_r   = self._max_range
-        norm_k  = 1.0 / (math.sqrt(2 * math.pi) * sigma)
+        for i, (px, py, pyaw) in enumerate(self._particles):
+            # Beam endpoint coordinates in world frame
+            bx = px + ranges * np.cos(pyaw + angles)
+            by = py + ranges * np.sin(pyaw + angles)
 
-        for i in range(N):
-            px, py, pyaw = particles[i]
-            p_log = 0.0
+            # Map cell indices
+            cx = ((bx - origin_x) / res).astype(int)
+            cy = ((by - origin_y) / res).astype(int)
 
-            for j in range(M):
-                beam_angle = pyaw + float(angles[j])
-                z_obs      = float(ranges[j])
+            in_bounds = (
+                (cx >= 0) & (cx < width) &
+                (cy >= 0) & (cy < height)
+            )
+            cx = np.clip(cx, 0, width  - 1)
+            cy = np.clip(cy, 0, height - 1)
 
-                z_exp = self._occ_map.ray_cast(px, py, beam_angle, max_r)
+            cell_vals = grid[cy, cx]
 
-                # Gaussian hit term
-                diff       = z_obs - z_exp
-                p_hit      = norm_k * math.exp(-0.5 * (diff / sigma) ** 2)
+            # Nearest-obstacle distance (cell-based approx):
+            #   cell ≥ 65 → occupied (d = 0)
+            #   cell  < 0 → unknown  (d = max_range, low weight)
+            #   otherwise → free     (brute-force small search)
+            dist = np.where(
+                cell_vals >= 65, 0.0,
+                np.where(cell_vals < 0, max_range,
+                         self._dist_to_obstacle(cx, cy, cell_vals,
+                                                 grid, width, height, res))
+            )
 
-                # Random term
-                p_rnd      = z_rand / max_r
+            p_hit  = z_hit  * norm_k * np.exp(-0.5 * (dist / sigma) ** 2)
+            p_rand = z_rand / max_range
+            p_mxr  = np.where(ranges >= max_range - 0.05, z_max, 0.0)
+            p      = np.where(in_bounds, p_hit + p_rand + p_mxr, p_rand)
+            p      = np.clip(p, 1e-300, None)
 
-                # Max-range term
-                p_max_term = z_max if z_obs >= (max_r - 0.05) else 0.0
+            log_weights[i] = np.sum(np.log(p))
 
-                p_total    = z_hit * p_hit + p_rnd + p_max_term
-                p_log     += math.log(max(p_total, 1e-300))
-
-            logs[i] = p_log
-
-        return logs
-
-    # ── systematic resampling ─────────────────────────────────────────────────
+        return log_weights
 
     @staticmethod
-    def _systematic_resample(particles: np.ndarray,
-                              weights: np.ndarray):
+    def _dist_to_obstacle(cx, cy, cell_vals,
+                           grid, width, height, res,
+                           search_r: int = 5) -> np.ndarray:
         """
-        Low-variance (systematic) resampling.
-        O(N) — preserves diversity better than multinomial resampling.
+        Brute-force nearest-occupied-cell distance for free-space endpoints.
+        Only called for cells that are neither occupied nor unknown.
         """
-        N     = len(weights)
-        cum   = np.cumsum(weights)
-        step  = 1.0 / N
-        start = np.random.uniform(0, step)
-        idx   = np.searchsorted(cum, np.arange(N) * step + start)
-        idx   = np.clip(idx, 0, N - 1)
-        return particles[idx].copy(), np.ones(N) / N
+        dist = np.zeros(len(cx), dtype=np.float64)
+        for k in range(len(cx)):
+            if cell_vals[k] >= 65:
+                continue
+            best = float('inf')
+            for dr in range(-search_r, search_r + 1):
+                for dc in range(-search_r, search_r + 1):
+                    r, c = cy[k] + dr, cx[k] + dc
+                    if 0 <= r < height and 0 <= c < width:
+                        if grid[r, c] >= 65:
+                            d = math.sqrt(dr * dr + dc * dc) * res
+                            if d < best:
+                                best = d
+            dist[k] = best if best != float('inf') else res * search_r
+        return dist
+
+    # ── Step 3: Resample ──────────────────────────────────────────────────────
+
+    def _resample(self):
+        """
+        Low-variance (systematic) resampling — O(N), avoids degeneracy.
+        Thrun et al., Probabilistic Robotics, Algorithm 4.4.
+        """
+        N   = self._N
+        w   = self._weights
+        cum = np.cumsum(w)
+        r   = self._rng.uniform(0.0, 1.0 / N)
+        idx = np.searchsorted(cum, r + np.arange(N) / N)
+        idx = np.clip(idx, 0, N - 1)
+        self._particles = self._particles[idx].copy()
+        self._weights   = np.ones(N) / N
 
     # ── publish helpers ────────────────────────────────────────────────────────
 
-    def _publish_pose(self, stamp):
-        """Publish the estimated pose with covariance."""
-        # Weighted covariance 3×3
-        dx  = self._particles[:, 0] - self._pose_x
-        dy  = self._particles[:, 1] - self._pose_y
-        dya = np.array([
+    def _publish_pose(self, stamp, odom_snap: tuple):
+        """
+        Publish estimated pose with weighted covariance and cache the
+        map→odom TF computed from the odom snapshot taken this cycle.
+
+        odom_snap = (ox, oy, oyaw)  — odom pose at the time _pose_* was set.
+        """
+        w  = self._weights
+        dx = self._particles[:, 0] - self._pose_x
+        dy = self._particles[:, 1] - self._pose_y
+        da = np.array([
             normalize_angle(a - self._pose_yaw)
             for a in self._particles[:, 2]
         ])
 
-        w = self._weights
-        cxx  = float(np.sum(w * dx  * dx))
-        cyy  = float(np.sum(w * dy  * dy))
-        cyaya = float(np.sum(w * dya * dya))
-        cxy  = float(np.sum(w * dx  * dy))
-        cxya = float(np.sum(w * dx  * dya))
-        cyya = float(np.sum(w * dy  * dya))
+        cxx  = float(np.dot(w, dx * dx))
+        cyy  = float(np.dot(w, dy * dy))
+        caa  = float(np.dot(w, da * da))
+        cxy  = float(np.dot(w, dx * dy))
+        cxa  = float(np.dot(w, dx * da))
+        cya  = float(np.dot(w, dy * da))
 
         msg = PoseWithCovarianceStamped()
         msg.header.stamp    = stamp
         msg.header.frame_id = self._map_frame
-
         msg.pose.pose.position.x  = self._pose_x
         msg.pose.pose.position.y  = self._pose_y
         msg.pose.pose.position.z  = 0.0
         msg.pose.pose.orientation = yaw_to_quaternion(self._pose_yaw)
 
-        # 6×6 covariance (x,y,z,rx,ry,rz) — we only fill x,y,yaw
+        # 6×6 covariance (x, y, z, rx, ry, rz) — fill x, y, yaw slots
         c = [0.0] * 36
-        c[0]  = cxx
-        c[1]  = cxy
-        c[5]  = cxya
-        c[6]  = cxy
-        c[7]  = cyy
-        c[11] = cyya
-        c[30] = cxya
-        c[31] = cyya
-        c[35] = cyaya
+        c[0],  c[1],  c[5]  = cxx, cxy, cxa
+        c[6],  c[7],  c[11] = cxy, cyy, cya
+        c[30], c[31], c[35] = cxa, cya, caa
         msg.pose.covariance = c
 
         self._pub_pose.publish(msg)
 
+        # ── compute and cache map→odom TF ─────────────────────────────────
+        # T_map_odom = T_map_base * inv(T_odom_base)
+        #   diff      = mcl_yaw − odom_yaw
+        #   tx        = mcl_x − R(diff) * odom_xy  (x component)
+        #   ty        = mcl_y − R(diff) * odom_xy  (y component)
+        ox, oy, oyaw = odom_snap
+        diff = normalize_angle(self._pose_yaw - oyaw)
+        cd, sd = math.cos(diff), math.sin(diff)
+        tx = self._pose_x - (ox * cd - oy * sd)
+        ty = self._pose_y - (ox * sd + oy * cd)
+
+        with self._tf_lock:
+            self._tf_tx  = tx
+            self._tf_ty  = ty
+            self._tf_yaw = diff
+
     def _broadcast_tf(self):
         """
-        Broadcast map → odom TF.
+        Broadcast map → odom TF at 20 Hz.
 
-        The map→odom transform is the *correction* applied on top of the
-        raw odometry, so downstream nodes (RViz, controller) obtain the
-        globally-consistent pose through: map ← MCL → odom ← odom_node → base_link
+        Re-sends the transform that was last computed by _publish_pose()
+        using the odom snapshot from that MCL cycle.  Reads only the
+        cached _tf_* values — never the live _prev_* odom state — so
+        there is no race with _cb_odom.
         """
+        with self._tf_lock:
+            tx   = self._tf_tx
+            ty   = self._tf_ty
+            tyaw = self._tf_yaw
+
         t = TransformStamped()
         t.header.stamp    = self.get_clock().now().to_msg()
         t.header.frame_id = self._map_frame
         t.child_frame_id  = self._odom_frame
-        t.transform.translation.x = self._pose_x
-        t.transform.translation.y = self._pose_y
+        t.transform.translation.x = tx
+        t.transform.translation.y = ty
         t.transform.translation.z = 0.0
-        t.transform.rotation      = yaw_to_quaternion(self._pose_yaw)
+        t.transform.rotation      = yaw_to_quaternion(tyaw)
+
         self._tf_broadcaster.sendTransform(t)
 
 
