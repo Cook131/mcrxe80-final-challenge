@@ -21,6 +21,24 @@ TF tree
   The map→odom offset is computed and broadcast by puzzlebotOdometry every
   50 Hz cycle.  It stays at identity until the first ArUco measurement update
   fires, then tracks the full 2-D correction offset.
+
+Robot geometry (Puzzlebot)
+--------------------------
+  Width:    0.22 m  →  half-width  = 0.11 m
+  Length:   0.30 m  →  half-length = 0.15 m
+  Diagonal: sqrt(0.11²+0.15²) ≈ 0.186 m  (bounding-circle radius)
+
+Parameter derivation
+--------------------
+  stop_dist      = diagonal + 5 cm safety margin  = 0.186 + 0.05  ≈ 0.24 m
+  emergency_dist = stop + braking distance at max_v over hold_ms
+                 = 0.24 + 0.22*0.35                              ≈ 0.32 m
+  warn_dist      = emergency + soft-braking zone                  = 0.65 m  (unchanged)
+  hysteresis     = ~25% of (emergency - stop) gap
+                 = 0.25 * (0.32-0.24)                             ≈ 0.03 m
+  inflation_r    = half-width + 10 cm clearance  = 0.11 + 0.10   = 0.21 m
+                   (was 0.35 — overly conservative, caused narrow-passage failures)
+  reflex_v       = reduced to 0.08 m/s (was 0.14) — safer arc speed in tight spaces
 """
 
 import os
@@ -57,11 +75,6 @@ def generate_launch_description():
     )
 
     # ── 2. Odometry (EKF) — wheel encoders + ArUco EKF fusion ─────────────
-    # Broadcasts BOTH:
-    #   TF map  → odom        (ArUco correction offset, updated at ~10 Hz)
-    #   TF odom → base_link   (raw dead-reckoning, updated at 50 Hz)
-    # /odom topic carries the corrected pose with frame_id='map'.
-    # FIX: removed undeclared 'ekf_mode' parameter.
     odometry_node = Node(
         package='iolair',
         executable='odometry',
@@ -111,6 +124,9 @@ def generate_launch_description():
     )
 
     # ── 5. A* Planner — global path planner on occupancy grid ──────────────
+    # inflation_radius: half-width (0.11) + 10cm clearance = 0.21m
+    # Reduced from 0.35 — that value blocked navigable passages narrower than
+    # 70cm, which is overkill for a 22cm-wide robot.
     astar_planner_node = Node(
         package='iolair',
         executable='astar_planner',
@@ -122,7 +138,7 @@ def generate_launch_description():
             'odom_topic':         '/odom',
             'goal_in_topic':      '/astar/goal',
             'goal_out_topic':     '/goal',
-            'inflation_radius':   0.35,
+            'inflation_radius':   0.21,   # was 0.35 — see header derivation
             'waypoint_threshold': 0.10,
             'occupied_threshold': 65,
             'allow_diagonal':     True,
@@ -138,21 +154,30 @@ def generate_launch_description():
     )
 
     # ── 7. Bug IBA — safety reflex layer, intercepts /cmd_raw → /cmd_vel ───
+    #
+    # stop_dist      0.24m  robot diagonal (0.186) + 5cm margin
+    # emergency_dist 0.32m  unchanged — correct for max_v + hold_ms
+    # warn_dist      0.65m  unchanged — good soft-braking zone
+    # hysteresis     0.03m  was 0.08 — reduced to 25% of (emg-stop) gap;
+    #                        0.08 consumed 67% of that gap causing sticky TURN
+    # reflex_v       0.08   was 0.14 — lower arc speed in tight obstacles
+    # reflex_w       0.50   unchanged
     bug_iba_node = Node(
         package='iolair',
         executable='bug_IBA',
         name='bug_reflex',
         output='screen',
         parameters=[{
-            'warn_dist':       0.65,
-            'emergency_dist':  0.32,
-            'stop_dist':       0.20,
-            'reflex_v':        0.14,
-            'reflex_w':        0.5,
-            'reflex_hold_ms':  350,
-            'front_half_deg':  30.0,
-            'side_half_deg':   35.0,
-            'hysteresis':      0.08,
+            'warn_dist':          0.65,   # unchanged
+            'emergency_dist':     0.32,   # unchanged
+            'stop_dist':          0.24,   # was 0.20 — below robot diagonal!
+            'reflex_v':           0.08,   # was 0.14 — safer in tight spaces
+            'reflex_w':           0.50,   # unchanged
+            'reflex_hold_ms':     350,    # unchanged
+            'front_half_deg':     30.0,   # unchanged
+            'side_half_deg':      35.0,   # unchanged
+            'hysteresis':         0.03,   # was 0.08 — was too sticky
+            'replan_cooldown_s':  2.0,    # new param (v3.0)
         }]
     )
 
@@ -184,11 +209,57 @@ def generate_launch_description():
             {'autostart': True},
         ]
     )
+
     rviz_goal_bridge_node = Node(
         package='iolair',
         executable='rviz_goal_bridge',
         name='rviz_goal_bridge',
         output='screen',
+    )
+
+    mcl_node = Node(
+        package='iolair',
+        executable='mcl',
+        name='puzzlebot_mcl',
+        output='screen',
+        parameters=[{
+            'num_particles':    300,
+            'beam_skip':        6,
+            'lidar_yaw_offset': math.pi,
+            'initial_yaw':      math.pi,
+            'map_frame':       'map',
+            'odom_frame':      'odom',
+            'base_frame':      'base_link',
+        }]
+    )
+
+    slam_node = Node(
+        package='iolair',
+        executable='slam',
+        name='slam_node',
+        output='screen',
+        parameters=[{
+            'scan_topic':       '/scan',
+            'lidar_yaw_offset':  math.pi,
+            'resolution':        0.05,
+            'map_init_size':     400,
+            'map_origin_x':     -10.0,
+            'map_origin_y':     -10.0,
+            'lidar_max_range':   8.0,
+            'beam_skip':         1,
+            'target_beams':      360,
+            'log_odds_occ':      0.85,
+            'log_odds_free':     0.40,
+            'log_odds_max':      3.5,
+            'log_odds_min':     -3.5,
+            'use_icp':           True,
+            'icp_max_iter':      50,
+            'icp_tolerance':     1e-4,
+            'publish_rate':      1.0,
+            'tf_rate':           20.0,
+            'occ_thresh':        0.65,
+            'free_thresh':       0.35,
+        }]
     )
 
     # ── Assemble LaunchDescription ─────────────────────────────────────────
@@ -207,6 +278,8 @@ def generate_launch_description():
         # /odom subscriber inside aruco_localizer finds the topic immediately
         odometry_node,
         aruco_localizer_node,
+        mcl_node,
+        slam_node,
 
         # Visualisation
         aruco_map_node,
