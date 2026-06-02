@@ -137,7 +137,7 @@ class ArucoDetectorNode(Node):
         super().__init__('aruco_detector')
 
         # ── Parámetros ────────────────────────────────────────────────
-        self.declare_parameter('camera_topic', '/camera/image_raw/compressed')
+        self.declare_parameter('camera_topic', '/camera_raw/compressed')
         self.declare_parameter('publish_image', True)
         self.declare_parameter('unknown_id',    -1)
         self.declare_parameter('calib_file',    '')
