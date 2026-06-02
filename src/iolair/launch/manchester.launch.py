@@ -88,7 +88,7 @@ def generate_launch_description():
             'camera_to_base_z': 0.13,
             'anchor_min_dist':  0.2,
             'anchor_max_dist':  3.50,
-            'anchor_reobserve': 0.05,
+            'anchor_reobserve': 0.1,
             'r_base_pos':       0.03,
             'r_base_yaw':       0.04,
             'distance_noise_k': 0.025,
@@ -105,8 +105,8 @@ def generate_launch_description():
         parameters=[{
             'landmarks_file': landmarks_yaml_file,
             'publish_rate':   1.0,
-            'sphere_scale':   0.08,
-            'text_scale':     0.12,
+            'sphere_scale':   0.095,
+            'text_scale':     0.15,
         }]
     )
 

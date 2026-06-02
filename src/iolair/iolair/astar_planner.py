@@ -152,6 +152,10 @@ class AStarPlannerNode(Node):
         self.active    = False
         self.status    = 'IDLE'
 
+        # Goal final guardado para poder replanificar desde posición del robot
+        self._final_goal_x: float | None = None
+        self._final_goal_y: float | None = None
+
         # Guardar configuración de QoS para mapas
         self.map_qos = QoSProfile(
             depth=1,
@@ -167,6 +171,10 @@ class AStarPlannerNode(Node):
             Odometry, odom_topic, self._cb_odom, 10)
         self.sub_goal = self.create_subscription(
             Pose2D, goal_in_topic, self._cb_goal, 10)
+        # Replan trigger desde bug_IBA: posición actual del robot cuando detecta
+        # un obstáculo. Replanifica al mismo goal final desde ahí.
+        self.create_subscription(
+            Pose2D, '/replan_trigger', self._cb_replan_trigger, 10)
 
         # ── Publicadores ──────────────────────────────────────────────────
         self.pub_wp     = self.create_publisher(Pose2D,  goal_out_topic, 10)
@@ -234,7 +242,29 @@ class AStarPlannerNode(Node):
     def _cb_goal(self, msg: Pose2D):
         self.get_logger().info(
             f'[A*] Objetivo recibido: x={msg.x:.2f} y={msg.y:.2f}')
+        # Guardamos el goal final para poder replanificar si bug_IBA lo pide
+        self._final_goal_x = msg.x
+        self._final_goal_y = msg.y
         self._plan_and_start(msg.x, msg.y)
+
+    def _cb_replan_trigger(self, msg: Pose2D):
+        """
+        Disparado por bug_IBA cuando detecta un obstáculo.
+        Replanifica desde la posición actual del robot (msg.x, msg.y)
+        al mismo goal final que estábamos siguiendo.
+        Ignora el trigger si no hay goal activo.
+        """
+        if self._final_goal_x is None:
+            self.get_logger().warn('[A*] Replan trigger recibido pero no hay goal activo — ignorando.')
+            return
+        self.get_logger().info(
+            f'[A*] Replan desde ({msg.x:.2f}, {msg.y:.2f}) '
+            f'→ goal ({self._final_goal_x:.2f}, {self._final_goal_y:.2f})')
+        # Actualizamos la posición del robot con la del trigger para que
+        # _plan_and_start arranque exactamente desde ahí
+        self.robot_x = msg.x
+        self.robot_y = msg.y
+        self._plan_and_start(self._final_goal_x, self._final_goal_y)
 
     # ── Planificación ─────────────────────────────────────────────────────────
 
