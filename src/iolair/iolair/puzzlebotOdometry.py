@@ -165,7 +165,7 @@ class PuzzlebotOdometry(Node):
         self.declare_parameter('rate',                50.0)
         self.declare_parameter('q_xy',                0.005)
         self.declare_parameter('q_theta',             0.01)
-        self.declare_parameter('source_timeout',      0.5)
+        self.declare_parameter('source_timeout',      1.5)   # FIX9: was 0.5 — 5 frames at 10 Hz is too tight
         # FIX6: separate, longer timeout for ICP (keyframe-gated, not every scan)
         self.declare_parameter('icp_source_timeout',  2.5)
         self.declare_parameter('r_pos_default',       0.1)
@@ -347,6 +347,14 @@ class PuzzlebotOdometry(Node):
 
         if self._current_source == SourceState.PREDICT_ONLY:
             self.get_logger().warn(f'EKF source → {label}')
+            # FIX8: reset initialisation flags so the next re-acquisition from
+            # any source bypasses the innovation gate (same as first-ever update).
+            # Without this, drift accumulated during dead-reckoning causes the
+            # first correction after re-acquisition to be wrongly rejected.
+            with self._ekf_lock:
+                self._aruco_initialised = False
+                self._mcl_initialised   = False
+                self._icp_initialised   = False
         else:
             self.get_logger().info(f'EKF source → {label}')
 
@@ -443,13 +451,20 @@ class PuzzlebotOdometry(Node):
 
             # FIX5: bypass innovation gate on the very first update from a
             #        source so large startup offsets are not silently dropped.
+            # FIX7: adaptive gate — when covariance is large (long PREDICT_ONLY
+            #        stretch) the gate widens to 3σ so real corrections aren't
+            #        rejected precisely when they are most needed.
             if not first_update:
-                if (math.hypot(y[0], y[1]) > self._max_ipos or
-                        abs(y[2]) > self._max_iyaw):
+                pos_sigma = math.sqrt(max(self._P[0, 0] + self._P[1, 1], 0.0))
+                yaw_sigma = math.sqrt(max(self._P[2, 2], 0.0))
+                gate_pos  = max(self._max_ipos, 3.0 * pos_sigma)
+                gate_yaw  = max(self._max_iyaw, 3.0 * yaw_sigma)
+                if (math.hypot(y[0], y[1]) > gate_pos or
+                        abs(y[2]) > gate_yaw):
                     self.get_logger().warn(
                         f'[{source}] update REJECTED — '
-                        f'Δpos={math.hypot(y[0],y[1]):.3f} m, '
-                        f'Δyaw={math.degrees(y[2]):.1f}°'
+                        f'Δpos={math.hypot(y[0],y[1]):.3f} m (gate={gate_pos:.2f}), '
+                        f'Δyaw={math.degrees(y[2]):.1f}° (gate={math.degrees(gate_yaw):.1f}°)'
                     )
                     return
 
