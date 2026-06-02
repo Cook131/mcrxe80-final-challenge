@@ -4,13 +4,13 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-
     pkg_dir = get_package_share_directory('iolair')
-    
-    # Resolves the path to your map file inside the installed share directory
-    map_yaml_file = os.path.join(pkg_dir, 'maps', 'slam_map.yaml') 
+
+    map_yaml_file       = os.path.join(pkg_dir, 'maps', 'slam_map.yaml')
+    landmarks_yaml_file = os.path.join(pkg_dir, 'maps', 'aruco_landmarks.yaml')
 
     return LaunchDescription([
+
         # 1. Nodo de Odometría del Puzzlebot
         Node(
             package='iolair',
@@ -25,22 +25,37 @@ def generate_launch_description():
             executable='aruco_localizer',
             name='aruco_localizer',
             output='screen',
-            # Aquí puedes sobreescribir los parámetros declarados en tu script si lo requieres
             parameters=[{
+                'landmarks_file':   landmarks_yaml_file,
                 'camera_to_base_x': 0.10,
                 'camera_to_base_y': 0.05,
                 'camera_to_base_z': 0.13,
-                'anchor_min_dist': 0.20,
-                'anchor_max_dist': 3.50,
+                'anchor_min_dist':  0.20,
+                'anchor_max_dist':  3.50,
                 'anchor_reobserve': 0.30,
-                'r_base_pos': 0.03,
-                'r_base_yaw': 0.04,
+                'r_base_pos':       0.03,
+                'r_base_yaw':       0.04,
                 'distance_noise_k': 0.025,
-                'publish_rate': 10.0
+                'publish_rate':     10.0,
             }]
         ),
 
-                Node(
+        # 3. Nodo visualizador de ArUcos en RViz
+        Node(
+            package='iolair',
+            executable='aruco_map_publisher',
+            name='aruco_map_publisher',
+            output='screen',
+            parameters=[{
+                'landmarks_file': landmarks_yaml_file,
+                'publish_rate':   1.0,
+                'sphere_scale':   0.08,
+                'text_scale':     0.12,
+            }]
+        ),
+
+        # 4. Map Server
+        Node(
             package='nav2_map_server',
             executable='map_server',
             name='map_server',
@@ -48,21 +63,23 @@ def generate_launch_description():
             parameters=[{'yaml_filename': map_yaml_file}]
         ),
 
-        # 2. Lifecycle Manager (Crucial! Activates the map_server lifecycle states)
+        # 5. Lifecycle Manager (activa map_server)
         Node(
             package='nav2_lifecycle_manager',
             executable='lifecycle_manager',
             name='lifecycle_manager_localization',
             output='screen',
-            parameters=[{'node_names': ['map_server']},
-                        {'autostart': True}]
+            parameters=[
+                {'node_names': ['map_server']},
+                {'autostart': True},
+            ]
         ),
 
-        # 3. Nodo del Controlador del Puzzlebot
+        # 6. Nodo del Controlador del Puzzlebot
         Node(
             package='iolair',
             executable='controller',
             name='puzzlebot_controller',
             output='screen'
-        )
+        ),
     ])

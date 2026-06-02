@@ -2,13 +2,13 @@
 yolo_detector_node.py
 ───────────────────────────────────────────────────────────────
 YOLOv8 Detector Node  —  Cookie / E80 Group R&D
-Se suscribe a /camera/image_raw y publica detecciones + imagen
-anotada (mismo estilo que aruco_detector).
+Se suscribe a /camera/image_raw/compressed y publica detecciones
++ imagen anotada (mismo estilo que aruco_detector).
 
 Topics:
-  SUB  /camera/image_raw        sensor_msgs/Image
-  PUB  /yolo/imagen             sensor_msgs/Image   (visualizacion)
-  PUB  /yolo/detecciones        std_msgs/String     (JSON)
+  SUB  /camera/image_raw/compressed   sensor_msgs/CompressedImage
+  PUB  /yolo/imagen                   sensor_msgs/Image   (visualizacion)
+  PUB  /yolo/detecciones              std_msgs/String     (JSON)
 
 Uso:
   ros2 run <paquete> yolo_detector_node
@@ -18,18 +18,18 @@ Uso:
 # =============================================================
 # CONFIGURACION — edita solo este bloque
 # =============================================================
-WEIGHTS      = "src/puzzlebot/weights/best.pt"       # <- pon aqui la ruta absoluta a best.pt
-CAMERA_TOPIC = "/camera/image_raw"
-CONF         = 0.65                    # confianza minima en vivo
+WEIGHTS      = "src/puzzlebot/weights/best.pt"
+CAMERA_TOPIC = "/camera/image_raw/compressed"
+CONF         = 0.65
 DEVICE       = "0"                     # "0" = GPU, "cpu" = CPU
-IMGSZ        = 320                     # resolucion de inferencia
+IMGSZ        = 320
 # =============================================================
 
 import json
 import rclpy
 from rclpy.node      import Node
 from rclpy.qos       import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg    import String
 from cv_bridge       import CvBridge
 from ultralytics     import YOLO
@@ -64,7 +64,7 @@ class YoloDetectorNode(Node):
 
         # ── Subscriber ────────────────────────────────────────
         self.sub = self.create_subscription(
-            Image, CAMERA_TOPIC, self.image_callback, qos_cam)
+            CompressedImage, CAMERA_TOPIC, self.image_callback, qos_cam)
 
         # ── Publishers ────────────────────────────────────────
         self.img_pub = self.create_publisher(Image,  "/yolo/imagen",      10)
@@ -95,11 +95,9 @@ class YoloDetectorNode(Node):
         box_cx = (x1 + x2) // 2
         box_cy = (y1 + y2) // 2
 
-        # Linea de alineamiento
         cv2.line(out, (img_cx, img_cy), (box_cx, box_cy), color, 1, cv2.LINE_AA)
         cv2.circle(out, (box_cx, box_cy), 3, color, -1, cv2.LINE_AA)
 
-        # Offset en pixeles respecto al centro
         dx = box_cx - img_cx
         dy = box_cy - img_cy
         offset_text = f"dx:{dx:+d} dy:{dy:+d}"
@@ -112,11 +110,11 @@ class YoloDetectorNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     # ─────────────────────────────────────────────────────────
-    def image_callback(self, msg: Image):
+    def image_callback(self, msg: CompressedImage):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
-            self.get_logger().error(f"Error decodificando imagen: {e}")
+            self.get_logger().error(f"Error decodificando imagen comprimida: {e}")
             return
 
         results = self.model.predict(

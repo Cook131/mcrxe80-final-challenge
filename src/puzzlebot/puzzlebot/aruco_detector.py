@@ -9,18 +9,15 @@ Detecta marcadores usando DOS diccionarios en paralelo + QR codes:
   - QR codes                     → contenido del QR como string
 
 Tópicos:
-  Suscribe:  camera/image_raw            (sensor_msgs/msg/Image)
-  Publica:   /aruco/id                   (std_msgs/msg/Int32)
-             /aruco/label                (std_msgs/msg/String)
-             /aruco/imagen               (sensor_msgs/msg/Image)
-             /aruco/waypoint             (geometry_msgs/msg/PoseStamped)
-             /aruco/qr                   (std_msgs/msg/String)
-             /aruco/distance             (std_msgs/msg/Float32)  metros en plano XZ
-             /aruco/angle                (std_msgs/msg/Float32)  grados, + = derecha
+  Suscribe:  /camera/image_raw/compressed  (sensor_msgs/CompressedImage)
+  Publica:   /aruco/id                     (std_msgs/msg/Int32)
+             /aruco/label                  (std_msgs/msg/String)
+             /aruco/imagen                 (sensor_msgs/msg/Image)
+             /aruco/waypoint               (geometry_msgs/msg/PoseStamped)
+             /aruco/qr                     (std_msgs/msg/String)
+             /aruco/distance               (std_msgs/msg/Float32)  metros en plano XZ
+             /aruco/angle                  (std_msgs/msg/Float32)  grados, + = derecha
 
- - Diccionario 4X4_50  IDs 0-4   → External WP 1…5   (paredes)
- - Diccionario 4X4_50  IDs 5-10  → Internal WP 1…6   (objetivos internos)
-...
   11…16        → Internal WP 1…6   (4X4_50 IDs 5-10)
   20…24        → External WP 1…5   (4X4_50 IDs 0-4)
 
@@ -42,7 +39,7 @@ from rclpy.node import Node
 
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import Float32, Int32, String
 
 # ─────────────────────────────────────────────────────────────────────
@@ -140,21 +137,18 @@ class ArucoDetectorNode(Node):
         super().__init__('aruco_detector')
 
         # ── Parámetros ────────────────────────────────────────────────
-        self.declare_parameter('camera_topic', 'camera/image_raw')   # Image raw
+        self.declare_parameter('camera_topic', '/camera/image_raw/compressed')
         self.declare_parameter('publish_image', True)
         self.declare_parameter('unknown_id',    -1)
         self.declare_parameter('calib_file',    '')
         self.declare_parameter('marker_size',   self.MARKER_SIZE)
         # Offset cámara→base_link en metros [x, y, z] (frame de cámara)
-        # Ajustar con la posición física de la cámara en el robot
         self.declare_parameter('cam_offset', [0.10, 0.0, 0.13])
 
         camera_topic     = self.get_parameter('camera_topic').value
         self.marker_size = float(self.get_parameter('marker_size').value)
 
         # ── Calibración ───────────────────────────────────────────────
-        # Calibración esperada a 320x240 (igual que publica camera_node)
-        # Si se recalibra a otra resolución, escalar K manualmente antes de correr.
         self.camera_matrix = None
         self.dist_coeffs   = None
         self.pose_ready    = False
@@ -184,9 +178,17 @@ class ArucoDetectorNode(Node):
         self.det_6x6     = self._build_6x6_detector()
         self.qr_detector = cv2.QRCodeDetector()
 
-        # ── Suscriptor ────────────────────────────────────────────────
-        # QoS RELIABLE (default) para coincidir con camera_node que publica RELIABLE
-        self.create_subscription(Image, camera_topic, self.image_callback, 10)
+        # ── Suscriptor — CompressedImage ──────────────────────────────
+        # BEST_EFFORT para no bloquear si el publisher también es BEST_EFFORT.
+        # Si camera_node publica RELIABLE, ambas políticas son compatibles.
+        from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+        qos_cam = QoSProfile(
+            reliability = QoSReliabilityPolicy.BEST_EFFORT,
+            history     = QoSHistoryPolicy.KEEP_LAST,
+            depth       = 1,
+        )
+        self.create_subscription(
+            CompressedImage, camera_topic, self.image_callback, qos_cam)
 
         # ── Publicadores ──────────────────────────────────────────────
         self.pub_id       = self.create_publisher(Int32,       '/aruco/id',       10)
@@ -276,29 +278,15 @@ class ArucoDetectorNode(Node):
     # ─────────────────────────────────────────────────────────────────
 
     def _angle_distance(self, tvec):
-        """
-        Calcula bearing y distancia desde tvec (frame óptico de cámara).
-
-        Frame óptico:  X → derecha, Y → abajo, Z → profundidad al marcador
-
-        Aplica el offset cámara→base_link (parámetro cam_offset [x, y, z])
-        para obtener coordenadas relativas al centro del robot.
-
-        Retorna:
-            dist_3d   float  metros  distancia euclidiana 3D
-            dist_xz   float  metros  distancia en plano del suelo (XZ)  ← usar para triangulación
-            angle_h   float  grados  bearing horizontal  (+= derecha, -= izquierda)
-            angle_v   float  grados  elevación           (+= arriba,  -= abajo)
-        """
         offset = self.get_parameter('cam_offset').value
         tx = float(tvec[0]) - float(offset[0])
         ty = float(tvec[1]) - float(offset[1])
         tz = float(tvec[2]) - float(offset[2])
 
         dist_3d  = math.sqrt(tx*tx + ty*ty + tz*tz)
-        dist_xz  = math.sqrt(tx*tx + tz*tz)           # distancia en plano del suelo
-        angle_h  = math.degrees(math.atan2(tx,  tz))  # bearing horizontal
-        angle_v  = math.degrees(math.atan2(-ty, tz))  # elevación (+ = arriba)
+        dist_xz  = math.sqrt(tx*tx + tz*tz)
+        angle_h  = math.degrees(math.atan2(tx,  tz))
+        angle_v  = math.degrees(math.atan2(-ty, tz))
 
         return dist_3d, dist_xz, angle_h, angle_v
 
@@ -320,7 +308,7 @@ class ArucoDetectorNode(Node):
             cv2.line(out, (w // 2, h // 2), (cx, cy), color, 1, cv2.LINE_AA)
             info_lines = [
                 label,
-                f"dist  {dist_xz:.3f} m",    # distancia plano suelo
+                f"dist  {dist_xz:.3f} m",
                 f"az  {angle_h:+.1f} deg",
                 f"el  {angle_v:+.1f} deg",
             ]
@@ -378,15 +366,14 @@ class ArucoDetectorNode(Node):
         return out
 
     # ─────────────────────────────────────────────────────────────────
-    # Callback principal  — suscribe sensor_msgs/Image (raw, sin comprimir)
+    # Callback principal — suscribe sensor_msgs/CompressedImage
     # ─────────────────────────────────────────────────────────────────
 
-    def image_callback(self, msg: Image):
+    def image_callback(self, msg: CompressedImage):
         try:
-            # CvBridge decodifica directamente desde Image raw (bgr8)
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
-            self.get_logger().error(f"Error decodificando imagen: {e}")
+            self.get_logger().error(f"Error decodificando imagen comprimida: {e}")
             return
 
         external_hits, internal_hits, wp6x6_hits, qr_data, qr_points = \
@@ -410,7 +397,6 @@ class ArucoDetectorNode(Node):
         any_aruco = external_hits or internal_hits or wp6x6_hits
 
         if any_aruco:
-            # Prioridad: interno > externo > 6x6
             if internal_hits:
                 mid    = internal_hits[0][0]
                 pub_id = internal_pub_id(mid)
@@ -427,7 +413,6 @@ class ArucoDetectorNode(Node):
             self.pub_id.publish(Int32(data=pub_id))
             self.pub_label.publish(String(data=label))
 
-            # Publicar PoseStamped de todos los marcadores visibles
             for poses, hits in [
                 (poses_ext,  external_hits),
                 (poses_int,  internal_hits),
@@ -441,7 +426,6 @@ class ArucoDetectorNode(Node):
                         pm.header.frame_id = 'camera_optical_frame'
                         self.pub_waypoint.publish(pm)
 
-            # Log (solo al cambiar el conjunto visible)
             curr_key = (
                 tuple(sorted(h[0] for h in external_hits)),
                 tuple(sorted(h[0] for h in internal_hits)),
@@ -465,7 +449,6 @@ class ArucoDetectorNode(Node):
                         )
                 self._prev_key = curr_key
 
-            # Publicar distancia (plano XZ) y ángulo del marcador prioritario
             priority_tv = None
             if   internal_hits and poses_int[0][1] is not None:
                 priority_tv = poses_int[0][1]

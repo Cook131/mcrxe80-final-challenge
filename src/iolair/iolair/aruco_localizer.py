@@ -5,24 +5,25 @@ aruco_localizer.py — Corrección de drift por landmark anchoring
 
 Problema que resuelve
 ---------------------
-El robot navega por una pista con ArUcos en posiciones DESCONOCIDAS.
+El robot navega por una pista con ArUcos en posiciones CONOCIDAS (YAML)
+o DESCONOCIDAS (anclado dinámico de fallback).
 La odometría acumula drift con el tiempo. Cada vez que el robot ve un
 ArUco, podemos corregir ese drift.
 
-Método: Landmark Anchoring
---------------------------
-Primera vez que se ve un marcador (ID nuevo):
-  → Calcular su posición global usando la pose EKF actual + tvec de cámara
-  → Guardar esa posición como "ancla" (landmark)
+Método: Landmark Anchoring con posiciones predefinidas
+------------------------------------------------------
+Al arrancar:
+  → Se carga aruco_landmarks.yaml con las posiciones globales conocidas
+  → Esos landmarks se marcan como "fijos" (no se actualizan con promedio móvil)
 
-Siguientes veces que se ve el mismo marcador:
+Primera vez que se ve un marcador ID NO listado en el YAML:
+  → Comportamiento de fallback: calcular su posición global usando la
+    pose EKF actual + tvec de cámara y guardarlo como ancla dinámica
+
+Siguientes veces que se ve el mismo marcador (fijo o dinámico):
   → El robot debería estar a la misma distancia/ángulo del ancla
   → Calcular dónde DEBERÍA estar el robot dado el ancla y el tvec actual
   → Publicar esa pose como corrección para el EKF
-
-Esto corrige el drift porque:
-  - Si el robot drifteó a la derecha, al ver el mismo ArUco desde
-    una posición estimada incorrecta, la corrección lo empuja de vuelta.
 
 Flujo de datos
 --------------
@@ -36,34 +37,47 @@ Flujo de datos
   aruco_localizer    →  /aruco/pose   (PoseWithCovarianceStamped) → EKF
                          /aruco/debug  (String)
 
-Integración con EKF
---------------------
-  puzzlebotOdometry.py ya tiene el parche para suscribirse a /aruco/pose
-  como tercer source (ARUCO_ACTIVE / ARUCO_PRIORITY).
-
 Parámetros ROS
 --------------
+  landmarks_file     ''     ruta al YAML con posiciones predefinidas.
+                            Si está vacío, todos los landmarks son dinámicos.
   camera_to_base_x   0.05   [m]   offset longitudinal cámara→base_link
   camera_to_base_y   0.00   [m]   offset lateral
   camera_to_base_z   0.10   [m]   altura cámara sobre el suelo
   anchor_min_dist    0.20   [m]   distancia mínima para anclar/corregir
   anchor_max_dist    3.50   [m]   distancia máxima para anclar/corregir
   anchor_reobserve   0.30   [m]   mínimo desplazamiento del robot para
-                                  re-observar el mismo marcador (evita
-                                  spamear correcciones estando quieto)
+                                  re-observar el mismo marcador
   r_base_pos         0.03   [m²]  varianza base de posición
   r_base_yaw         0.04   [rad²] varianza base de orientación
   distance_noise_k   0.025  factor de ruido proporcional a d²
   publish_rate       10.0   [Hz]
+
+Formato del YAML
+----------------
+  landmarks:
+    1:
+      x: 1.50
+      y: 0.00
+    2:
+      x: 3.00
+      y: 1.50
 """
 
 import math
+import os
 import threading
 import time
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
+
+try:
+    import yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
 
 from geometry_msgs.msg import (
     PoseStamped, PoseWithCovarianceStamped, Quaternion
@@ -124,17 +138,15 @@ def camera_tvec_to_robot_frame(tvec: np.ndarray, robot_yaw: float,
            dy_global = dx_robot·sin(yaw) + dy_robot·cos(yaw)
       3. Añadir offset de cámara a base_link
     """
-    dx_robot = float(tvec[2])    # profundidad al marcador
-    dy_robot = -float(tvec[0])   # desplazamiento lateral (izquierda positivo)
+    dx_robot = float(tvec[2])
+    dy_robot = -float(tvec[0])
 
     cos_y = math.cos(robot_yaw)
     sin_y = math.sin(robot_yaw)
 
-    # Posición del marcador en frame global desde la cámara
     dx_g = dx_robot * cos_y - dy_robot * sin_y
     dy_g = dx_robot * sin_y + dy_robot * cos_y
 
-    # Offset cámara→base_link en frame global
     off_x = cam_x * cos_y - cam_y * sin_y
     off_y = cam_x * sin_y + cam_y * cos_y
 
@@ -142,29 +154,43 @@ def camera_tvec_to_robot_frame(tvec: np.ndarray, robot_yaw: float,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Estructura de un landmark anclado
+# Estructura de un landmark
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Landmark:
-    """Posición global estimada de un marcador ArUco."""
+    """Posición global de un marcador ArUco.
+
+    Atributos
+    ---------
+    fixed : bool
+        True  → posición cargada desde YAML; nunca se actualiza con
+                promedio móvil (se confía 100 % en el mapa).
+        False → posición estimada dinámicamente; se refina con cada
+                observación.
+    """
 
     def __init__(self, pub_id: int, gx: float, gy: float,
-                 robot_x: float, robot_y: float):
+                 robot_x: float, robot_y: float,
+                 fixed: bool = False):
         self.pub_id    = pub_id
-        self.gx        = gx        # posición global X del marcador [m]
-        self.gy        = gy        # posición global Y del marcador [m]
-        self.n_obs     = 1         # número de observaciones
-        self.last_robot_x = robot_x  # última posición del robot al verlo
+        self.gx        = gx
+        self.gy        = gy
+        self.n_obs     = 1
+        self.fixed     = fixed
+        self.last_robot_x = robot_x
         self.last_robot_y = robot_y
 
     def update_position(self, gx: float, gy: float,
                         robot_x: float, robot_y: float):
-        """
-        Actualiza la posición del ancla con un promedio móvil suavizado.
-        Cuantas más observaciones, menos peso a la nueva (el ancla se
-        vuelve más estable con el tiempo).
-        """
-        alpha = 1.0 / (self.n_obs + 1)   # peso decreciente
+        """Actualiza la posición con promedio móvil (solo landmarks dinámicos)."""
+        if self.fixed:
+            # Landmark fijo: no modificar posición, solo contabilizar observación
+            self.n_obs += 1
+            self.last_robot_x = robot_x
+            self.last_robot_y = robot_y
+            return
+
+        alpha = 1.0 / (self.n_obs + 1)
         self.gx = (1 - alpha) * self.gx + alpha * gx
         self.gy = (1 - alpha) * self.gy + alpha * gy
         self.n_obs += 1
@@ -182,6 +208,7 @@ class ArucoLocalizerNode(Node):
         super().__init__('aruco_localizer')
 
         # ── Parámetros ────────────────────────────────────────────────────
+        self.declare_parameter('landmarks_file',    '')
         self.declare_parameter('camera_to_base_x',  0.05)
         self.declare_parameter('camera_to_base_y',  0.00)
         self.declare_parameter('camera_to_base_z',  0.10)
@@ -193,6 +220,7 @@ class ArucoLocalizerNode(Node):
         self.declare_parameter('distance_noise_k',  0.025)
         self.declare_parameter('publish_rate',     10.0)
 
+        self._landmarks_file = self.get_parameter('landmarks_file').value
         self._cam_x      = self.get_parameter('camera_to_base_x').value
         self._cam_y      = self.get_parameter('camera_to_base_y').value
         self._cam_z      = self.get_parameter('camera_to_base_z').value
@@ -207,7 +235,8 @@ class ArucoLocalizerNode(Node):
         # ── Estado ────────────────────────────────────────────────────────
         self._lock = threading.Lock()
 
-        # Landmarks descubiertos: pub_id → Landmark
+        # Landmarks: pub_id → Landmark
+        # Se pre-pobla desde YAML; los IDs no listados se anclan dinámicamente.
         self._landmarks: dict[int, Landmark] = {}
 
         # Última pose del EKF
@@ -225,7 +254,9 @@ class ArucoLocalizerNode(Node):
 
         # Pose a publicar (None = no hay corrección nueva)
         self._correction: tuple[float, float, float, float] | None = None
-        # (rx, ry, ryaw, distance)
+
+        # ── Cargar landmarks desde YAML ───────────────────────────────────
+        self._load_landmarks_from_yaml()
 
         # ── Suscriptores ──────────────────────────────────────────────────
         self.create_subscription(
@@ -245,11 +276,110 @@ class ArucoLocalizerNode(Node):
 
         self.create_timer(1.0 / rate, self._process_and_publish)
 
+        n_fixed = sum(1 for lm in self._landmarks.values() if lm.fixed)
         self.get_logger().info(
-            'ArUco Localizer (landmark anchoring) listo\n'
-            '  Primera detección de un ID → ancla su posición global\n'
-            '  Re-detecciones            → corrección de drift al EKF\n'
-            '  Publica → /aruco/pose  (PoseWithCovarianceStamped)'
+            f'ArUco Localizer (landmark anchoring) listo\n'
+            f'  Landmarks fijos (YAML): {n_fixed}\n'
+            f'  IDs no listados usarán anclado dinámico de fallback\n'
+            f'  Publica → /aruco/pose  (PoseWithCovarianceStamped)'
+        )
+
+    # ── Carga de YAML ─────────────────────────────────────────────────────
+
+    def _load_landmarks_from_yaml(self):
+        """
+        Carga posiciones predefinidas desde el archivo YAML.
+
+        Espera la estructura:
+            landmarks:
+              <id>:
+                x: <float>
+                y: <float>
+
+        Los landmarks cargados se marcan como fixed=True, de modo que su
+        posición global nunca se modifica con el promedio móvil.
+        IDs no presentes en el YAML seguirán siendo anclados dinámicamente.
+        """
+        path = self._landmarks_file
+
+        if not path:
+            self.get_logger().info(
+                'Parámetro landmarks_file vacío → '
+                'todos los landmarks serán dinámicos.'
+            )
+            return
+
+        if not _YAML_AVAILABLE:
+            self.get_logger().error(
+                'PyYAML no está instalado. '
+                'Instálalo con: pip install pyyaml\n'
+                'Continuando sin landmarks predefinidos.'
+            )
+            return
+
+        if not os.path.isfile(path):
+            self.get_logger().error(
+                f'Archivo de landmarks no encontrado: {path}\n'
+                f'Continuando sin landmarks predefinidos.'
+            )
+            return
+
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            self.get_logger().error(
+                f'Error al parsear YAML ({path}): {e}\n'
+                f'Continuando sin landmarks predefinidos.'
+            )
+            return
+
+        if not isinstance(data, dict) or 'landmarks' not in data:
+            self.get_logger().error(
+                f'El YAML no contiene la clave "landmarks". '
+                f'Revisa el formato en {path}.'
+            )
+            return
+
+        entries = data['landmarks']
+        if not isinstance(entries, dict):
+            self.get_logger().error(
+                '"landmarks" debe ser un diccionario id → {{x, y}}.'
+            )
+            return
+
+        loaded = 0
+        for raw_id, coords in entries.items():
+            try:
+                pub_id = int(raw_id)
+                gx = float(coords['x'])
+                gy = float(coords['y'])
+            except (TypeError, KeyError, ValueError) as e:
+                self.get_logger().warn(
+                    f'Entrada inválida para ID={raw_id}: {e} — omitida.'
+                )
+                continue
+
+            # robot_x / robot_y en 0,0 porque aún no hemos recibido odometría;
+            # last_robot_x/y se usará solo para el umbral de re-observación,
+            # así que se inicializan en un valor imposible para forzar la
+            # primera corrección en cuanto el robot detecte el marcador.
+            lm = Landmark(
+                pub_id=pub_id,
+                gx=gx,
+                gy=gy,
+                robot_x=float('inf'),
+                robot_y=float('inf'),
+                fixed=True,
+            )
+            self._landmarks[pub_id] = lm
+            loaded += 1
+            self.get_logger().info(
+                f'  [YAML] ID={pub_id} → ({gx:.3f}, {gy:.3f}) [FIJO]'
+            )
+
+        self.get_logger().info(
+            f'Cargados {loaded} landmarks predefinidos desde {path}'
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────
@@ -301,7 +431,6 @@ class ArucoLocalizerNode(Node):
             yaw_ekf  = self._robot_yaw
 
         # Posición global del marcador según la pose EKF actual
-        # (robot_x + desplazamiento al marcador en frame global)
         dx_g, dy_g = camera_tvec_to_robot_frame(
             t_vec, yaw_ekf, self._cam_x, self._cam_y
         )
@@ -310,11 +439,12 @@ class ArucoLocalizerNode(Node):
 
         with self._lock:
             if pub_id not in self._landmarks:
-                # ── PRIMERA VEZ: anclar este marcador ─────────────────────
-                lm = Landmark(pub_id, marker_gx, marker_gy, rx_ekf, ry_ekf)
+                # ── PRIMERA VEZ y NO está en YAML: anclar dinámicamente ───
+                lm = Landmark(pub_id, marker_gx, marker_gy,
+                              rx_ekf, ry_ekf, fixed=False)
                 self._landmarks[pub_id] = lm
                 self.get_logger().info(
-                    f'[ANCHOR] ID={pub_id} anclado en '
+                    f'[ANCHOR-DYN] ID={pub_id} anclado dinámicamente en '
                     f'({marker_gx:.3f}, {marker_gy:.3f}) '
                     f'desde robot ({rx_ekf:.3f}, {ry_ekf:.3f}) '
                     f'd={dist:.3f}m'
@@ -331,28 +461,23 @@ class ArucoLocalizerNode(Node):
                 return   # robot casi quieto, no spamear
 
             # ── CALCULAR CORRECCIÓN ───────────────────────────────────────
-            # El marcador está en (lm.gx, lm.gy) en el mundo.
-            # Dado el tvec actual (marcador relativo a cámara), el robot
-            # DEBERÍA estar en:
-            #   robot_corrected = landmark_pos - desplazamiento_al_marcador
+            # El marcador está en (lm.gx, lm.gy). Dado el tvec actual,
+            # el robot DEBERÍA estar en:
             rx_corr = lm.gx - dx_g
             ry_corr = lm.gy - dy_g
 
-            # Orientación: el eje Z de la cámara apunta al marcador.
-            # bearing_global = dirección robot→marcador en el mapa
             bearing = math.atan2(dy_g, dx_g)
-            # El robot mira en la dirección del marcador
-            # (corregido por el ángulo lateral del tvec)
             lateral_angle = math.atan2(-float(t_vec[0]), float(t_vec[2]))
             ryaw_corr = normalize_angle(bearing - lateral_angle)
 
-            # Actualizar ancla suavemente (promedio móvil)
+            # Actualizar ancla (solo si es dinámica; los fijos ignoran esto)
             lm.update_position(marker_gx, marker_gy, rx_ekf, ry_ekf)
 
             drift = math.hypot(rx_corr - rx_ekf, ry_corr - ry_ekf)
+            tag = 'FIXED' if lm.fixed else 'DYN'
 
             self.get_logger().info(
-                f'[CORRECT] ID={pub_id} obs#{lm.n_obs} | '
+                f'[CORRECT-{tag}] ID={pub_id} obs#{lm.n_obs} | '
                 f'drift={drift:.3f}m | '
                 f'EKF=({rx_ekf:.3f},{ry_ekf:.3f}) → '
                 f'corr=({rx_corr:.3f},{ry_corr:.3f})'
@@ -377,7 +502,7 @@ class ArucoLocalizerNode(Node):
 
         msg = PoseWithCovarianceStamped()
         msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'odom'   # frame de odometría (no mapa global)
+        msg.header.frame_id = 'odom'
 
         msg.pose.pose.position.x  = rx
         msg.pose.pose.position.y  = ry
@@ -396,9 +521,10 @@ class ArucoLocalizerNode(Node):
         self._pub_pose.publish(msg)
 
         with self._lock:
-            n_lm = len(self._landmarks)
+            n_fixed  = sum(1 for lm in self._landmarks.values() if lm.fixed)
+            n_dyn    = len(self._landmarks) - n_fixed
         debug = (
-            f'landmarks={n_lm} | '
+            f'lm_fixed={n_fixed} lm_dyn={n_dyn} | '
             f'corr=({rx:.3f},{ry:.3f}) θ={math.degrees(ryaw):.1f}° | '
             f'σ_pos={math.sqrt(r_pos):.3f}m d={dist:.3f}m'
         )

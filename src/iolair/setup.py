@@ -19,7 +19,9 @@ setup(
             glob.glob('launch/*.py')),
         # Maps — every .yaml inside maps/ gets installed
         (os.path.join('share', package_name, 'maps'),
-            glob.glob('maps/*')),  
+            glob.glob('maps/*')),
+        (os.path.join('share', package_name, 'configs'),
+            glob.glob('configs/*')),  
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -44,6 +46,7 @@ setup(
             'astar_planner   = iolair.astar_planner:main',
             'rviz_goal_bridge = iolair.goal_bridge:main',
             'mapping_node     = iolair.mapping_node:main',
+            'aruco_map_publisher = iolair.aruco_map_publisher:main',
         ],
     },
 )
