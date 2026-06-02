@@ -24,7 +24,7 @@ Tópicos:
 Calibración:
   Busca automáticamente camera_params.npz o camera_params.json
   en la misma carpeta que este script.
-  Calibración esperada a 320x240 (misma resolución que publica camera_node).
+  Calibración esperada a 1080x720 (resolución de entrada de la cámara).
 """
 
 import json
@@ -131,7 +131,7 @@ def _to_posestamped(rvec, tvec) -> PoseStamped:
 # ─────────────────────────────────────────────────────────────────────
 class ArucoDetectorNode(Node):
 
-    MARKER_SIZE = 0.105   # metros — medir marcador físico con regla
+    MARKER_SIZE = 0.95   # metros — medir marcador físico con regla
 
     def __init__(self):
         super().__init__('aruco_detector')
