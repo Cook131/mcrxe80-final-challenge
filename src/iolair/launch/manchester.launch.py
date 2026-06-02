@@ -4,6 +4,7 @@ aruco_bug_iba.launch.py
 Launches the full navigation stack for the Puzzlebot using:
   - ArUco Detector        (puzzlebot pkg) — detects ArUco markers from camera
   - ArUco Localizer       (iolair pkg)    — landmark-anchoring EKF correction
+  - ArUco Map Publisher   (iolair pkg)    — visualiza landmarks en RViz
   - A* Planner            (iolair pkg)    — path planning on occupancy grid
   - Bug IBA / BugReflex   (iolair pkg)    — safety reflex layer (LiDAR-based)
   - Odometry / EKF        (iolair pkg)    — wheel encoder + EKF dead-reckoning
@@ -11,38 +12,19 @@ Launches the full navigation stack for the Puzzlebot using:
   - Map Server            (nav2)          — serves the pre-built slam_map
   - Nav2 Lifecycle Mgr    (nav2)          — activates map_server automatically
 
-Topic pipeline recap
---------------------
-  camera/image_raw
-      └─► aruco_detector   →  /aruco/id, /aruco/distance, /aruco/angle,
-                               /aruco/waypoint, /aruco/label, /aruco/imagen
+Uso
+---
+  # Modo por defecto (full — todas las fuentes)
+  ros2 launch iolair aruco_bug_iba.launch.py
 
-  /VelocityEncR, /VelocityEncL
-      └─► odometry (EKF)   →  /odom
+  # Solo ArUco
+  ros2 launch iolair aruco_bug_iba.launch.py ekf_mode:=aruco
 
-  /aruco/waypoint + /odom
-      └─► aruco_localizer  →  /aruco/pose  →  (fused back into EKF)
+  # Solo encoders
+  ros2 launch iolair aruco_bug_iba.launch.py ekf_mode:=odometry_only
 
-  /map (or /slam_map if SLAM is active)
-  /odom + /astar/goal (Pose2D)
-      └─► astar_planner    →  /goal (Pose2D waypoints, one at a time)
-                               /astar/path (nav_msgs/Path, for RViz)
-                               /astar/status (String)
-
-  /goal (Pose2D from A*)
-      └─► go_to_goal       →  /cmd_raw  (Twist)
-
-  /cmd_raw + /scan (LaserScan)
-      └─► bug_IBA          →  /cmd_vel  (with safety reflexes)
-
-  /cmd_vel
-      └─► controller       →  /VelocitySetR, /VelocitySetL  →  firmware
-
-NOTE — setup.py entry point required
--------------------------------------
-  'astar_planner' must be registered in src/iolair/setup.py:
-      'astar_planner = iolair.astar_planner:main',
-  Then rebuild with:  colcon build --packages-select iolair
+  # Mapa personalizado
+  ros2 launch iolair aruco_bug_iba.launch.py map_yaml:=/ruta/a/mi_mapa.yaml
 """
 
 import os
@@ -59,15 +41,25 @@ def generate_launch_description():
     # ── Package share directories ──────────────────────────────────────────
     iolair_dir = get_package_share_directory('iolair')
 
-    # ── Launch arguments (easy to override from CLI) ───────────────────────
+    landmarks_yaml = os.path.join(iolair_dir, 'maps', 'aruco_landmarks.yaml')
+
+    # ── Launch arguments ───────────────────────────────────────────────────
+    ekf_mode_arg = DeclareLaunchArgument(
+        'ekf_mode',
+        default_value='aruco',
+        description=(
+            'Modo del EKF de odometría. '
+            'Opciones: odometry_only | aruco | mcl | icp | full'
+        ),
+    )
+
     map_yaml_arg = DeclareLaunchArgument(
         'map_yaml',
-        default_value=os.path.join(iolair_dir, 'maps', 'slam_map.yaml'),
-        description='Absolute path to the map YAML file'
+        default_value=os.path.join(iolair_dir, 'maps', 'SLAM_map.yaml'),
+        description='Ruta absoluta al archivo YAML del mapa'
     )
-    map_yaml = LaunchConfiguration('map_yaml')
 
-    # ── 1. ArUco Detector — detects ArUco markers, publishes pose data ─────
+    # ── 1. ArUco Detector ──────────────────────────────────────────────────
     aruco_detector_node = Node(
         package='puzzlebot',
         executable='aruco_detector',
@@ -75,72 +67,77 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 2. Odometry (EKF) — wheel encoders + multi-source EKF fusion ───────
+    # ── 2. Odometry (EKF) ──────────────────────────────────────────────────
+    # FIX: eliminada la coma al final que lo convertía en tuple
     odometry_node = Node(
         package='iolair',
         executable='odometry',
         name='puzzlebot_odometry',
         output='screen',
+        parameters=[{
+            'ekf_mode':     LaunchConfiguration('ekf_mode'),
+            'wheel_radius': 0.05,
+            'wheel_base':   0.19,
+            'rate':         50.0,
+        }]
     )
 
-    # ── 3. ArUco Localizer — landmark-anchoring correction for the EKF ─────
-    #       Subscribes:  /aruco/waypoint (PoseStamped), /odom (Odometry)
-    #       Publishes:   /aruco/pose (PoseWithCovarianceStamped) → EKF
+    # ── 3. ArUco Localizer ─────────────────────────────────────────────────
+    # FIX: agregado landmarks_file para cargar posiciones predefinidas del YAML
     aruco_localizer_node = Node(
         package='iolair',
         executable='aruco_localizer',
         name='aruco_localizer',
         output='screen',
         parameters=[{
-            # Camera-to-base_link offsets [m]
-            'camera_to_base_x': 0.10,
-            'camera_to_base_y': 0.00,
-            'camera_to_base_z': 0.13,
-            # Landmark anchoring distances [m]
-            'anchor_min_dist':  0.20,
-            'anchor_max_dist':  3.50,
-            'anchor_reobserve': 0.30,
-            # EKF noise terms
+            'landmarks_file':    landmarks_yaml,
+            'camera_to_base_x':  0.03,
+            'camera_to_base_y':  0.07,
+            'camera_to_base_z':  0.13,
+            'anchor_min_dist':   0.20,
+            'anchor_max_dist':   3.50,
+            'anchor_reobserve':  0.30,
             'r_base_pos':        0.03,
             'r_base_yaw':        0.04,
             'distance_noise_k':  0.025,
-            # Publishing rate [Hz]
             'publish_rate':      10.0,
         }]
     )
 
-    # ── 4. A* Planner — global path planner on occupancy grid ──────────────
-    #       Subscribes:  /map or /slam_map (OccupancyGrid, auto-detected)
-    #                    /odom             (Odometry)
-    #                    /astar/goal       (Pose2D)  ← send goal here
-    #       Publishes:   /goal             (Pose2D)  → go_to_goal waypoints
-    #                    /astar/path       (Path)    → RViz visualisation
-    #                    /astar/status     (String)
+    # ── 4. ArUco Map Publisher — visualiza landmarks en RViz ───────────────
+    aruco_map_publisher_node = Node(
+        package='iolair',
+        executable='aruco_map_publisher',
+        name='aruco_map_publisher',
+        output='screen',
+        parameters=[{
+            'landmarks_file': landmarks_yaml,
+            'publish_rate':   1.0,
+            'sphere_scale':   0.08,
+            'text_scale':     0.12,
+        }]
+    )
+
+    # ── 5. A* Planner ──────────────────────────────────────────────────────
     astar_planner_node = Node(
         package='iolair',
         executable='astar_planner',
         name='astar_planner',
         output='screen',
         parameters=[{
-            # Map topic priority: A* listens to /slam_map first, falls back to /map
             'slam_map_topic':     '/slam_map',
             'static_map_topic':   '/map',
             'odom_topic':         '/odom',
-            # Goal input (publish a Pose2D here to trigger planning)
             'goal_in_topic':      '/astar/goal',
-            # Waypoint output consumed by go_to_goal
             'goal_out_topic':     '/goal',
-            # Planner tuning
-            'inflation_radius':   0.15,   # obstacle inflation [m]
-            'waypoint_threshold': 0.10,   # distance to consider waypoint reached [m]
-            'occupied_threshold': 65,     # occupancy value treated as obstacle (0-100)
-            'allow_diagonal':     True,   # 8-connected A* (vs 4-connected)
+            'inflation_radius':   0.15,
+            'waypoint_threshold': 0.10,
+            'occupied_threshold': 65,
+            'allow_diagonal':     True,
         }]
     )
 
-    # ── 5. Go-to-Goal — drives the robot toward each A* waypoint ───────────
-    #       Subscribes:  /goal (Pose2D from A*), /odom (Odometry)
-    #       Publishes:   /cmd_raw (Twist) → bug_IBA
+    # ── 6. Go-to-Goal ──────────────────────────────────────────────────────
     go_to_goal_node = Node(
         package='iolair',
         executable='go_to_goal',
@@ -148,33 +145,26 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 6. Bug IBA (BugReflex safety layer) — intercepts /cmd_raw → /cmd_vel
-    #       Subscribes:  /cmd_raw (Twist), /scan (LaserScan)
-    #       Publishes:   /cmd_vel (Twist), /reflex_status (String)
+    # ── 7. Bug IBA ─────────────────────────────────────────────────────────
     bug_iba_node = Node(
         package='iolair',
         executable='bug_IBA',
         name='bug_reflex',
         output='screen',
         parameters=[{
-            # Safety distances [m]
-            'warn_dist':       0.55,   # start of predictive braking zone
-            'emergency_dist':  0.22,   # triggers escape arc
-            'stop_dist':       0.10,   # triggers full stop
-            # Escape arc velocities
-            'reflex_v':        0.04,   # linear  [m/s]
-            'reflex_w':        0.65,   # angular [rad/s]
-            # Timing / hysteresis
-            'reflex_hold_ms':  350,    # minimum reflex hold time [ms]
-            'front_half_deg':  30.0,   # frontal sector half-angle [deg]
-            'side_half_deg':   35.0,   # lateral sector half-angle [deg]
-            'hysteresis':      0.06,   # deactivation margin [m]\
+            'warn_dist':      0.55,
+            'emergency_dist': 0.22,
+            'stop_dist':      0.10,
+            'reflex_v':       0.04,
+            'reflex_w':       0.65,
+            'reflex_hold_ms': 350,
+            'front_half_deg': 30.0,
+            'side_half_deg':  35.0,
+            'hysteresis':     0.06,
         }]
     )
 
-    # ── 7. Controller — PID wheel velocity controller ──────────────────────
-    #       Subscribes:  /cmd_vel, /VelocityEncR, /VelocityEncL
-    #       Publishes:   /VelocitySetR, /VelocitySetL  → firmware
+    # ── 8. Controller ──────────────────────────────────────────────────────
     controller_node = Node(
         package='iolair',
         executable='controller',
@@ -182,16 +172,16 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 8. Map Server — serves the pre-built SLAM map as /map ──────────────
+    # ── 9. Map Server ──────────────────────────────────────────────────────
     map_server_node = Node(
         package='nav2_map_server',
         executable='map_server',
         name='map_server',
         output='screen',
-        parameters=[{'yaml_filename': map_yaml}]
+        parameters=[{'yaml_filename': LaunchConfiguration('map_yaml')}]
     )
 
-    # ── 9. Nav2 Lifecycle Manager — auto-activates map_server ──────────────
+    # ── 10. Nav2 Lifecycle Manager ─────────────────────────────────────────
     lifecycle_manager_node = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
@@ -203,30 +193,41 @@ def generate_launch_description():
         ]
     )
 
-    # ── Assemble LaunchDescription ─────────────────────────────────────────
+    rviz_goal_bridge_node = Node(
+        package='iolair',
+        executable='rviz_goal_bridge',
+        name='rviz_goal_bridge',
+        output='screen',
+    )
+
+    # ── LaunchDescription ─────────────────────────────────────────────────
+    # FIX: ekf_mode_arg agregado aquí (antes faltaba)
     return LaunchDescription([
+        ekf_mode_arg,
         map_yaml_arg,
 
-        # Perception
+        # Percepción
         aruco_detector_node,
 
-        # State estimation
+        # Estimación de estado
         odometry_node,
         aruco_localizer_node,
+        aruco_map_publisher_node,
 
-        # Path planning
+        # Planeación
         astar_planner_node,
 
-        # Navigation
+        # Navegación
         go_to_goal_node,
 
-        # Safety layer
+        # Capa de seguridad
         bug_iba_node,
 
-        # Actuation
+        # Actuación
         controller_node,
 
-        # Map infrastructure
+        # Infraestructura del mapa
         map_server_node,
         lifecycle_manager_node,
+        rviz_goal_bridge_node,
     ])

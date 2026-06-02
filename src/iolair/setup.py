@@ -47,6 +47,7 @@ setup(
             'rviz_goal_bridge = iolair.goal_bridge:main',
             'mapping_node     = iolair.mapping_node:main',
             'aruco_map_publisher = iolair.aruco_map_publisher:main',
+            'mission_planner = iolair.mission_planner:main',
         ],
     },
 )

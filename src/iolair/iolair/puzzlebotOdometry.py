@@ -18,6 +18,21 @@ Two external pose sources are supported:
       Tiene prioridad más baja que MCL pero más alta que ICP.
       Útil cuando no hay mapa pero sí marcadores con posición conocida.
 
+EKF mode selection  (parámetro: ekf_mode)
+-----------------------------------------
+  odometry_only  → solo encoders, sin fuente externa (dead-reckoning puro)
+  aruco          → encoders + /aruco/pose
+  mcl            → encoders + /mcl/pose
+  icp            → encoders + /icp/pose
+  full           → todas las fuentes con la lógica de prioridad completa
+                   (MCL > ARUCO > ICP)   ← comportamiento original
+
+  Ejemplo de uso en launch:
+      parameters=[{'ekf_mode': 'aruco'}]
+
+  Ejemplo desde CLI:
+      ros2 run iolair odometry --ros-args -p ekf_mode:=mcl
+
 The node monitors BOTH topics.  Whichever one has published a message
 within the last `source_timeout` seconds is considered **active**.
 If both are active simultaneously, MCL takes priority (it is the more
@@ -57,6 +72,8 @@ UPDATE (on each incoming measurement):
 
 Parameters (--ros-args -p name:=value)
 --------------------------------------
+  ekf_mode            'full'  modo de fusión:
+                              odometry_only | aruco | mcl | icp | full
   wheel_radius        0.05   [m]
   wheel_base          0.19   [m]
   rate                50.0   [Hz]
@@ -64,7 +81,6 @@ Parameters (--ros-args -p name:=value)
   q_theta             0.01   process noise – rotation     [rad²/s]
   source_timeout      0.5    seconds of silence before MCL/ARUCO declared dead
   icp_source_timeout  2.5    seconds of silence before ICP declared dead
-                             (ICP publishes only on keyframes, not every scan)
   r_pos_default       0.1    fallback R diagonal for xy   [m²]
   r_yaw_default       0.05   fallback R diagonal for yaw  [rad²]
   max_innov_pos       1.0    innovation gate – position   [m]
@@ -80,23 +96,9 @@ Subscribes
 ----------
   /VelocityEncL    (std_msgs/Float32)
   /VelocityEncR    (std_msgs/Float32)
-  /mcl/pose        (geometry_msgs/PoseWithCovarianceStamped)
-  /icp/pose        (geometry_msgs/PoseWithCovarianceStamped)
-  /aruco/pose      (geometry_msgs/PoseWithCovarianceStamped)
-
-Fixes (v2)
-----------
-  FIX1 — Angular velocity sign corrected: w = R*(wr - wl)/L  (was wl - wr)
-  FIX2 — Wheel velocity read inside ekf_lock to prevent data race with
-          encoder callbacks running on separate executor threads.
-  FIX3 — Process noise Q = diag(q_diag)*dt only; removed erroneous
-          speed_scale multiplier that inflated covariance at high speed.
-  FIX4 — dt upper-bound tightened from 0.5 s to 0.08 s to avoid integrating
-          stale velocities after a long pause.
-  FIX5 — Innovation gate bypassed for the very first update of each source
-          so large initial offsets (common on startup) are not silently dropped.
-  FIX6 — Separate icp_source_timeout parameter (default 2.5 s) because ICP
-          only publishes on accepted keyframes, not every scan cycle.
+  /mcl/pose        (geometry_msgs/PoseWithCovarianceStamped)  si el modo lo permite
+  /icp/pose        (geometry_msgs/PoseWithCovarianceStamped)  si el modo lo permite
+  /aruco/pose      (geometry_msgs/PoseWithCovarianceStamped)  si el modo lo permite
 """
 
 import math
@@ -139,6 +141,11 @@ def euler_to_quaternion(roll: float, pitch: float, yaw: float) -> Quaternion:
     return q
 
 
+# ── valid modes ────────────────────────────────────────────────────────────────
+
+VALID_MODES = {'odometry_only', 'aruco', 'mcl', 'icp', 'full'}
+
+
 # ── source state machine ───────────────────────────────────────────────────────
 
 class SourceState:
@@ -158,6 +165,7 @@ class PuzzlebotOdometry(Node):
         super().__init__('puzzlebot_odom_ekf_node')
 
         # ── parameters ────────────────────────────────────────────────────
+        self.declare_parameter('ekf_mode',            'full')
         self.declare_parameter('initial_yaw',         0.0)
         self.declare_parameter('wheel_radius',        0.05)
         self.declare_parameter('wheel_base',          0.19)
@@ -165,32 +173,47 @@ class PuzzlebotOdometry(Node):
         self.declare_parameter('q_xy',                0.005)
         self.declare_parameter('q_theta',             0.01)
         self.declare_parameter('source_timeout',      0.5)
-        # FIX6: separate, longer timeout for ICP (keyframe-gated, not every scan)
         self.declare_parameter('icp_source_timeout',  2.5)
         self.declare_parameter('r_pos_default',       0.1)
         self.declare_parameter('r_yaw_default',       0.05)
         self.declare_parameter('max_innov_pos',       1.0)
         self.declare_parameter('max_innov_yaw',       1.5)
 
-        self._R_wheel    = self.get_parameter('wheel_radius').value
-        self._L          = self.get_parameter('wheel_base').value
-        self._rate       = self.get_parameter('rate').value
-        q_xy             = self.get_parameter('q_xy').value
-        q_th             = self.get_parameter('q_theta').value
-        self._timeout    = self.get_parameter('source_timeout').value
-        self._icp_timeout = self.get_parameter('icp_source_timeout').value  # FIX6
-        self._r_pos      = self.get_parameter('r_pos_default').value
-        self._r_yaw      = self.get_parameter('r_yaw_default').value
-        self._max_ipos   = self.get_parameter('max_innov_pos').value
-        self._max_iyaw   = self.get_parameter('max_innov_yaw').value
+        # ── ekf_mode validation ───────────────────────────────────────────
+        raw_mode = self.get_parameter('ekf_mode').value.strip().lower()
+        if raw_mode not in VALID_MODES:
+            self.get_logger().warn(
+                f'ekf_mode="{raw_mode}" no reconocido. '
+                f'Opciones válidas: {sorted(VALID_MODES)}. '
+                f'Usando "full" por defecto.'
+            )
+            raw_mode = 'full'
+        self._ekf_mode = raw_mode
+
+        # Flags de qué fuentes están habilitadas en este modo
+        self._use_mcl   = self._ekf_mode in ('mcl',   'full')
+        self._use_icp   = self._ekf_mode in ('icp',   'full')
+        self._use_aruco = self._ekf_mode in ('aruco', 'full')
+
+        self._R_wheel     = self.get_parameter('wheel_radius').value
+        self._L           = self.get_parameter('wheel_base').value
+        self._rate        = self.get_parameter('rate').value
+        q_xy              = self.get_parameter('q_xy').value
+        q_th              = self.get_parameter('q_theta').value
+        self._timeout     = self.get_parameter('source_timeout').value
+        self._icp_timeout = self.get_parameter('icp_source_timeout').value
+        self._r_pos       = self.get_parameter('r_pos_default').value
+        self._r_yaw       = self.get_parameter('r_yaw_default').value
+        self._max_ipos    = self.get_parameter('max_innov_pos').value
+        self._max_iyaw    = self.get_parameter('max_innov_yaw').value
 
         self._Q_diag = np.array([q_xy, q_xy, q_th])
 
         # ── EKF state ─────────────────────────────────────────────────────
-        self._x  = np.zeros(3)
+        self._x    = np.zeros(3)
         self._x[2] = self.get_parameter('initial_yaw').value
-        self._P  = np.diag([1e-6, 1e-6, 1e-6])
-        self._I3 = np.eye(3)
+        self._P    = np.diag([1e-6, 1e-6, 1e-6])
+        self._I3   = np.eye(3)
 
         # ── wheel velocities ──────────────────────────────────────────────
         self._wl = 0.0
@@ -201,7 +224,6 @@ class PuzzlebotOdometry(Node):
         self._last_icp_t:   float = -1.0
         self._last_aruco_t: float = -1.0
 
-        # FIX5: track whether each source has ever been fused (bypass gate on first update)
         self._mcl_initialised   = False
         self._icp_initialised   = False
         self._aruco_initialised = False
@@ -210,8 +232,6 @@ class PuzzlebotOdometry(Node):
         self._prev_source    = SourceState.PREDICT_ONLY
 
         # ── lock ──────────────────────────────────────────────────────────
-        # Single lock guards: EKF state (_x, _P), wheel velocities (_wl, _wr),
-        # and source timestamps / initialisation flags.
         self._ekf_lock = threading.Lock()
 
         # ── QoS ───────────────────────────────────────────────────────────
@@ -221,15 +241,20 @@ class PuzzlebotOdometry(Node):
             depth=10,
         )
 
-        # ── subscribers ───────────────────────────────────────────────────
+        # ── subscribers (encoders siempre activos) ────────────────────────
         self.create_subscription(Float32, '/VelocityEncL', self._cb_enc_l, enc_qos)
         self.create_subscription(Float32, '/VelocityEncR', self._cb_enc_r, enc_qos)
-        self.create_subscription(
-            PoseWithCovarianceStamped, '/mcl/pose',   self._cb_mcl,   10)
-        self.create_subscription(
-            PoseWithCovarianceStamped, '/icp/pose',   self._cb_icp,   10)
-        self.create_subscription(
-            PoseWithCovarianceStamped, '/aruco/pose', self._cb_aruco, 10)
+
+        # Fuentes externas: solo se suscriben si el modo las habilita
+        if self._use_mcl:
+            self.create_subscription(
+                PoseWithCovarianceStamped, '/mcl/pose', self._cb_mcl, 10)
+        if self._use_icp:
+            self.create_subscription(
+                PoseWithCovarianceStamped, '/icp/pose', self._cb_icp, 10)
+        if self._use_aruco:
+            self.create_subscription(
+                PoseWithCovarianceStamped, '/aruco/pose', self._cb_aruco, 10)
 
         # ── publishers ────────────────────────────────────────────────────
         self._pub_odom   = self.create_publisher(Odometry, '/odom', 10)
@@ -241,23 +266,27 @@ class PuzzlebotOdometry(Node):
         self.create_timer(1.0 / self._rate, self._predict_and_publish)
         self.create_timer(0.2, self._watchdog)
 
+        # ── log de modo activo ────────────────────────────────────────────
+        sources_enabled = []
+        if self._use_mcl:   sources_enabled.append('/mcl/pose')
+        if self._use_aruco: sources_enabled.append('/aruco/pose')
+        if self._use_icp:   sources_enabled.append('/icp/pose')
+        sources_str = ', '.join(sources_enabled) if sources_enabled else 'ninguna (dead-reckoning)'
+
         self.get_logger().info(
-            f'EKF Odometry started — '
-            f'r={self._R_wheel} m, L={self._L} m, '
-            f'rate={self._rate} Hz, timeout={self._timeout} s, '
-            f'icp_timeout={self._icp_timeout} s\n'
-            f'Waiting for /mcl/pose, /icp/pose or /aruco/pose ...'
+            f'EKF Odometry iniciado\n'
+            f'  ekf_mode  : {self._ekf_mode}\n'
+            f'  Fuentes   : {sources_str}\n'
+            f'  r={self._R_wheel} m, L={self._L} m, rate={self._rate} Hz'
         )
 
     # ── encoder callbacks ──────────────────────────────────────────────────────
 
     def _cb_enc_l(self, msg: Float32):
-        # FIX2: protect wheel velocity writes with the EKF lock
         with self._ekf_lock:
             self._wl = msg.data
 
     def _cb_enc_r(self, msg: Float32):
-        # FIX2: protect wheel velocity writes with the EKF lock
         with self._ekf_lock:
             self._wr = msg.data
 
@@ -295,22 +324,44 @@ class PuzzlebotOdometry(Node):
             last_icp   = self._last_icp_t
             last_aruco = self._last_aruco_t
 
-        mcl_ok   = (last_mcl   > 0 and now - last_mcl   < self._timeout)
-        # FIX6: ICP uses its own (longer) timeout
-        icp_ok   = (last_icp   > 0 and now - last_icp   < self._icp_timeout)
-        aruco_ok = (last_aruco > 0 and now - last_aruco < self._timeout)
+        # Solo considerar fuentes que el modo habilita
+        mcl_ok   = (self._use_mcl   and
+                    last_mcl   > 0 and now - last_mcl   < self._timeout)
+        icp_ok   = (self._use_icp   and
+                    last_icp   > 0 and now - last_icp   < self._icp_timeout)
+        aruco_ok = (self._use_aruco and
+                    last_aruco > 0 and now - last_aruco < self._timeout)
 
-        if mcl_ok:
-            new_state = SourceState.MCL_PRIORITY if (icp_ok or aruco_ok) \
-                        else SourceState.MCL_ACTIVE
-        elif aruco_ok and icp_ok:
-            new_state = SourceState.ARUCO_PRIORITY
-        elif aruco_ok:
-            new_state = SourceState.ARUCO_ACTIVE
-        elif icp_ok:
-            new_state = SourceState.ICP_ACTIVE
-        else:
+        # Modo odometry_only: siempre PREDICT_ONLY
+        if self._ekf_mode == 'odometry_only':
             new_state = SourceState.PREDICT_ONLY
+
+        # Modos de fuente única: sin lógica de prioridad
+        elif self._ekf_mode == 'mcl':
+            new_state = SourceState.MCL_ACTIVE if mcl_ok \
+                        else SourceState.PREDICT_ONLY
+
+        elif self._ekf_mode == 'icp':
+            new_state = SourceState.ICP_ACTIVE if icp_ok \
+                        else SourceState.PREDICT_ONLY
+
+        elif self._ekf_mode == 'aruco':
+            new_state = SourceState.ARUCO_ACTIVE if aruco_ok \
+                        else SourceState.PREDICT_ONLY
+
+        # Modo full: lógica de prioridad completa (MCL > ARUCO > ICP)
+        else:
+            if mcl_ok:
+                new_state = SourceState.MCL_PRIORITY if (icp_ok or aruco_ok) \
+                            else SourceState.MCL_ACTIVE
+            elif aruco_ok and icp_ok:
+                new_state = SourceState.ARUCO_PRIORITY
+            elif aruco_ok:
+                new_state = SourceState.ARUCO_ACTIVE
+            elif icp_ok:
+                new_state = SourceState.ICP_ACTIVE
+            else:
+                new_state = SourceState.PREDICT_ONLY
 
         self._current_source = new_state
         self._log_source_change()
@@ -324,22 +375,24 @@ class PuzzlebotOdometry(Node):
         self._prev_source = self._current_source
 
         labels = {
-            SourceState.PREDICT_ONLY:   '⚠  PREDICT_ONLY   — no external correction (covariance growing)',
-            SourceState.MCL_ACTIVE:     '✓  MCL_ACTIVE     — localisation mode (/mcl/pose)',
-            SourceState.ICP_ACTIVE:     '✓  ICP_ACTIVE     — mapping mode (/icp/pose)',
-            SourceState.ARUCO_ACTIVE:   '✓  ARUCO_ACTIVE   — ArUco triangulation (/aruco/pose)',
-            SourceState.MCL_PRIORITY:   '✓  MCL_PRIORITY   — MCL selected (beats ARUCO/ICP)',
-            SourceState.ARUCO_PRIORITY: '✓  ARUCO_PRIORITY — ARUCO selected (beats ICP)',
+            SourceState.PREDICT_ONLY:   '⚠  PREDICT_ONLY   — sin corrección externa (covarianza creciendo)',
+            SourceState.MCL_ACTIVE:     '✓  MCL_ACTIVE     — modo localización (/mcl/pose)',
+            SourceState.ICP_ACTIVE:     '✓  ICP_ACTIVE     — modo mapeo (/icp/pose)',
+            SourceState.ARUCO_ACTIVE:   '✓  ARUCO_ACTIVE   — triangulación ArUco (/aruco/pose)',
+            SourceState.MCL_PRIORITY:   '✓  MCL_PRIORITY   — MCL seleccionado (gana a ARUCO/ICP)',
+            SourceState.ARUCO_PRIORITY: '✓  ARUCO_PRIORITY — ARUCO seleccionado (gana a ICP)',
         }
         label = labels[self._current_source]
 
         if self._current_source == SourceState.PREDICT_ONLY:
-            self.get_logger().warn(f'EKF source → {label}')
+            self.get_logger().warn(
+                f'[ekf_mode={self._ekf_mode}] EKF source → {label}')
         else:
-            self.get_logger().info(f'EKF source → {label}')
+            self.get_logger().info(
+                f'[ekf_mode={self._ekf_mode}] EKF source → {label}')
 
         msg = String()
-        msg.data = self._current_source
+        msg.data = f'{self._ekf_mode}:{self._current_source}'
         self._pub_source.publish(msg)
 
     # ── EKF PREDICT ───────────────────────────────────────────────────────────
@@ -347,30 +400,24 @@ class PuzzlebotOdometry(Node):
     def _predict_and_publish(self):
         now = self.get_clock().now()
         dt  = (now - self._last_time).nanoseconds / 1e9
-        # FIX4: tightened upper bound — 0.08 s (~4 cycles) instead of 0.5 s
         if dt < 0.001 or dt > 0.08:
             self._last_time = now
             return
         self._last_time = now
 
         with self._ekf_lock:
-            # FIX2: read wheel velocities inside the lock
             wl = self._wl
             wr = self._wr
 
-            # FIX1: correct sign — standard differential drive is (wr - wl)/L
             v = self._R_wheel * (wr + wl) / 2.0
             w = self._R_wheel * (wr - wl) / self._L
 
             th = self._x[2]
 
-            # State prediction
             self._x[0] += v * math.cos(th) * dt
             self._x[1] += v * math.sin(th) * dt
             self._x[2]  = normalize_angle(th + w * dt)
 
-            # Covariance prediction
-            # FIX3: Q = diag(q_diag) * dt only — no speed_scale multiplier
             F = np.array([
                 [1.0, 0.0, -v * math.sin(th) * dt],
                 [0.0, 1.0,  v * math.cos(th) * dt],
@@ -387,16 +434,6 @@ class PuzzlebotOdometry(Node):
     # ── EKF UPDATE ────────────────────────────────────────────────────────────
 
     def _ekf_update(self, msg: PoseWithCovarianceStamped, source: str):
-        """
-        EKF measurement update for a direct pose observation (H = I).
-
-        y  = z − x̂
-        S  = P + R          (because H = I)
-        K  = P @ S⁻¹
-        x̂  = x̂ + K @ y
-        P  = (I−K)P(I−K)ᵀ + KRKᵀ   Joseph form — numerically stable
-        P  = (P+Pᵀ)/2                symmetry enforcement
-        """
         z_x   = msg.pose.pose.position.x
         z_y   = msg.pose.pose.position.y
         z_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
@@ -408,7 +445,6 @@ class PuzzlebotOdometry(Node):
         R    = np.diag([r_xx, r_yy, r_tt])
 
         with self._ekf_lock:
-            # FIX5: determine whether this source has been initialised yet
             if source == 'MCL':
                 first_update = not self._mcl_initialised
                 self._mcl_initialised = True
@@ -423,13 +459,11 @@ class PuzzlebotOdometry(Node):
                           z_y   - self._x[1],
                           normalize_angle(z_yaw - self._x[2])])
 
-            # FIX5: bypass innovation gate on the very first update from a
-            #        source so large startup offsets are not silently dropped.
             if not first_update:
                 if (math.hypot(y[0], y[1]) > self._max_ipos or
                         abs(y[2]) > self._max_iyaw):
                     self.get_logger().warn(
-                        f'[{source}] update REJECTED — '
+                        f'[{source}] update RECHAZADO — '
                         f'Δpos={math.hypot(y[0],y[1]):.3f} m, '
                         f'Δyaw={math.degrees(y[2]):.1f}°'
                     )
@@ -473,11 +507,9 @@ class PuzzlebotOdometry(Node):
 
         odom.twist.twist.linear.x  = v
         odom.twist.twist.angular.z = w
-        # Fixed: twist covariance uses physically meaningful velocity uncertainty,
-        # not the process-noise q_xy which has different units/semantics.
         tc = [0.0] * 36
-        tc[0]  = 0.01   # linear velocity uncertainty (m/s)²
-        tc[35] = 0.01   # angular velocity uncertainty (rad/s)²
+        tc[0]  = 0.01
+        tc[35] = 0.01
         odom.twist.covariance = tc
 
         self._pub_odom.publish(odom)
