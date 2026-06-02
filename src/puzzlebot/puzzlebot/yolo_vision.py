@@ -19,7 +19,7 @@ Uso:
 # CONFIGURACION — edita solo este bloque
 # =============================================================
 WEIGHTS      = "src/puzzlebot/weights/best.pt"
-CAMERA_TOPIC = "/camera/image_raw/compressed"
+CAMERA_TOPIC = "/camera_raw/compressed"
 CONF         = 0.65
 DEVICE       = "0"                     # "0" = GPU, "cpu" = CPU
 IMGSZ        = 320
