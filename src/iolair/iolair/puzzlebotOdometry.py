@@ -279,6 +279,7 @@ class PuzzlebotOdometry(Node):
         with self._ekf_lock:
             self._last_mcl_t = time.monotonic()
         self._update_source_state()
+        # MCL solo actualiza si ArUco no está disponible (ArUco tiene prioridad)
         if self._current_source in (SourceState.MCL_ACTIVE,
                                     SourceState.MCL_PRIORITY):
             self._ekf_update(msg, 'MCL')
@@ -287,6 +288,7 @@ class PuzzlebotOdometry(Node):
         with self._ekf_lock:
             self._last_icp_t = time.monotonic()
         self._update_source_state()
+        # ICP solo actualiza si ni ArUco ni MCL están disponibles
         if self._current_source == SourceState.ICP_ACTIVE:
             self._ekf_update(msg, 'ICP')
 
@@ -294,6 +296,7 @@ class PuzzlebotOdometry(Node):
         with self._ekf_lock:
             self._last_aruco_t = time.monotonic()
         self._update_source_state()
+        # ArUco siempre actualiza cuando está activo (prioridad máxima)
         if self._current_source in (SourceState.ARUCO_ACTIVE,
                                     SourceState.ARUCO_PRIORITY):
             self._ekf_update(msg, 'ARUCO')
@@ -312,13 +315,16 @@ class PuzzlebotOdometry(Node):
         icp_ok   = (last_icp   > 0 and now - last_icp   < self._icp_timeout)
         aruco_ok = (last_aruco > 0 and now - last_aruco < self._timeout)
 
-        if mcl_ok:
-            new_state = SourceState.MCL_PRIORITY if (icp_ok or aruco_ok) \
-                        else SourceState.MCL_ACTIVE
+        # Prioridad: ArUco (más preciso cuando hay marcadores) > MCL > ICP
+        if aruco_ok and mcl_ok:
+            new_state = SourceState.ARUCO_PRIORITY   # ArUco gana sobre MCL
         elif aruco_ok and icp_ok:
-            new_state = SourceState.ARUCO_PRIORITY
+            new_state = SourceState.ARUCO_PRIORITY   # ArUco gana sobre ICP
         elif aruco_ok:
             new_state = SourceState.ARUCO_ACTIVE
+        elif mcl_ok:
+            new_state = SourceState.MCL_PRIORITY if icp_ok \
+                        else SourceState.MCL_ACTIVE
         elif icp_ok:
             new_state = SourceState.ICP_ACTIVE
         else:

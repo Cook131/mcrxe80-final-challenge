@@ -8,7 +8,7 @@ Launches the full navigation stack for the Puzzlebot using:
                                             publishes TF: map → odom → base_link
   - A* Planner            (iolair pkg)    — path planning on occupancy grid
   - Go-to-Goal            (iolair pkg)    — drives toward each A* waypoint
-  - Bug IBA / BugReflex   (iolair pkg)    — safety reflex layer (LiDAR-based)
+  - Bug IBA / BugReflex   (iolair pkg)    — safety reflex layer BUG2 (LiDAR-based)
   - Controller            (iolair pkg)    — PID wheel velocity controller
   - Map Server            (nav2)          — serves the pre-built SLAM map
   - Nav2 Lifecycle Mgr    (nav2)          — activates map_server automatically
@@ -30,25 +30,27 @@ Robot geometry (Puzzlebot)
 
 Parameter derivation
 --------------------
-  stop_dist      = diagonal + 5 cm safety margin  = 0.186 + 0.05  ≈ 0.24 m
-  emergency_dist = stop + braking distance at max_v over hold_ms
-                 = 0.24 + 0.22*0.35                              ≈ 0.32 m
-  warn_dist      = emergency + soft-braking zone                  = 0.65 m  (unchanged)
-  hysteresis     = ~25% of (emergency - stop) gap
-                 = 0.25 * (0.32-0.24)                             ≈ 0.03 m
-  inflation_r    = half-width + 10 cm clearance  = 0.11 + 0.10   = 0.21 m
-                   (was 0.35 — overly conservative, caused narrow-passage failures)
-  reflex_v       = reduced to 0.08 m/s (was 0.14) — safer arc speed in tight spaces
+  stop_dist        = diagonal + 5 cm safety margin  = 0.186 + 0.05  ≈ 0.24 m
+  emergency_dist   = stop + braking distance at max_v over hold_ms
+                   = 0.24 + 0.22*0.35                              ≈ 0.32 m
+  warn_dist        = emergency + soft-braking zone                  = 0.65 m  (unchanged)
+  hysteresis       = ~25% of (emergency - stop) gap
+                   = 0.25 * (0.32-0.24)                             ≈ 0.03 m
+  inflation_r      = half-width + 10 cm clearance  = 0.11 + 0.10   = 0.21 m
+                     (was 0.35 — overly conservative, caused narrow-passage failures)
+  reflex_v         = reduced to 0.08 m/s (was 0.14) — safer arc speed in tight spaces
+  m_line_tol       = 0.12 m — tolerancia perpendicular a línea M de BUG2
+  bug2_min_follow  = 0.20 m — distancia mínima wall-follow antes de chequear salida
 """
 
 import os
+import math
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-import math
 
 
 def generate_launch_description():
@@ -59,7 +61,7 @@ def generate_launch_description():
     # ── Launch arguments ───────────────────────────────────────────────────
     map_yaml_arg = DeclareLaunchArgument(
         'map_yaml',
-        default_value=os.path.join(iolair_dir, 'maps', 'SLAM_map.yaml'),
+        default_value=os.path.join(iolair_dir, 'maps', 'map_pista.yaml'),
         description='Absolute path to the map YAML file'
     )
     map_yaml = LaunchConfiguration('map_yaml')
@@ -84,7 +86,7 @@ def generate_launch_description():
             'wheel_radius': 0.05,
             'wheel_base':   0.19,
             'rate':         50.0,
-            'initial_yaw': math.pi,
+            'initial_yaw':  math.pi,
         }]
     )
 
@@ -153,31 +155,36 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 7. Bug IBA — safety reflex layer, intercepts /cmd_raw → /cmd_vel ───
+    # ── 7. Bug IBA — safety reflex layer BUG2, intercepts /cmd_raw → /cmd_vel
     #
-    # stop_dist      0.24m  robot diagonal (0.186) + 5cm margin
-    # emergency_dist 0.32m  unchanged — correct for max_v + hold_ms
-    # warn_dist      0.65m  unchanged — good soft-braking zone
-    # hysteresis     0.03m  was 0.08 — reduced to 25% of (emg-stop) gap;
-    #                        0.08 consumed 67% of that gap causing sticky TURN
-    # reflex_v       0.08   was 0.14 — lower arc speed in tight obstacles
-    # reflex_w       0.50   unchanged
+    # stop_dist        0.24m  robot diagonal (0.186) + 5cm margin
+    # emergency_dist   0.32m  unchanged — correct for max_v + hold_ms
+    # warn_dist        0.65m  unchanged — good soft-braking zone
+    # hysteresis       0.03m  was 0.08 — reduced to 25% of (emg-stop) gap;
+    #                          0.08 consumed 67% of that gap causing sticky TURN
+    # reflex_v         0.08   was 0.14 — safer arc speed in tight spaces
+    # reflex_w         0.50   unchanged
+    # m_line_tol       0.12m  BUG2 v4.0 — tolerancia perpendicular a línea M
+    # bug2_min_follow  0.20m  BUG2 v4.0 — distancia mínima wall-follow antes
+    #                          de chequear salida (evita salir en el hit point)
     bug_iba_node = Node(
         package='iolair',
         executable='bug_IBA',
         name='bug_reflex',
         output='screen',
         parameters=[{
-            'warn_dist':          0.65,   # unchanged
-            'emergency_dist':     0.32,   # unchanged
-            'stop_dist':          0.24,   # was 0.20 — below robot diagonal!
-            'reflex_v':           0.08,   # was 0.14 — safer in tight spaces
-            'reflex_w':           0.50,   # unchanged
-            'reflex_hold_ms':     350,    # unchanged
-            'front_half_deg':     30.0,   # unchanged
-            'side_half_deg':      35.0,   # unchanged
-            'hysteresis':         0.03,   # was 0.08 — was too sticky
-            'replan_cooldown_s':  2.0,    # new param (v3.0)
+            'warn_dist':           0.45,   # unchanged
+            'emergency_dist':      0.22,   # unchanged
+            'stop_dist':           0.13,   # was 0.20 — below robot diagonal!
+            'reflex_v':            0.1,   # was 0.14 — safer in tight spaces
+            'reflex_w':            0.50,   # unchanged
+            'reflex_hold_ms':      350,    # unchanged
+            'front_half_deg':      30.0,   # unchanged
+            'side_half_deg':       35.0,   # unchanged
+            'hysteresis':          0.03,   # was 0.08 — was too sticky
+            'replan_cooldown_s':   2.0,    # v3.0
+            'm_line_tol':          0.12,   # v4.0 BUG2 — tolerancia línea M
+            'bug2_min_follow_m':   0.20,   # v4.0 BUG2 — distancia mínima wall-follow
         }]
     )
 
@@ -227,9 +234,9 @@ def generate_launch_description():
             'beam_skip':        6,
             'lidar_yaw_offset': math.pi,
             'initial_yaw':      math.pi,
-            'map_frame':       'map',
-            'odom_frame':      'odom',
-            'base_frame':      'base_link',
+            'map_frame':        'map',
+            'odom_frame':       'odom',
+            'base_frame':       'base_link',
         }]
     )
 
