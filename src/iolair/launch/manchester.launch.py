@@ -61,7 +61,7 @@ def generate_launch_description():
     # ── Launch arguments ───────────────────────────────────────────────────
     map_yaml_arg = DeclareLaunchArgument(
         'map_yaml',
-        default_value=os.path.join(iolair_dir, 'maps', 'map_pista.yaml'),
+        default_value=os.path.join(iolair_dir, 'maps', 'SLAM_map.yaml'),
         description='Absolute path to the map YAML file'
     )
     map_yaml = LaunchConfiguration('map_yaml')
