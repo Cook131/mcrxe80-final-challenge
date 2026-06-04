@@ -3,28 +3,36 @@
 ArUco Detector Doble-Diccionario + QR Node para Puzzlebot - Manchester Robotics
 
 Detecta marcadores usando DOS diccionarios en paralelo + QR codes:
-  - Diccionario 4X4_50  IDs 0-2  → External WP 1, 2, 3   (paredes)
-  - Diccionario 4X4_50  IDs 3-5  → Internal WP 1, 2, 3   (objetivos internos)
-  - Diccionario 6X6_50  IDs 0-6  → Waypoint_0 … Waypoint_6
-  - QR codes                     → contenido del QR como string
+  - Diccionario 4X4_50  IDs 0-4   → External WP 1…5  (paredes/esquinas)
+  - Diccionario 4X4_50  IDs 5-8   → Internal WP 1…4  (objetivos internos)
+  - Diccionario 4X4_50  IDs 9-10  → External WP 6-7  (también externos)
+  - QR codes                      → contenido del QR + distancia/ángulo
+
+Mapeo de IDs publicados:
+  20…29  → External WPs  (4X4_50 IDs 0-4, 9-10 → pub 20-24, 29-30)
+  10…15  → Internal WPs  (4X4_50 IDs 5-8   → pub 10-13)
 
 Tópicos:
-  Suscribe:  /camera/image_raw/compressed  (sensor_msgs/CompressedImage)
-  Publica:   /aruco/id                     (std_msgs/msg/Int32)
-             /aruco/label                  (std_msgs/msg/String)
-             /aruco/imagen                 (sensor_msgs/msg/Image)
-             /aruco/waypoint               (geometry_msgs/msg/PoseStamped)
-             /aruco/qr                     (std_msgs/msg/String)
-             /aruco/distance               (std_msgs/msg/Float32)  metros en plano XZ
-             /aruco/angle                  (std_msgs/msg/Float32)  grados, + = derecha
+  Suscribe:  /camera_raw/compressed   (sensor_msgs/CompressedImage)
 
-  11…16        → Internal WP 1…6   (4X4_50 IDs 5-10)
-  20…24        → External WP 1…5   (4X4_50 IDs 0-4)
+  Publica (ArUco):
+             /aruco/id                (std_msgs/msg/Int32)
+             /aruco/label             (std_msgs/msg/String)
+             /aruco/imagen            (sensor_msgs/msg/Image)
+             /aruco/waypoint          (geometry_msgs/msg/PoseStamped)
+             /aruco/distance          (std_msgs/msg/Float32)  metros en plano XZ
+             /aruco/angle             (std_msgs/msg/Float32)  grados, + = derecha
+
+  Publica (QR):
+             /aruco/qr                (std_msgs/msg/String)   contenido del QR
+             /aruco/qr/distance       (std_msgs/msg/Float32)  metros en plano XZ
+             /aruco/qr/angle          (std_msgs/msg/Float32)  grados, + = derecha
 
 Calibración:
   Busca automáticamente camera_params.npz o camera_params.json
   en la misma carpeta que este script.
   Calibración esperada a 1080x720 (resolución de entrada de la cámara).
+  El tamaño físico del QR se configura con el parámetro 'qr_size' (default 0.08 m).
 """
 
 import json
@@ -57,12 +65,8 @@ LABEL_INTERNAL = {
     8: "Internal WP 4", 9: "Internal WP 5", 10: "Internal WP 6",
 }
 
-WAYPOINT_6X6_IDS = set(range(7))
-
-def label_6x6(mid: int) -> str:        return f"Waypoint_{mid}"
 def external_pub_id(mid: int) -> int:  return 20 + mid
 def internal_pub_id(mid: int) -> int:  return 10 + (mid - 5)   # 5→10 … 10→15
-def waypoint_pub_id(mid: int) -> int:  return 30 + mid
 
 # ─────────────────────────────────────────────────────────────────────
 # Calibración
@@ -132,6 +136,7 @@ def _to_posestamped(rvec, tvec) -> PoseStamped:
 class ArucoDetectorNode(Node):
 
     MARKER_SIZE = 0.095   # metros — medir marcador físico con regla
+    QR_SIZE     = 0.08    # metros — medir el QR físico con regla
 
     def __init__(self):
         super().__init__('aruco_detector')
@@ -142,11 +147,13 @@ class ArucoDetectorNode(Node):
         self.declare_parameter('unknown_id',    -1)
         self.declare_parameter('calib_file',    '')
         self.declare_parameter('marker_size',   self.MARKER_SIZE)
+        self.declare_parameter('qr_size',       self.QR_SIZE)
         # Offset cámara→base_link en metros [x, y, z] (frame de cámara)
         self.declare_parameter('cam_offset', [0.10, 0.0, 0.13])
 
         camera_topic     = self.get_parameter('camera_topic').value
         self.marker_size = float(self.get_parameter('marker_size').value)
+        self.qr_size     = float(self.get_parameter('qr_size').value)
 
         # ── Calibración ───────────────────────────────────────────────
         self.camera_matrix = None
@@ -175,7 +182,6 @@ class ArucoDetectorNode(Node):
         # ── Detectores ────────────────────────────────────────────────
         self.bridge      = CvBridge()
         self.det_4x4     = self._build_4x4_detector()
-        self.det_6x6     = self._build_6x6_detector()
         self.qr_detector = cv2.QRCodeDetector()
 
         # ── Suscriptor — CompressedImage ──────────────────────────────
@@ -195,21 +201,21 @@ class ArucoDetectorNode(Node):
         self.pub_label    = self.create_publisher(String,      '/aruco/label',    10)
         self.pub_image    = self.create_publisher(Image,       '/aruco/imagen',   10)
         self.pub_waypoint = self.create_publisher(PoseStamped, '/aruco/waypoint', 10)
-        self.pub_qr       = self.create_publisher(String,      '/aruco/qr',       10)
-        self.pub_distance = self.create_publisher(Float32,     '/aruco/distance', 10)
-        self.pub_angle    = self.create_publisher(Float32,     '/aruco/angle',    10)
+        self.pub_qr          = self.create_publisher(String,  '/aruco/qr',          10)
+        self.pub_qr_distance = self.create_publisher(Float32, '/aruco/qr/distance', 10)
+        self.pub_qr_angle    = self.create_publisher(Float32, '/aruco/qr/angle',    10)
+        self.pub_distance    = self.create_publisher(Float32, '/aruco/distance',    10)
+        self.pub_angle       = self.create_publisher(Float32, '/aruco/angle',       10)
 
         self._prev_key = None
         self._prev_qr  = ""
 
         self.get_logger().info(
             f"ArUco Dual-Dict + QR listo | topic: {camera_topic}\n"
-            f"  4X4_50 IDs 0-2 → External WPs (pub 20-22)\n"
-            f"  4X4_50 IDs 3-5 → Internal WPs (pub 11-13)\n"
-            f"  6X6_50 IDs 0-6 → Waypoints    (pub 30-36)\n"
-            f"  QR → /aruco/qr\n"
-            f"  /aruco/distance → dist plano XZ (metros)\n"
-            f"  /aruco/angle    → bearing horizontal (grados)"
+            f"  4X4_50 IDs 0-4,9-10 → External WPs (pub 20-24, 29-30)\n"
+            f"  4X4_50 IDs 5-8      → Internal WPs (pub 10-13)\n"
+            f"  QR → /aruco/qr  |  /aruco/qr/distance  |  /aruco/qr/angle\n"
+            f"  ArUco → /aruco/distance  |  /aruco/angle"
         )
 
     # ─────────────────────────────────────────────────────────────────
@@ -220,10 +226,6 @@ class ArucoDetectorNode(Node):
         d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         return cv2.aruco.ArucoDetector(d, cv2.aruco.DetectorParameters())
 
-    def _build_6x6_detector(self):
-        d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_50)
-        return cv2.aruco.ArucoDetector(d, cv2.aruco.DetectorParameters())
-
     # ─────────────────────────────────────────────────────────────────
     # Detección
     # ─────────────────────────────────────────────────────────────────
@@ -231,7 +233,6 @@ class ArucoDetectorNode(Node):
     def _detect_all(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners_4x4, ids_4x4, _ = self.det_4x4.detectMarkers(gray)
-        corners_6x6, ids_6x6, _ = self.det_6x6.detectMarkers(gray)
 
         qr_data, qr_points, _ = self.qr_detector.detectAndDecode(frame)
         qr_data   = qr_data or ""
@@ -246,13 +247,7 @@ class ArucoDetectorNode(Node):
                 elif mid in INTERNAL_4X4_IDS:
                     internal_hits.append((mid, corners_4x4[i]))
 
-        wp6x6_hits = []
-        if ids_6x6 is not None:
-            for i, mid in enumerate(ids_6x6.flatten()):
-                if int(mid) in WAYPOINT_6X6_IDS:
-                    wp6x6_hits.append((int(mid), corners_6x6[i]))
-
-        return external_hits, internal_hits, wp6x6_hits, qr_data, qr_points
+        return external_hits, internal_hits, qr_data, qr_points
 
     # ─────────────────────────────────────────────────────────────────
     # Pose
@@ -349,7 +344,7 @@ class ArucoDetectorNode(Node):
         cv2.circle(out, (cx, cy), 2, color, -1, cv2.LINE_AA)
 
     def _annotate(self, frame, external_hits, internal_hits,
-                  wp6x6_hits, qr_data, qr_points, poses_ext, poses_int, poses_6x6):
+                  qr_data, qr_points, poses_ext, poses_int):
         out = frame.copy()
         for i, (mid, corner) in enumerate(external_hits):
             rv, tv = poses_ext[i]
@@ -357,9 +352,6 @@ class ArucoDetectorNode(Node):
         for i, (mid, corner) in enumerate(internal_hits):
             rv, tv = poses_int[i]
             self._draw_marker(out, corner, LABEL_INTERNAL[mid], (0, 255, 0),   rv, tv)
-        for i, (mid, corner) in enumerate(wp6x6_hits):
-            rv, tv = poses_6x6[i]
-            self._draw_marker(out, corner, label_6x6(mid),      (255, 128, 0), rv, tv)
         if qr_data:
             self._draw_qr(out, qr_data, qr_points)
         self._draw_crosshair(out)
@@ -376,39 +368,57 @@ class ArucoDetectorNode(Node):
             self.get_logger().error(f"Error decodificando imagen comprimida: {e}")
             return
 
-        external_hits, internal_hits, wp6x6_hits, qr_data, qr_points = \
+        external_hits, internal_hits, qr_data, qr_points = \
             self._detect_all(frame)
 
         unknown_id = self.get_parameter('unknown_id').value
 
         poses_ext  = [self._estimate_pose(c) for _, c in external_hits]
         poses_int  = [self._estimate_pose(c) for _, c in internal_hits]
-        poses_6x6  = [self._estimate_pose(c) for _, c in wp6x6_hits]
 
         # ── QR ────────────────────────────────────────────────────────
-        if qr_data and qr_data != self._prev_qr:
-            self.pub_qr.publish(String(data=qr_data))
-            self.get_logger().info(f"  [QR] {qr_data}")
-            self._prev_qr = qr_data
+        if qr_data and qr_points is not None:
+            if qr_data != self._prev_qr:
+                self.pub_qr.publish(String(data=qr_data))
+                self.get_logger().info(f"  [QR] {qr_data}")
+                self._prev_qr = qr_data
+
+            # Pose del QR con solvePnP — misma técnica que los ArUcos.
+            # qr_points shape: (1,4,2), orden OpenCV: TL, TR, BR, BL.
+            if self.pose_ready:
+                half_qr = self.qr_size / 2.0
+                qr_obj_pts = np.array([
+                    [-half_qr,  half_qr, 0],
+                    [ half_qr,  half_qr, 0],
+                    [ half_qr, -half_qr, 0],
+                    [-half_qr, -half_qr, 0],
+                ], dtype=np.float32)
+                ok_qr, _, qr_tvec = cv2.solvePnP(
+                    qr_obj_pts,
+                    qr_points[0].astype(np.float32),
+                    self.camera_matrix, self.dist_coeffs,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE,
+                )
+                if ok_qr:
+                    _, dist_xz_qr, angle_h_qr, _ = self._angle_distance(
+                        qr_tvec.flatten())
+                    self.pub_qr_distance.publish(Float32(data=float(dist_xz_qr)))
+                    self.pub_qr_angle.publish(Float32(data=float(angle_h_qr)))
         elif not qr_data:
             self._prev_qr = ""
 
         # ── ArUcos ────────────────────────────────────────────────────
-        any_aruco = external_hits or internal_hits or wp6x6_hits
+        any_aruco = external_hits or internal_hits
 
         if any_aruco:
             if internal_hits:
                 mid    = internal_hits[0][0]
                 pub_id = internal_pub_id(mid)
                 label  = LABEL_INTERNAL[mid]
-            elif external_hits:
+            else:
                 mid    = external_hits[0][0]
                 pub_id = external_pub_id(mid)
                 label  = LABEL_EXTERNAL[mid]
-            else:
-                mid    = wp6x6_hits[0][0]
-                pub_id = waypoint_pub_id(mid)
-                label  = label_6x6(mid)
 
             self.pub_id.publish(Int32(data=pub_id))
             self.pub_label.publish(String(data=label))
@@ -416,7 +426,6 @@ class ArucoDetectorNode(Node):
             for poses, hits in [
                 (poses_ext,  external_hits),
                 (poses_int,  internal_hits),
-                (poses_6x6,  wp6x6_hits),
             ]:
                 for i, (_, _corner) in enumerate(hits):
                     rv, tv = poses[i]
@@ -429,13 +438,11 @@ class ArucoDetectorNode(Node):
             curr_key = (
                 tuple(sorted(h[0] for h in external_hits)),
                 tuple(sorted(h[0] for h in internal_hits)),
-                tuple(sorted(h[0] for h in wp6x6_hits)),
             )
             if curr_key != self._prev_key:
                 for hits, poses, label_fn, id_fn, tag in [
                     (external_hits, poses_ext, lambda m: LABEL_EXTERNAL[m], external_pub_id, "EXT"),
                     (internal_hits, poses_int, lambda m: LABEL_INTERNAL[m], internal_pub_id, "INT"),
-                    (wp6x6_hits,   poses_6x6,  label_6x6,                  waypoint_pub_id, "WP "),
                 ]:
                     for i, (mid, _) in enumerate(hits):
                         rv, tv = poses[i]
@@ -454,8 +461,6 @@ class ArucoDetectorNode(Node):
                 priority_tv = poses_int[0][1]
             elif external_hits and poses_ext[0][1] is not None:
                 priority_tv = poses_ext[0][1]
-            elif wp6x6_hits    and poses_6x6[0][1] is not None:
-                priority_tv = poses_6x6[0][1]
 
             if priority_tv is not None:
                 _, dist_xz, angle_h, _ = self._angle_distance(priority_tv)
@@ -465,15 +470,15 @@ class ArucoDetectorNode(Node):
         else:
             self.pub_id.publish(Int32(data=unknown_id))
             self.pub_label.publish(String(data=""))
-            if self._prev_key not in (None, ((), (), ())):
+            if self._prev_key not in (None, ((), ())):
                 self.get_logger().info("  (sin marcadores)")
-            self._prev_key = ((), (), ())
+            self._prev_key = ((), ())
 
         # ── Imagen anotada ────────────────────────────────────────────
         if self.get_parameter('publish_image').value:
             annotated = self._annotate(
-                frame, external_hits, internal_hits, wp6x6_hits,
-                qr_data, qr_points, poses_ext, poses_int, poses_6x6
+                frame, external_hits, internal_hits,
+                qr_data, qr_points, poses_ext, poses_int
             )
             ann_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
             ann_msg.header = msg.header
