@@ -33,10 +33,10 @@ setup(
         'console_scripts': [
             # format:  'executable_name = package.module:main_function'
 
-            'astar_planner   = iolair.astar_planner:main',
-            'rviz_goal_bridge = iolair.goal_bridge:main',
-            'mission_planner = iolair.mission_planner:main',
-            'mission_manager = iolair.mission_manager:main',
+            'astar_planner   = Navigation.astar_planner:main',
+            'rviz_goal_bridge = Navigation.goal_bridge:main',
+            'mission_planner = Navigation.mission_planner:main',
+            'mission_manager = Navigation.mission_manager:main',
         ],
     },
 )

@@ -32,11 +32,11 @@ setup(
     entry_points={
         'console_scripts': [
             # format:  'executable_name = package.module:main_function'
-            'slam       = iolair.slam_node:main',
-            'mcl        = iolair.mcl_node:main',
-            'aruco_localizer       = iolair.aruco_localizer:main',
-            'mapping_node     = iolair.mapping_node:main',
-            'aruco_map_publisher = iolair.aruco_map_publisher:main',
+            'slam                  = LocalizationMapping.slam_node:main',
+            'mcl                   = LocalizationMapping.mcl_node:main',
+            'aruco_localizer       = LocaliztaionMapping.aruco_localizer:main',
+            'mapping_node          = LocalizationMapping.mapping_node:main',
+            'aruco_map_publisher   = LocalizationMapping.aruco_map_publisher:main',
         ],
     },
 )

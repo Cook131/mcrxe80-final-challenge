@@ -35,11 +35,11 @@ setup(
     entry_points={
         'console_scripts': [
             # format:  'executable_name = package.module:main_function'
-            'odometry   = iolair.puzzlebotOdometry:main',
-            'controller = iolair.puzzlebotController:main',
-            'teleop     = iolair.puzzlebotTeleop:main',
+            'odometry    = iolair.puzzlebotOdometry:main',
+            'controller  = iolair.puzzlebotController:main',
+            'teleop      = iolair.puzzlebotTeleop:main',
             'go_to_goal  = iolair.puzzlebotGoToGoal:main',
-            'bug       = iolair.bug_tangent:main',
+            'bug_tangent = iolair.bug_tangent:main',
 
         ],
     },

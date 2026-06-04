@@ -185,35 +185,33 @@ def generate_launch_description():
         executable = 'bug_tangent',
         name       = 'bug_tangent',
         output     = 'screen',
-        emulate_tty= True,
-        parameters = [{
-            # Geometría del robot
-            'robot_radius_m':      LaunchConfiguration('0.2'),  # distancia del centro a la esquina (diagonal/2)
-            'gap_safety_factor':   LaunchConfiguration('1.5'),
-            'wall_clearance_m':    LaunchConfiguration('0.08'),
+        parameters =[{# Geometría del robot
+            'robot_radius_m':      0.2,  # distancia del centro a la esquina (diagonal/2)
+            'gap_safety_factor':   1.5,
+            'wall_clearance_m':    0.08,
             # Umbrales de distancia
-            'warn_dist':           LaunchConfiguration('0.65'),
-            'emergency_dist':      LaunchConfiguration('0.35'),
-            'stop_dist':           LaunchConfiguration('0.14'),
+            'warn_dist':           0.65,
+            'emergency_dist':      0.35,
+            'stop_dist':           0.14,
             # Wall-follow
-            'wall_follow_dist':    LaunchConfiguration('0.3'),
-            'wall_follow_kp':      LaunchConfiguration('1.2'),
-            'wall_follow_w_max':   LaunchConfiguration('0.8'),
-            'reflex_v':            LaunchConfiguration('0.06'),
-            'reflex_w':            LaunchConfiguration('0.65'),
-            'reflex_hold_ms':      LaunchConfiguration('500'),
+            'wall_follow_dist':    0.3,
+            'wall_follow_kp':      1.2,
+            'wall_follow_w_max':   0.8,
+            'reflex_v':            0.06,
+            'reflex_w':            0.65,
+            'reflex_hold_ms':      500,
             # Tangent Bug
-            'gap_jump_ratio':      LaunchConfiguration('1.3'),
-            'heuristic_margin':    LaunchConfiguration('0.1'),
-            'tangent_sector_deg':  LaunchConfiguration('120'),
-            'min_follow_m':        LaunchConfiguration('0.25'),
+            'gap_jump_ratio':      1.3,
+            'heuristic_margin':    0.1,
+            'tangent_sector_deg':  120,
+            'min_follow_m':        0.25,
             # LiDAR
-            'front_half_deg':      LaunchConfiguration('30'),
-            'side_half_deg':       LaunchConfiguration('35'),
-            'lidar_yaw_offset':    LaunchConfiguration('math.pi'),  # LiDAR montado mirando hacia atrás
+            'front_half_deg':      30,
+            'side_half_deg':       35,
+            'lidar_yaw_offset':    math.pi,  # LiDAR montado mirando hacia atrás
             # Sistema
-            'hysteresis':          LaunchConfiguration('0.06'),
-            'replan_cooldown_s':   LaunchConfiguration('2.0'),
+            'hysteresis':          0.06,
+            'replan_cooldown_s':  2.0,
         }]
     )
 
@@ -260,7 +258,6 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'num_particles':    300,
-            'beam_skip':        6,
             'lidar_yaw_offset': math.pi,
             'initial_yaw':      math.pi,
             'map_frame':        'map',
@@ -327,7 +324,7 @@ def generate_launch_description():
         go_to_goal_node,
 
         # Safety layer
-        bug_node,
+        ##bug_node,
 
         # Actuation
         controller_node,

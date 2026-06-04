@@ -520,7 +520,7 @@ class PuzzlebotOdometry(Node):
         odom.header.stamp    = now.to_msg()
         # /odom carries the EKF-corrected pose in the MAP frame so that
         # consumers (A*, go-to-goal) always see the best estimate.
-        odom.header.frame_id = 'map'
+        odom.header.frame_id = 'odom'
         odom.child_frame_id  = 'base_link'
 
         odom.pose.pose.position.x  = x[0]
