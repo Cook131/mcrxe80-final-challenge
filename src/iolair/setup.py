@@ -48,6 +48,7 @@ setup(
             'mapping_node     = iolair.mapping_node:main',
             'aruco_map_publisher = iolair.aruco_map_publisher:main',
             'mission_planner = iolair.mission_planner:main',
+            'mission_manager = iolair.mission_manager:main',
         ],
     },
 )

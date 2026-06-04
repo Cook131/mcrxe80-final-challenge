@@ -140,7 +140,7 @@ def generate_launch_description():
             'odom_topic':         '/odom',
             'goal_in_topic':      '/astar/goal',
             'goal_out_topic':     '/goal',
-            'inflation_radius':   0.21,   # was 0.35 — see header derivation
+            'inflation_radius':   0.2,   # was 0.35 — see header derivation
             'waypoint_threshold': 0.10,
             'occupied_threshold': 65,
             'allow_diagonal':     True,
@@ -173,9 +173,9 @@ def generate_launch_description():
         name='bug_reflex',
         output='screen',
         parameters=[{
-            'warn_dist':           0.45,   # unchanged
-            'emergency_dist':      0.22,   # unchanged
-            'stop_dist':           0.13,   # was 0.20 — below robot diagonal!
+            'warn_dist':           0.5,   # unchanged
+            'emergency_dist':      0.3,   # unchanged
+            'stop_dist':           0.2,   # was 0.20 — below robot diagonal!
             'reflex_v':            0.1,   # was 0.14 — safer in tight spaces
             'reflex_w':            0.50,   # unchanged
             'reflex_hold_ms':      350,    # unchanged
@@ -183,8 +183,8 @@ def generate_launch_description():
             'side_half_deg':       35.0,   # unchanged
             'hysteresis':          0.03,   # was 0.08 — was too sticky
             'replan_cooldown_s':   2.0,    # v3.0
-            'm_line_tol':          0.12,   # v4.0 BUG2 — tolerancia línea M
-            'bug2_min_follow_m':   0.20,   # v4.0 BUG2 — distancia mínima wall-follow
+            'm_line_tol':          0.1,   # v4.0 BUG2 — tolerancia línea M
+            'bug2_min_follow_m':   0.40,   # v4.0 BUG2 — distancia mínima wall-follow
         }]
     )
 

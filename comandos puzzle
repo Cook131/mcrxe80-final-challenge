@@ -1,0 +1,27 @@
+termianles separadas en general
+
+ros2 launch sllidar_ros2 sllidar_a1_launch.py serial_port:=/dev/ttyUSB1offset
+
+ros2 launch puzzlebot_ros micro_ros_agent.launch.py
+offset
+cd iolair_ws
+source install/setup.bash
+python3 camera.py
+
+
+
+
+para conecatrse al puzzlebot
+
+ssh 10.42.0.1
+
+Puzzlebot72
+
+
+
+Terminal Compu
+
+
+cd mcr
+
+ros2 launch iolair manchester.launch.py

@@ -17,7 +17,7 @@ class MissionPlannerNode(Node):
         self.declare_parameter('loop_mission', False)
         self.declare_parameter('start_delay', 2.0)
         self.declare_parameter('goal_timeout', 60.0)
-        self.declare_parameter('waypoints_file', 'exploration_waypoints.yaml') # Ruta al YAML
+        self.declare_parameter('waypoints_file', 'src/iolair/configs/exploration_waypoints.yaml') # Ruta al YAML
 
         self._loop        = self.get_parameter('loop_mission').value
         self._start_delay = self.get_parameter('start_delay').value
