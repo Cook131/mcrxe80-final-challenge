@@ -29,7 +29,7 @@ class GoToGoalNode(Node):
         self.declare_parameter('kp_w',                  1.0)
         self.declare_parameter('ki_w',                  0.0)
         self.declare_parameter('kd_w',                  0.0)
-        self.declare_parameter('max_linear_velocity',   0.22)
+        self.declare_parameter('max_linear_velocity',   0.4)
         self.declare_parameter('max_angular_velocity',  0.5)
         self.declare_parameter('angle_threshold',       0.15)
         self.declare_parameter('goal_reached_dist',     0.10)  # 10 cm — realistic for hardware

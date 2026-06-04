@@ -38,17 +38,9 @@ setup(
             'odometry   = iolair.puzzlebotOdometry:main',
             'controller = iolair.puzzlebotController:main',
             'teleop     = iolair.puzzlebotTeleop:main',
-            'slam       = iolair.slam_node:main',
             'go_to_goal  = iolair.puzzlebotGoToGoal:main',
-            'mcl        = iolair.mcl_node:main',
-            'aruco_localizer       = iolair.aruco_localizer:main',
             'bug_IBA       = iolair.bug_IBA:main',
-            'astar_planner   = iolair.astar_planner:main',
-            'rviz_goal_bridge = iolair.goal_bridge:main',
-            'mapping_node     = iolair.mapping_node:main',
-            'aruco_map_publisher = iolair.aruco_map_publisher:main',
-            'mission_planner = iolair.mission_planner:main',
-            'mission_manager = iolair.mission_manager:main',
+
         ],
     },
 )

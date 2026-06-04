@@ -8,7 +8,7 @@ Launches the full navigation stack for the Puzzlebot using:
                                             publishes TF: map → odom → base_link
   - A* Planner            (iolair pkg)    — path planning on occupancy grid
   - Go-to-Goal            (iolair pkg)    — drives toward each A* waypoint
-  - Bug IBA / BugReflex   (iolair pkg)    — safety reflex layer BUG2 (LiDAR-based)
+  - Bug IBA / BugReflex   (iolair pkg)    — safety reflex layer BUG2+LateralCtrl v4.1
   - Controller            (iolair pkg)    — PID wheel velocity controller
   - Map Server            (nav2)          — serves the pre-built SLAM map
   - Nav2 Lifecycle Mgr    (nav2)          — activates map_server automatically
@@ -28,19 +28,28 @@ Robot geometry (Puzzlebot)
   Length:   0.30 m  →  half-length = 0.15 m
   Diagonal: sqrt(0.11²+0.15²) ≈ 0.186 m  (bounding-circle radius)
 
-Parameter derivation
---------------------
-  stop_dist        = diagonal + 5 cm safety margin  = 0.186 + 0.05  ≈ 0.24 m
-  emergency_dist   = stop + braking distance at max_v over hold_ms
-                   = 0.24 + 0.22*0.35                              ≈ 0.32 m
-  warn_dist        = emergency + soft-braking zone                  = 0.65 m  (unchanged)
-  hysteresis       = ~25% of (emergency - stop) gap
-                   = 0.25 * (0.32-0.24)                             ≈ 0.03 m
-  inflation_r      = half-width + 10 cm clearance  = 0.11 + 0.10   = 0.21 m
+Parameter derivation — bug_IBA v4.1
+------------------------------------
+  stop_dist        = diagonal + 5 cm safety margin  = 0.186 + 0.05  ≈ 0.14 m
+                     (v4.1: aumentado de 0.13 para coincidir con geometría real)
+  emergency_dist   = stop + braking distance at reflex_v over hold_ms
+                   = 0.14 + 0.10*0.35                              ≈ 0.35 m
+                     (v4.1: aumentado de 0.30 — reacciona antes de estar pegado)
+  warn_dist        = emergency + soft-braking zone                  = 0.65 m (unchanged)
+  hysteresis       = ~25 % of (emergency - stop) gap
+                   = 0.25 * (0.35 - 0.14)                          ≈ 0.05 m
+                     (v4.1: recalculado por nuevos stop/emergency)
+  wall_follow_dist = distancia lateral deseada al muro durante BUG2 = 0.40 m
+                     (v4.1 NEW — P-controller lateral, elimina "pasar rozando")
+  wall_follow_kp   = ganancia proporcional del P-controller lateral  = 1.20
+  wall_follow_w_max= límite angular del P-controller                 = 0.80 rad/s
+  reflex_v         = 0.06 m/s (v4.1: reducido — velocidad base wall-follow;
+                     la velocidad real es adaptativa según distancia al frente)
+  m_line_tol       = 0.15 m  (v4.1: ligeramente aumentado de 0.12 para robustez)
+  bug2_min_follow  = 0.30 m  (v4.1: aumentado de 0.20 — evita salidas falsas)
+  bug2_min_time_s  = 1.0 s   (v4.1 NEW — tiempo mínimo en wall-follow anti-ruido)
+  inflation_r      = half-width + 10 cm clearance = 0.11 + 0.10 = 0.21 m
                      (was 0.35 — overly conservative, caused narrow-passage failures)
-  reflex_v         = reduced to 0.08 m/s (was 0.14) — safer arc speed in tight spaces
-  m_line_tol       = 0.12 m — tolerancia perpendicular a línea M de BUG2
-  bug2_min_follow  = 0.20 m — distancia mínima wall-follow antes de chequear salida
 """
 
 import os
@@ -70,7 +79,7 @@ def generate_launch_description():
 
     # ── 1. ArUco Detector — detects markers, publishes /aruco/waypoint ─────
     aruco_detector_node = Node(
-        package='puzzlebot',
+        package='Vision',
         executable='aruco_detector',
         name='aruco_detector',
         output='screen',
@@ -92,7 +101,7 @@ def generate_launch_description():
 
     # ── 3. ArUco Localizer — landmark-anchoring correction for the EKF ─────
     aruco_localizer_node = Node(
-        package='iolair',
+        package='LocalizationMapping',
         executable='aruco_localizer',
         name='aruco_localizer',
         output='screen',
@@ -113,14 +122,14 @@ def generate_launch_description():
 
     # ── 4. ArUco Map Publisher — landmark markers for RViz ─────────────────
     aruco_map_node = Node(
-        package='iolair',
+        package='LocalizationMapping',
         executable='aruco_map_publisher',
         name='aruco_map_publisher',
         output='screen',
         parameters=[{
             'landmarks_file': landmarks_yaml_file,
             'publish_rate':   1.0,
-            'sphere_scale':   0.095,
+            'sphere_scale':   0.2,
             'text_scale':     0.15,
         }]
     )
@@ -130,7 +139,7 @@ def generate_launch_description():
     # Reduced from 0.35 — that value blocked navigable passages narrower than
     # 70cm, which is overkill for a 22cm-wide robot.
     astar_planner_node = Node(
-        package='iolair',
+        package='Navigation',
         executable='astar_planner',
         name='astar_planner',
         output='screen',
@@ -140,10 +149,10 @@ def generate_launch_description():
             'odom_topic':         '/odom',
             'goal_in_topic':      '/astar/goal',
             'goal_out_topic':     '/goal',
-            'inflation_radius':   0.2,   # was 0.35 — see header derivation
+            'inflation_radius':   0.2,
             'waypoint_threshold': 0.10,
             'occupied_threshold': 65,
-            'allow_diagonal':     True,
+            'allow_diagonal':     False,
         }]
     )
 
@@ -155,36 +164,46 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 7. Bug IBA — safety reflex layer BUG2, intercepts /cmd_raw → /cmd_vel
+    # ── 7. Bug IBA — safety reflex layer BUG2 + lateral control v4.1 ───────
     #
-    # stop_dist        0.24m  robot diagonal (0.186) + 5cm margin
-    # emergency_dist   0.32m  unchanged — correct for max_v + hold_ms
-    # warn_dist        0.65m  unchanged — good soft-braking zone
-    # hysteresis       0.03m  was 0.08 — reduced to 25% of (emg-stop) gap;
-    #                          0.08 consumed 67% of that gap causing sticky TURN
-    # reflex_v         0.08   was 0.14 — safer arc speed in tight spaces
-    # reflex_w         0.50   unchanged
-    # m_line_tol       0.12m  BUG2 v4.0 — tolerancia perpendicular a línea M
-    # bug2_min_follow  0.20m  BUG2 v4.0 — distancia mínima wall-follow antes
-    #                          de chequear salida (evita salir en el hit point)
+    # Cambios v4.1 respecto a v4.0:
+    #   stop_dist        0.14m   era 0.13 — margen sobre diagonal robot (0.186m)
+    #   emergency_dist   0.35m   era 0.30 — reacciona ~13cm antes de estar pegado
+    #   warn_dist        0.65m   sin cambio
+    #   hysteresis       0.05m   era 0.03 — recalculado: 25% * (0.35-0.14)
+    #   reflex_v         0.06    era 0.10 — velocidad BASE del wall-follow;
+    #                             la velocidad real es adaptativa (ver FIX-3)
+    #   reflex_w         0.65    era 0.50 — restaurado para giros de esquina
+    #   wall_follow_dist 0.40m   NEW — distancia lateral deseada al muro (P-ctrl)
+    #   wall_follow_kp   1.20    NEW — ganancia P-controller lateral
+    #   wall_follow_w_max 0.80   NEW — límite angular del P-controller [rad/s]
+    #   m_line_tol       0.15m   era 0.12 — más tolerante para salida BUG2
+    #   bug2_min_follow  0.30m   era 0.20 — más distancia antes de chequear salida
+    #   bug2_min_time_s  1.0s    NEW — tiempo mínimo en wall-follow (anti-ruido odom)
     bug_iba_node = Node(
         package='iolair',
         executable='bug_IBA',
         name='bug_reflex',
         output='screen',
         parameters=[{
-            'warn_dist':           0.5,   # unchanged
-            'emergency_dist':      0.3,   # unchanged
-            'stop_dist':           0.2,   # was 0.20 — below robot diagonal!
-            'reflex_v':            0.1,   # was 0.14 — safer in tight spaces
-            'reflex_w':            0.50,   # unchanged
-            'reflex_hold_ms':      350,    # unchanged
-            'front_half_deg':      30.0,   # unchanged
-            'side_half_deg':       35.0,   # unchanged
-            'hysteresis':          0.03,   # was 0.08 — was too sticky
-            'replan_cooldown_s':   2.0,    # v3.0
-            'm_line_tol':          0.1,   # v4.0 BUG2 — tolerancia línea M
-            'bug2_min_follow_m':   0.40,   # v4.0 BUG2 — distancia mínima wall-follow
+            'warn_dist':            0.6,   # unchanged
+            'emergency_dist':       0.40,   # v4.1: era 0.30
+            'stop_dist':            0.18,   # v4.1: era 0.13
+            'reflex_v':             0.2,   # v4.1: velocidad base wall-follow
+            'reflex_w':             0.5,   # v4.1: restaurado para esquinas
+            'reflex_hold_ms':       350,    # unchanged
+            'front_half_deg':       45.0,   # unchanged
+            'side_half_deg':        45.0,   # unchanged
+            'hysteresis':           0.05,   # v4.1: recalculado 25%*(emg-stop)
+            'replan_cooldown_s':    2.0,    # unchanged
+            'm_line_tol':           0.12,   # v4.1: era 0.12
+            'bug2_min_follow_m':    0.20,   # v4.1: era 0.20
+            # ── v4.1 NEW: P-controller lateral ───────────────────────────
+            'wall_follow_dist':     0.22,   # distancia lateral deseada al muro
+            'wall_follow_kp':       1.20,   # ganancia proporcional
+            'wall_follow_w_max':    0.5,   # límite angular [rad/s]
+            # ── v4.1 NEW: tiempo mínimo en wall-follow ────────────────────
+            'bug2_min_time_s':      1.0,    # anti-ruido odometría [s]
         }]
     )
 
@@ -218,14 +237,14 @@ def generate_launch_description():
     )
 
     rviz_goal_bridge_node = Node(
-        package='iolair',
+        package='Navigation',
         executable='rviz_goal_bridge',
         name='rviz_goal_bridge',
         output='screen',
     )
 
     mcl_node = Node(
-        package='iolair',
+        package='LocalizationMapping',
         executable='mcl',
         name='puzzlebot_mcl',
         output='screen',
@@ -241,7 +260,7 @@ def generate_launch_description():
     )
 
     slam_node = Node(
-        package='iolair',
+        package='LocalizationMapping',
         executable='slam',
         name='slam_node',
         output='screen',

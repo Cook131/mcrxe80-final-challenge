@@ -1,0 +1,39 @@
+# aruco_landmarks.yaml
+# Posiciones globales predefinidas de los marcadores ArUco.
+# Unidades: metros. Frame: odom / mapa global (X=este, Y=norte).
+# (Coordenadas originales en cm, convertidas ÷ 100)
+
+landmarks:
+  0:
+    x: -1.78
+    y: -1.84
+  1:
+    x: -2.81
+    y:  0.18
+  2:
+    x: -1.78
+    y:  1.84
+  3:
+    x:  1.08
+    y:  1.84
+  4:
+    x:  1.08
+    y: -1.84
+  5:
+    x: -0.41
+    y:  0.54
+  6:
+    x: -0.41
+    y: -0.64
+  7:
+    x: -1.61
+    y:  0.54
+  8:
+    x: -1.61
+    y: -0.64
+  9:
+    x:  2.06
+    y: -1.47
+  10:
+    x:  2.06
+    y:  1.06

@@ -1,11 +1,13 @@
 termianles separadas en general
 
-ros2 launch sllidar_ros2 sllidar_a1_launch.py serial_port:=/dev/ttyUSB1offset
+ros2 launch sllidar_ros2 sllidar_a1_launch.py serial_port:=/dev/ttyUSB1
 
 ros2 launch puzzlebot_ros micro_ros_agent.launch.py
-offset
+
+
+
 cd iolair_ws
-source install/setup.bash
+
 python3 camera.py
 
 
