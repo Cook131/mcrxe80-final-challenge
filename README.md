@@ -10,7 +10,6 @@
   <img src="https://img.shields.io/badge/Status-Final%20Project-4CAF50?style=for-the-badge&logo=check&logoColor=white" />
   <img src="https://img.shields.io/badge/Robot-Puzzlebot-FF6B35?style=for-the-badge&logo=robot&logoColor=white" />
   <img src="https://img.shields.io/badge/Environment-Real%20World-2196F3?style=for-the-badge&logo=warehouse&logoColor=white" />
-  <img src="https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white" />
 </p>
 
 <p>
@@ -20,8 +19,7 @@
   <a href="#-nodes">Nodes</a> •
   <a href="#-launch-files">Launch Files</a> •
   <a href="#-installation">Installation</a> •
-  <a href="#-usage">Usage</a> •
-  <a href="#-contributing">Contributing</a>
+  <a href="#-usage">Usage</a>
 </p>
 
 </div>
@@ -30,7 +28,7 @@
 
 ## 🏭 Overview
 
-**TE3003B Final Project** is a complete ROS2-based autonomy stack for a **Puzzlebot** (Manchester Robotics) differential-drive robot. The system goes far beyond basic teleoperation: it implements a full perception-localization-planning-control pipeline capable of operating in unknown environments and correcting odometry drift using multiple sensor fusion sources.
+**TE3003B Final Project** is a complete ROS2-based autonomy stack for a **Puzzlebot** (Manchester Robotics) differential-drive robot. The system implements a full perception-localization-planning-control pipeline capable of operating in known environments, correcting odometry drift via ArUco landmark anchoring and MCL, and navigating autonomously to a sequence of waypoints.
 
 > **Objective:** Deliver a production-quality autonomous navigation stack on real Puzzlebot hardware, integrating EKF odometry, SLAM, MCL, ArUco landmark anchoring, YOLO object detection, A\* path planning, and a reactive safety layer — all running on ROS 2 Humble without Nav2 at runtime.
 
@@ -44,7 +42,7 @@ The system is organized around a layered architecture:
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         PERCEPTION                                  │
 │  aruco_detector ──► /aruco/*   │  yolo_vision ──► /yolo/*          │
-│  (dual-dict 4X4+6X6 + QR)      │  (YOLOv8, custom weights)         │
+│  (dual-dict 4X4_50 + 6X6_50)   │  (YOLOv8, custom weights)         │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
 ┌────────────────────────────────▼────────────────────────────────────┐
@@ -61,12 +59,13 @@ The system is organized around a layered architecture:
 │                          PLANNING                                   │
 │  astar_planner ──► /astar/path + /goal                              │
 │  (dynamic map source, obstacle inflation, line-of-sight shortcut)   │
+│  mission_planner ──► /astar/goal   (YAML waypoint sequencer)        │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
 ┌────────────────────────────────▼────────────────────────────────────┐
 │                          CONTROL                                    │
 │  puzzlebotGoToGoal ──► /cmd_raw  (dual PID v+ω, align-and-drive)   │
-│  bug_IBA ──► /cmd_vel            (safety reflex: brake → turn → stop)│
+│  bug_IBA ──► /cmd_vel            (safety reflex: BUG2 wall-follow)  │
 │  puzzlebotController ──► /VelocitySetR, /VelocitySetL               │
 │  (dual PID wheel velocity, inverse kinematics, anti-windup)         │
 └─────────────────────────────────────────────────────────────────────┘
@@ -88,34 +87,46 @@ The odometry node implements an automatic source-switching state machine:
 ## 📁 Project Structure
 
 ```
-src/
-├── iolair/                        # Main ROS 2 package
-│   ├── iolair/
-│   │   ├── puzzlebotController.py   # PID wheel velocity controller
-│   │   ├── puzzlebotGoToGoal.py     # Dual-PID goal navigation
-│   │   ├── puzzlebotOdometry.py     # EKF odometry (MCL/ICP/ArUco fusion)
-│   │   ├── puzzlebotTeleop.py       # Keyboard teleoperation
-│   │   ├── aruco_localizer.py       # ArUco landmark anchoring
-│   │   ├── astar_planner.py         # A* path planner
-│   │   ├── bug_IBA.py               # Reactive safety layer
-│   │   ├── mcl_node.py              # Monte Carlo Localization
-│   │   └── slam_node.py             # Online SLAM (ICP + occupancy grid)
-│   ├── launch/
-│   │   ├── teleop.launch.py         # Teleoperation
-│   │   ├── odometry.launch.py       # Odometry + GoToGoal
-│   │   ├── slam.launch.py           # Full SLAM stack
-│   │   ├── mcl.launch.py            # MCL localization on saved map
-│   │   └── aruco_localizer.launch.py # ArUco-based localization
-│   ├── maps/
-│   │   ├── slam_map.pgm             # Saved occupancy map
-│   │   └── slam_map.yaml            # Map metadata
-│   └── setup.py
+mcrxe80-final-challenge/
+├── calibrar.py                      # Camera calibration script (checkerboard)
+├── calib_imgs/                      # Calibration images (30 frames)
 │
-└── puzzlebot/                     # Perception package
-    └── puzzlebot/
-        ├── aruco_detector.py        # Dual-dict ArUco + QR detector
-        ├── yolo_vision.py           # YOLOv8 object detector
-        └── camera_params.*          # Camera calibration files
+└── src/
+    ├── iolair/                        # Main ROS 2 package
+    │   ├── iolair/
+    │   │   ├── puzzlebotController.py   # PID wheel velocity controller
+    │   │   ├── puzzlebotGoToGoal.py     # Dual-PID goal navigation
+    │   │   ├── puzzlebotOdometry.py     # EKF odometry (MCL/ICP/ArUco fusion)
+    │   │   ├── puzzlebotTeleop.py       # Keyboard teleoperation
+    │   │   ├── aruco_localizer.py       # ArUco landmark anchoring
+    │   │   ├── aruco_map_publisher.py   # ArUco landmark RViz visualizer
+    │   │   ├── astar_planner.py         # A* path planner
+    │   │   ├── bug_IBA.py               # Reactive safety layer (BUG2)
+    │   │   ├── goal_bridge.py           # RViz /clicked_point → /astar/goal bridge
+    │   │   ├── mapping_node.py          # Map merger (max-occupancy accumulator)
+    │   │   ├── mcl_node.py              # Monte Carlo Localization
+    │   │   ├── mission_planner.py       # YAML waypoint sequencer
+    │   │   └── slam_node.py             # Online SLAM (ICP + occupancy grid)
+    │   ├── launch/
+    │   │   ├── manchester.launch.py     # Full autonomous stack (primary entry point)
+    │   │   ├── astar_slam_bug.launch.py # A* + SLAM + BUG2 (no ArUco/MCL)
+    │   │   └── odometry.launch.py       # Odometry + Controller only (legacy)
+    │   ├── maps/
+    │   │   ├── SLAM_map.pgm             # Saved occupancy map
+    │   │   └── SLAM_map.yaml            # Map metadata
+    │   ├── configs/
+    │   │   ├── aruco_landmarks.yaml     # Global ArUco landmark positions
+    │   │   └── exploration_waypoints.yaml # Mission waypoints for mission_planner
+    │   └── setup.py
+    │
+    └── puzzlebot/                     # Perception package
+        └── puzzlebot/
+            ├── aruco_detector.py        # Dual-dict ArUco detector (4X4_50 + 6X6_50)
+            ├── yolo_vision.py           # YOLOv8 object detector
+            ├── camera_params.npz        # Camera calibration (numpy)
+            ├── camera_params.json       # Camera calibration (JSON)
+            └── weights/
+                └── best.pt              # Custom YOLOv8 weights
 ```
 
 ---
@@ -126,22 +137,26 @@ src/
 
 | Node | Executable | Description |
 |---|---|---|
-| **puzzlebotController** | `controller` | Closed-loop PID wheel velocity controller. Runs at 50 Hz. Implements inverse differential kinematics, per-wheel PID with anti-windup, and integral reset on direction change. Tunable via `--ros-args -p Kp:=X`. |
-| **puzzlebotGoToGoal** | `go_to_goal` | Dual-PID navigation to a `Pose2D` goal. Separates linear (aggressive) and angular (smooth) PID loops. Uses align-and-drive logic: rotates to face goal before advancing. |
-| **puzzlebotOdometry** | `odometry` | Full EKF odometry fusing encoder dead-reckoning with up to three external pose sources (MCL, ICP, ArUco). Implements Joseph-form covariance updates, innovation gating, and automatic source-switching with configurable timeouts. |
-| **puzzlebotTeleop** | `teleop` | Keyboard teleoperation with velocity ramping at 50 Hz. W/S/A/D keys, space bar for emergency stop. Thread-safe design with guaranteed terminal restoration. |
-| **aruco_localizer** | `aruco_localizer` | Drift correction by landmark anchoring. First observation anchors a marker's global position; subsequent observations compute a correction vector and publish it to the EKF. Uses adaptive noise covariance (distance-proportional). |
-| **astar_planner** | `astar` | A\* path planner on occupancy grids. Dynamically selects between `/slam_map` and `/map` at runtime, inflates obstacles, applies line-of-sight shortcutting, and feeds waypoints to GoToGoal. |
-| **bug_IBA** | `bug_reflex` | Three-zone reactive safety layer between GoToGoal and the controller: `PASS_THROUGH` → `PREDICTIVE_BRAKE` → `REFLEX_TURN` (arc escape) → `REFLEX_STOP`. Hysteresis prevents oscillation. |
-| **mcl_node** | `mcl` | SIR Particle Filter localization. Fuses EKF odometry (motion model) with LiDAR scans (beam-range-finder sensor model + ray-casting). Supports RViz pose initialization via `/initialpose`. |
-| **slam_node** | `slam` | Online SLAM building an occupancy grid with log-odds updates and Bresenham ray-casting. ICP scan matching corrects drift between keyframes. Publishes `/icp/pose` for EKF fusion. Saves maps via `/slam/save_map` service. |
+| **puzzlebotController** | `controller` | Closed-loop PID wheel velocity controller at 50 Hz. Implements inverse differential kinematics, per-wheel PID with anti-windup, and integral reset on direction change. |
+| **puzzlebotGoToGoal** | `go_to_goal` | Dual-PID navigation to a `Pose2D` goal. Separates linear and angular PID loops. Uses align-and-drive logic: rotates to face goal before advancing. Publishes to `/cmd_raw`. |
+| **puzzlebotOdometry** | `odometry` | Full EKF odometry fusing encoder dead-reckoning with up to three external pose sources (MCL, ICP, ArUco). Joseph-form covariance updates, innovation gating, and automatic source-switching with configurable timeouts. |
+| **puzzlebotTeleop** | `teleop` | Keyboard teleoperation with velocity ramping at 50 Hz. W/S/A/D keys, Space for emergency stop. Thread-safe with guaranteed terminal restoration. |
+| **aruco_localizer** | `aruco_localizer` | Drift correction by landmark anchoring against `aruco_landmarks.yaml`. Unknown markers are anchored dynamically on first observation. Adaptive noise covariance scales with distance². |
+| **aruco_map_publisher** | `aruco_map_publisher` | Publishes ArUco landmark positions from `aruco_landmarks.yaml` as a `MarkerArray` on `/aruco/markers` for RViz visualization. |
+| **astar_planner** | `astar_planner` | A\* path planner on occupancy grids. Dynamically selects between `/slam_map` and `/map` at runtime, inflates obstacles, applies line-of-sight shortcutting, and feeds waypoints to GoToGoal. |
+| **bug_IBA** | `bug_IBA` | BUG2 reactive safety layer between GoToGoal and the controller: `PASS_THROUGH` → `PREDICTIVE_BRAKE` → `REFLEX_TURN` (arc escape) → `REFLEX_STOP`. Intercepts `/cmd_raw` and publishes to `/cmd_vel`. |
+| **goal_bridge** | `rviz_goal_bridge` | Converts RViz `/clicked_point` (PointStamped) into `/astar/goal` (Pose2D), enabling click-to-navigate from RViz. |
+| **mapping_node** | `mapping_node` | Map merger node that accumulates SLAM snapshots using a max-occupancy strategy. Cells marked occupied are never freed. Expands automatically as the map grows. |
+| **mcl_node** | `mcl` | SIR Particle Filter localization. Vectorised likelihood-field sensor model with precomputed EDT. Fuses EKF odometry (motion model) with LiDAR scans. Supports `/initialpose` from RViz. |
+| **mission_planner** | `mission_planner` | Reads waypoints from `exploration_waypoints.yaml` and publishes them sequentially to `/astar/goal`. Supports looping and configurable timeout per goal. |
+| **slam_node** | `slam` | Online SLAM building an occupancy grid with log-odds updates and Bresenham ray-casting. ICP scan matching corrects drift between keyframes. Publishes `/icp/pose` for EKF fusion and `/slam_map` for A\*. |
 
 ### `puzzlebot` package
 
 | Node | Executable | Description |
 |---|---|---|
-| **aruco_detector** | — | Dual-dictionary ArUco detector (4×4\_50 + 6×6\_50) plus QR code detection. Estimates 6-DOF pose via `solvePnP`. Publishes ID, label, distance, angle, waypoint pose, and annotated image. Camera-calibration auto-detected from `.npz` or `.json`. |
-| **yolo_vision** | — | YOLOv8 inference node using custom weights (`best.pt`). Publishes annotated image and JSON detections with class, confidence, and bounding box. |
+| **aruco_detector** | `aruco_detector` | Dual-dictionary ArUco detector (`4X4_50` IDs 0–10 for external/internal WPs, `6X6_50` IDs 0–6 for named waypoints). Estimates 6-DOF pose via `solvePnP`. Publishes ID, distance, angle, waypoint pose, and annotated image. |
+| **yolo_vision** | `yolo_vision` | YOLOv8 inference node using custom weights (`best.pt`). Publishes annotated image and JSON detections with class, confidence, and bounding box on `/yolo/detecciones`. |
 
 ---
 
@@ -149,17 +164,20 @@ src/
 
 | Topic | Type | Description |
 |---|---|---|
-| `/cmd_vel` | `geometry_msgs/Twist` | Velocity command (after safety layer) |
-| `/cmd_raw` | `geometry_msgs/Twist` | Velocity command (before safety layer) |
+| `/cmd_vel` | `geometry_msgs/Twist` | Velocity command (after BUG2 safety layer) |
+| `/cmd_raw` | `geometry_msgs/Twist` | Velocity command (before safety layer, from GoToGoal) |
 | `/odom` | `nav_msgs/Odometry` | EKF-fused odometry + covariance |
 | `/slam_map` | `nav_msgs/OccupancyGrid` | Live SLAM map (latched) |
+| `/map` | `nav_msgs/OccupancyGrid` | Static map served by nav2_map_server |
 | `/mcl/pose` | `PoseWithCovarianceStamped` | MCL corrected pose |
-| `/icp/pose` | `PoseWithCovarianceStamped` | ICP-corrected pose |
+| `/icp/pose` | `PoseWithCovarianceStamped` | ICP-corrected pose from SLAM node |
 | `/aruco/pose` | `PoseWithCovarianceStamped` | ArUco landmark correction |
 | `/ekf/active_source` | `std_msgs/String` | Current EKF fusion source |
 | `/astar/path` | `nav_msgs/Path` | Planned path for RViz |
-| `/reflex_status` | `std_msgs/String` | Safety layer mode |
-| `/aruco/id` | `std_msgs/Int32` | Detected ArUco pub ID |
+| `/astar/goal` | `geometry_msgs/Pose2D` | Goal input to A\* planner |
+| `/goal` | `geometry_msgs/Pose2D` | A\* waypoint output to GoToGoal |
+| `/aruco/markers` | `visualization_msgs/MarkerArray` | Landmark spheres for RViz |
+| `/aruco/id` | `std_msgs/Int32` | Detected ArUco public ID |
 | `/aruco/distance` | `std_msgs/Float32` | Distance to marker [m] |
 | `/yolo/detecciones` | `std_msgs/String` | YOLO detections (JSON) |
 
@@ -169,22 +187,23 @@ src/
 
 | Launch file | What it starts |
 |---|---|
-| `teleop.launch.py` | Odometry + Controller (teleop must run in a separate terminal) |
-| `odometry.launch.py` | Odometry + Controller + GoToGoal |
-| `slam.launch.py` | Static TF + Odometry + Controller + SLAM node (2s delayed) |
-| `mcl.launch.py` | Map server + Lifecycle manager + Odometry + MCL + Controller |
-| `aruco_localizer.launch.py` | Odometry + ArUco Localizer + Map server + Controller |
+| `manchester.launch.py` | **Full autonomous stack**: Map server + ArUco detector + Odometry (EKF) + ArUco localizer + MCL + SLAM + ArUco map publisher + A\* planner + GoToGoal + Bug IBA + Controller + RViz goal bridge |
+| `astar_slam_bug.launch.py` | A\* + SLAM + BUG2 (no ArUco or MCL): static TF + Odometry + Controller + SLAM (2 s delayed) + A\* planner + RViz goal bridge + GoToGoal + Bug IBA |
+| `odometry.launch.py` | Legacy: Odometry + Controller only (uses old `odometria`/`controlador` executables) |
+
+> **Primary entry point for competition use:** `manchester.launch.py`
 
 ---
 
 ## 📋 Requirements
 
 - **ROS 2 Humble** on Ubuntu 22.04
-- **Python 3.8+** with `numpy`, `scipy`
+- **Python 3.8+** with `numpy`, `scipy`, `pyyaml`
 - **OpenCV** with ArUco module (`opencv-contrib-python`)
 - **Ultralytics YOLOv8** (`pip install ultralytics`)
+- **nav2_map_server** + **nav2_lifecycle_manager** (only needed for `manchester.launch.py`)
 - **Physical Puzzlebot** hardware with RPLiDAR and camera
-- Custom **YOLOv8 weights** (`best.pt`) — available via the [Releases](https://github.com/Cook131/mcrxe80-final-challenge/releases) tab
+- Custom **YOLOv8 weights** (`best.pt`) — included in `src/puzzlebot/weights/`
 
 ---
 
@@ -214,52 +233,59 @@ colcon build --packages-select iolair puzzlebot
 source install/setup.bash
 ```
 
-### 4. Place YOLOv8 weights
-
-Download `best.pt` from the [Releases](https://github.com/Cook131/mcrxe80-final-challenge/releases/tag/new) tab and update the path in `yolo_vision.py`:
-
-```python
-WEIGHTS = "/path/to/best.pt"
-```
-
 ---
 
 ## 🎮 Usage
 
-### Teleoperation (manual driving)
+### Full autonomous navigation (`manchester.launch.py`)
+
+This is the primary competition launch file. It starts the complete stack: ArUco-anchored EKF, MCL, SLAM, A\*, BUG2, and the controller.
 
 ```bash
-# Terminal 1 — core nodes
-ros2 launch iolair teleop.launch.py
+# Provide a map (SLAM_map.yaml) in src/iolair/maps/ before launching
+ros2 launch iolair manchester.launch.py
 
-# Terminal 2 — keyboard control
+# Optional: override the map file
+ros2 launch iolair manchester.launch.py map_yaml:=/path/to/your_map.yaml
+```
+
+To navigate, either:
+- **RViz click**: activate the *Publish Point* tool and click on the map — `rviz_goal_bridge` forwards it to the A\* planner.
+- **CLI**: publish a goal manually:
+
+```bash
+ros2 topic pub --once /astar/goal geometry_msgs/Pose2D "{x: 1.5, y: 0.0, theta: 0.0}"
+```
+
+### Automated waypoint mission
+
+```bash
+# Edit src/iolair/configs/exploration_waypoints.yaml with your waypoints, then:
+ros2 run iolair mission_planner --ros-args -p waypoints_file:=<path>/exploration_waypoints.yaml
+```
+
+### SLAM mapping
+
+```bash
+ros2 launch iolair astar_slam_bug.launch.py
+# Drive manually in a second terminal:
+ros2 run iolair teleop
+# Map is saved automatically to src/iolair/maps/SLAM_map when the node shuts down
+```
+
+### Keyboard teleoperation
+
+```bash
 ros2 run iolair teleop
 # W/S: forward/backward  |  A/D: turn  |  Space: emergency stop  |  Q: quit
 ```
 
-### SLAM (mapping an unknown environment)
+### Camera calibration
 
 ```bash
-ros2 launch iolair slam.launch.py
-# Drive with teleop in a second terminal
-# When done, save the map:
-ros2 service call /slam/save_map std_srvs/srv/Trigger
-```
-
-### MCL (localization on a saved map)
-
-```bash
-# Place slam_map.pgm and slam_map.yaml in src/iolair/maps/
-ros2 launch iolair mcl.launch.py
-# Send a 2D Pose Estimate from RViz to initialize the particle cloud
-```
-
-### Autonomous navigation (A\* + GoToGoal)
-
-```bash
-ros2 launch iolair odometry.launch.py
-# Publish a goal:
-ros2 topic pub /astar/goal geometry_msgs/Pose2D "{x: 1.5, y: 0.0, theta: 0.0}"
+# Collect calibration images (checkerboard), then:
+python3 calibrar.py
+# Outputs camera_params.json and camera_params.npz to the working directory
 ```
 
 ### Individual nodes
@@ -271,19 +297,17 @@ ros2 run iolair go_to_goal
 ros2 run iolair slam
 ros2 run iolair mcl
 ros2 run iolair aruco_localizer
-ros2 run iolair bug_reflex
-ros2 run iolair astar
+ros2 run iolair aruco_map_publisher
+ros2 run iolair bug_IBA
+ros2 run iolair astar_planner
+ros2 run iolair rviz_goal_bridge
+ros2 run iolair mission_planner
+ros2 run iolair mapping_node
+ros2 run puzzlebot aruco_detector
+ros2 run puzzlebot yolo_vision
 ```
 
 ---
-
-## 🤝 Contributing
-
-This is the **final project repository** for TE3003B (Robotics and Intelligent Systems). For academic purposes:
-
-- Code reviews and improvements are welcome
-- Report issues via [GitHub Issues](https://github.com/Cook131/mcrxe80-final-challenge/issues)
-- CI runs automatically on every push via GitHub Actions (ROS 2 Humble build + rosdep check)
 
 ## 📄 License
 
