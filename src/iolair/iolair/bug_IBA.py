@@ -49,7 +49,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, Pose2D
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 
@@ -140,9 +140,13 @@ class BugReflex(Node):
         self.create_subscription(Pose2D,    '/astar/goal',   self._cb_goal,        10)
 
         # ── Publicadores ──────────────────────────────────────────────────
-        self._pub_cmd     = self.create_publisher(Twist,  '/cmd_vel',        10)
-        self._pub_status  = self.create_publisher(String, '/reflex_status',  10)
-        self._pub_replan  = self.create_publisher(Pose2D, '/replan_trigger', 10)
+        self._pub_cmd       = self.create_publisher(Twist,  '/cmd_vel',        10)
+        self._pub_status    = self.create_publisher(String, '/reflex_status',  10)
+        self._pub_replan    = self.create_publisher(Pose2D, '/replan_trigger', 10)
+        # Señal de pausa/reanudación para GoToGoal y A* durante evasión BUG2
+        # True  → pausa (BUG2 activo, nav_systems suspendidos)
+        # False → reanuda (BUG2 terminó, recalcular y retomar)
+        self._pub_nav_pause = self.create_publisher(Bool,  '/nav_pause',      10)
 
         self.create_timer(0.05, self._loop)   # 20 Hz
 
@@ -222,10 +226,12 @@ class BugReflex(Node):
                 self._bug2_traveled  = 0.0
                 self._bug2_prev_x    = self._robot_x
                 self._bug2_prev_y    = self._robot_y
-                self._maybe_trigger_replan(now)
+                # Suspender GoToGoal y A* mientras dure la evasión
+                pause_msg = Bool(); pause_msg.data = True
+                self._pub_nav_pause.publish(pause_msg)
                 self.get_logger().warn(
                     f'[BugReflex] BUG2 hit en ({self._hit_x:.2f}, {self._hit_y:.2f}) | '
-                    f'dist_goal={self._hit_dist_goal:.2f}m')
+                    f'dist_goal={self._hit_dist_goal:.2f}m — nav PAUSADA')
             else:
                 # Acumular distancia recorrida en wall-follow
                 step = math.hypot(self._robot_x - self._bug2_prev_x,
@@ -240,6 +246,10 @@ class BugReflex(Node):
                         f'[BugReflex] BUG2 salida — sobre línea M, '
                         f'dist_goal={self._dist_to_goal(self._robot_x, self._robot_y):.2f}m '
                         f'< hit={self._hit_dist_goal:.2f}m')
+                    # Reanudar navegación: primero replan, luego despausar
+                    self._maybe_trigger_replan(now)
+                    pause_msg = Bool(); pause_msg.data = False
+                    self._pub_nav_pause.publish(pause_msg)
                     self._publish(self._last_cmd, PASS_THROUGH)
                     return
 
@@ -390,6 +400,11 @@ class BugReflex(Node):
                 self.get_logger().warn(
                     f'[BugReflex] {self._mode} → {mode}',
                     throttle_duration_sec=0.4)
+            # Si salimos de BUG2 por cualquier vía (p. ej. REFLEX_STOP → PASS),
+            # garantizar que la pausa de navegación se levante
+            if self._mode == BUG2_WALL_FOLLOW and mode == PASS_THROUGH:
+                pause_msg = Bool(); pause_msg.data = False
+                self._pub_nav_pause.publish(pause_msg)
             self._mode = mode
 
         self._pub_cmd.publish(cmd)

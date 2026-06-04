@@ -18,10 +18,4 @@ def generate_launch_description():
             executable='controlador',
             name='puzzlebot_controller'
         ),
-        # Nodo de Navegación Go-to-Goal
-        Node(
-            package='iolair',
-            executable='go_to_goal',
-            name='puzzlebot_navigation'
-        )
     ])

@@ -14,6 +14,7 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, Pose2D
+from std_msgs.msg import Bool
 
 
 class GoToGoalNode(Node):
@@ -51,6 +52,8 @@ class GoToGoalNode(Node):
         self.target_x = 0.0
         self.target_y = 0.0
         self.active   = False
+        # Suspendido por bug_IBA durante evasión BUG2
+        self._nav_paused = False
 
         self.error_dist_prev  = 0.0
         self.error_angle_prev = 0.0
@@ -59,8 +62,9 @@ class GoToGoalNode(Node):
         self.last_time        = self.get_clock().now()
 
         # ── Subscribers ───────────────────────────────────────────────────
-        self.create_subscription(Odometry, '/odom',  self._cb_odom, 10)
-        self.create_subscription(Pose2D,   '/goal',  self._cb_goal, 10)
+        self.create_subscription(Odometry, '/odom',      self._cb_odom,      10)
+        self.create_subscription(Pose2D,   '/goal',      self._cb_goal,      10)
+        self.create_subscription(Bool,     '/nav_pause', self._cb_nav_pause, 10)
 
         # ── Publisher → /cmd_raw so bug_IBA can intercept ─────────────────
         self._pub_cmd = self.create_publisher(Twist, '/cmd_raw', 10)
@@ -72,6 +76,17 @@ class GoToGoalNode(Node):
 
     # ── Callbacks ─────────────────────────────────────────────────────────
 
+    def _cb_nav_pause(self, msg: Bool):
+        """Pausa/reanuda el controlador según señal de bug_IBA."""
+        was_paused = self._nav_paused
+        self._nav_paused = msg.data
+        if msg.data and not was_paused:
+            # Publicar stop inmediato al pausar para que /cmd_raw quede en cero
+            self._pub_cmd.publish(Twist())
+            self.get_logger().warn('[GoToGoal] NAV PAUSADA — BUG2 evadiendo obstáculo')
+        elif not msg.data and was_paused:
+            self.get_logger().info('[GoToGoal] NAV REANUDADA — retomando control')
+
     def _cb_odom(self, msg: Odometry):
         self.x  = msg.pose.pose.position.x
         self.y  = msg.pose.pose.position.y
@@ -80,7 +95,7 @@ class GoToGoalNode(Node):
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         )
-        if self.active:
+        if self.active and not self._nav_paused:
             self._control_loop()
 
     def _cb_goal(self, msg: Pose2D):

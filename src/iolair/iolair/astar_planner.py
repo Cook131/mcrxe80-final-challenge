@@ -167,7 +167,7 @@ class AStarPlannerNode(Node):
         self.sub_map = None
 
         # BUG2 pause state — A* stops publishing waypoints while BUG2 is evading
-        self._bug2_paused = False
+        self._nav_paused = False
 
         # ── Suscriptores fijos ─────────────────────────────────────────────
         self.sub_odom = self.create_subscription(
@@ -178,9 +178,10 @@ class AStarPlannerNode(Node):
         # un obstáculo. Replanifica al mismo goal final desde ahí.
         self.create_subscription(
             Pose2D, '/replan_trigger', self._cb_replan_trigger, 10)
-        # Escucha el estado de BUG2 para pausar/reanudar la publicación de waypoints
+        # Señal unificada de pausa/reanudación desde bug_IBA
+        from std_msgs.msg import Bool as _Bool
         self.create_subscription(
-            String, '/reflex_status', self._cb_reflex_status, 10)
+            _Bool, '/nav_pause', self._cb_nav_pause, 10)
 
         # ── Publicadores ──────────────────────────────────────────────────
         self.pub_wp     = self.create_publisher(Pose2D,  goal_out_topic, 10)
@@ -253,23 +254,20 @@ class AStarPlannerNode(Node):
         self._final_goal_y = msg.y
         self._plan_and_start(msg.x, msg.y)
 
-    def _cb_reflex_status(self, msg: String):
+    def _cb_nav_pause(self, msg):
         """
-        Pausa la publicación de waypoints cuando BUG2 está bordeando un obstáculo.
-        Al salir (PASS o BRAKE), si hay un goal activo, replannea desde la posición
-        actual para retomar la misión con una ruta fresca.
+        Pausa/reanuda la publicación de waypoints cuando bug_IBA señala
+        que BUG2 está bordeando un obstáculo.
+        Al reanudar, NO recalcula aquí — el replan ya lo disparó bug_IBA
+        vía /replan_trigger justo antes de publicar nav_pause=False.
         """
-        evading = msg.data in ('BUG2_WALL', 'REFLEX_STOP')
+        was_paused = self._nav_paused
+        self._nav_paused = msg.data
 
-        if evading and not self._bug2_paused:
-            self._bug2_paused = True
+        if msg.data and not was_paused:
             self.get_logger().info('[A*] BUG2 activo — pausando publicación de waypoints.')
-
-        elif not evading and self._bug2_paused:
-            self._bug2_paused = False
-            self.get_logger().info('[A*] BUG2 terminó — recalculando ruta desde posición actual.')
-            if self._final_goal_x is not None:
-                self._plan_and_start(self._final_goal_x, self._final_goal_y)
+        elif not msg.data and was_paused:
+            self.get_logger().info('[A*] BUG2 terminó — ruta recalculada por replan_trigger, retomando.')
 
     def _cb_replan_trigger(self, msg: Pose2D):
         """
@@ -346,6 +344,10 @@ class AStarPlannerNode(Node):
 
         self.waypoints = deque(world_path[1:])
         self.active    = True
+        # Si estábamos pausados por BUG2, el replan ya terminó — despausar
+        if self._nav_paused:
+            self._nav_paused = False
+            self.get_logger().info('[A*] Replan completado — nav_pause levantada.')
         self._set_status('PLANNING')
 
         self.get_logger().info(f'[A*] Ruta calculada con {len(world_path)} waypoints.')
@@ -355,7 +357,7 @@ class AStarPlannerNode(Node):
 
     def _control_loop(self):
         # No publicar waypoints mientras BUG2 está bordeando un obstáculo
-        if self._bug2_paused:
+        if self._nav_paused:
             return
         if not self.active or not self.waypoints:
             return
