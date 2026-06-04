@@ -39,7 +39,7 @@ setup(
             'controller = iolair.puzzlebotController:main',
             'teleop     = iolair.puzzlebotTeleop:main',
             'go_to_goal  = iolair.puzzlebotGoToGoal:main',
-            'bug_IBA       = iolair.bug_IBA:main',
+            'bug       = iolair.bug_tangent:main',
 
         ],
     },

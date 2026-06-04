@@ -180,30 +180,40 @@ def generate_launch_description():
     #   m_line_tol       0.15m   era 0.12 — más tolerante para salida BUG2
     #   bug2_min_follow  0.30m   era 0.20 — más distancia antes de chequear salida
     #   bug2_min_time_s  1.0s    NEW — tiempo mínimo en wall-follow (anti-ruido odom)
-    bug_iba_node = Node(
-        package='iolair',
-        executable='bug_IBA',
-        name='bug_reflex',
-        output='screen',
-        parameters=[{
-            'warn_dist':            0.6,   # unchanged
-            'emergency_dist':       0.40,   # v4.1: era 0.30
-            'stop_dist':            0.18,   # v4.1: era 0.13
-            'reflex_v':             0.2,   # v4.1: velocidad base wall-follow
-            'reflex_w':             0.5,   # v4.1: restaurado para esquinas
-            'reflex_hold_ms':       350,    # unchanged
-            'front_half_deg':       45.0,   # unchanged
-            'side_half_deg':        45.0,   # unchanged
-            'hysteresis':           0.05,   # v4.1: recalculado 25%*(emg-stop)
-            'replan_cooldown_s':    2.0,    # unchanged
-            'm_line_tol':           0.12,   # v4.1: era 0.12
-            'bug2_min_follow_m':    0.20,   # v4.1: era 0.20
-            # ── v4.1 NEW: P-controller lateral ───────────────────────────
-            'wall_follow_dist':     0.22,   # distancia lateral deseada al muro
-            'wall_follow_kp':       1.20,   # ganancia proporcional
-            'wall_follow_w_max':    0.5,   # límite angular [rad/s]
-            # ── v4.1 NEW: tiempo mínimo en wall-follow ────────────────────
-            'bug2_min_time_s':      1.0,    # anti-ruido odometría [s]
+    bug_node = Node(
+        package    = 'iolair',
+        executable = 'bug_tangent',
+        name       = 'bug_tangent',
+        output     = 'screen',
+        emulate_tty= True,
+        parameters = [{
+            # Geometría del robot
+            'robot_radius_m':      LaunchConfiguration('0.2'),  # distancia del centro a la esquina (diagonal/2)
+            'gap_safety_factor':   LaunchConfiguration('1.5'),
+            'wall_clearance_m':    LaunchConfiguration('0.08'),
+            # Umbrales de distancia
+            'warn_dist':           LaunchConfiguration('0.65'),
+            'emergency_dist':      LaunchConfiguration('0.35'),
+            'stop_dist':           LaunchConfiguration('0.14'),
+            # Wall-follow
+            'wall_follow_dist':    LaunchConfiguration('0.3'),
+            'wall_follow_kp':      LaunchConfiguration('1.2'),
+            'wall_follow_w_max':   LaunchConfiguration('0.8'),
+            'reflex_v':            LaunchConfiguration('0.06'),
+            'reflex_w':            LaunchConfiguration('0.65'),
+            'reflex_hold_ms':      LaunchConfiguration('500'),
+            # Tangent Bug
+            'gap_jump_ratio':      LaunchConfiguration('1.3'),
+            'heuristic_margin':    LaunchConfiguration('0.1'),
+            'tangent_sector_deg':  LaunchConfiguration('120'),
+            'min_follow_m':        LaunchConfiguration('0.25'),
+            # LiDAR
+            'front_half_deg':      LaunchConfiguration('30'),
+            'side_half_deg':       LaunchConfiguration('35'),
+            'lidar_yaw_offset':    LaunchConfiguration('math.pi'),  # LiDAR montado mirando hacia atrás
+            # Sistema
+            'hysteresis':          LaunchConfiguration('0.06'),
+            'replan_cooldown_s':   LaunchConfiguration('2.0'),
         }]
     )
 
@@ -317,7 +327,7 @@ def generate_launch_description():
         go_to_goal_node,
 
         # Safety layer
-        bug_iba_node,
+        bug_node,
 
         # Actuation
         controller_node,
