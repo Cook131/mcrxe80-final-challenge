@@ -257,12 +257,16 @@ def generate_launch_description():
         name='puzzlebot_mcl',
         output='screen',
         parameters=[{
-            'num_particles':    300,
+            'num_particles':    500,
             'lidar_yaw_offset': math.pi,
             'initial_yaw':      math.pi,
             'map_frame':        'map',
             'odom_frame':       'odom',
             'base_frame':       'base_link',
+            'pose_ema_alpha':     0.25,   # 0.25 si aún hay jitter, 0.5 si responde lento
+            'beam_skip':          10,
+            'sigma_hit':          0.38,
+            'resample_interval':  3,
         }]
     )
 
@@ -324,7 +328,7 @@ def generate_launch_description():
         go_to_goal_node,
 
         # Safety layer
-        ##bug_node,
+        bug_node,
 
         # Actuation
         controller_node,

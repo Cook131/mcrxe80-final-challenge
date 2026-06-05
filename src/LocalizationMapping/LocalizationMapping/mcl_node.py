@@ -66,6 +66,7 @@ Parameters (--ros-args -p name:=value)
   lidar_yaw_offset     0.0      static LiDAR mount correction [rad]
   min_trans            0.05     motion threshold for predict+update [m]
   min_rot              0.05     motion threshold for predict+update [rad]
+  pose_ema_alpha        0.35    EMA smoothing on published pose [0=frozen, 1=raw]
   pose_publish_hz      20.0     pose publish rate (always-on timer)
   initial_x/y/yaw      0.0      initial pose mean
   initial_cov_x/y/yaw  0.5/0.5/0.2  initial spread (σ)
@@ -248,6 +249,7 @@ class PuzzlebotMCL(Node):
 
         self.declare_parameter('min_trans', 0.05)
         self.declare_parameter('min_rot',   0.05)
+        self.declare_parameter('pose_ema_alpha', 0.35)   # EMA smoothing [0=frozen, 1=raw]
 
         self.declare_parameter('initial_x',       0.0)
         self.declare_parameter('initial_y',       0.0)
@@ -281,6 +283,7 @@ class PuzzlebotMCL(Node):
         self._yaw_offset   = self.get_parameter('lidar_yaw_offset').value
         self._min_trans    = self.get_parameter('min_trans').value
         self._min_rot      = self.get_parameter('min_rot').value
+        self._ema_alpha    = self.get_parameter('pose_ema_alpha').value
 
         self._map_frame    = self.get_parameter('map_frame').value
         self._odom_frame   = self.get_parameter('odom_frame').value
@@ -384,7 +387,7 @@ class PuzzlebotMCL(Node):
             f'EDT backend={_EDT_BACKEND} | '
             f'beam_skip={self._beam_skip} | '
             f'min_trans={self._min_trans} m | min_rot={self._min_rot} rad | '
-            f'pose_hz={pose_hz}'
+            f'pose_ema_alpha={self._ema_alpha} | pose_hz={pose_hz}'
         )
 
         if _EDT_BACKEND == 'none':
@@ -450,6 +453,7 @@ class PuzzlebotMCL(Node):
             self._particles[:, 1] = self._rng.normal(y,   sy,  self._N)
             self._particles[:, 2] = self._rng.normal(yaw, sya, self._N)
             self._weights[:]      = 1.0 / self._N
+            # Hard-reset EMA state — no blending from the previous estimate
             self._pose_x   = x
             self._pose_y   = y
             self._pose_yaw = yaw
@@ -531,10 +535,16 @@ class PuzzlebotMCL(Node):
             cs   = float(np.dot(self._weights, np.cos(self._particles[:, 2])))
             pyaw = math.atan2(ss, cs)
 
+            # ── EMA smoothing — suppresses frame-to-frame jitter ─────────
+            # alpha=1.0 → raw particle mean (original behaviour)
+            # alpha<1.0 → exponential moving average over successive estimates
+            a = self._ema_alpha
             with self._pose_lock:
-                self._pose_x            = px
-                self._pose_y            = py
-                self._pose_yaw          = pyaw
+                self._pose_x   = a * px  + (1.0 - a) * self._pose_x
+                self._pose_y   = a * py  + (1.0 - a) * self._pose_y
+                # Circular EMA: blend on the shortest angular arc
+                yaw_diff       = normalize_angle(pyaw - self._pose_yaw)
+                self._pose_yaw = normalize_angle(self._pose_yaw + a * yaw_diff)
                 self._odom_snap_for_pub = odom_snap
 
         # ── 4. Resample ───────────────────────────────────────────────────

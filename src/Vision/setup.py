@@ -10,9 +10,9 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('lib/python3.10/site-packages/puzzlebot', [   # ← aquí el cambio
-            'configs/camera_params.npz',
-            'configs/camera_params.json',
+        ('lib/python3.10/site-packages/Vision', [
+            'Vision/camera_params.npz',
+            'Vision/camera_params.json',
         ]),
     ],
     install_requires=['setuptools'],

@@ -34,7 +34,7 @@ setup(
             # format:  'executable_name = package.module:main_function'
             'slam                  = LocalizationMapping.slam_node:main',
             'mcl                   = LocalizationMapping.mcl_node:main',
-            'aruco_localizer       = LocaliztaionMapping.aruco_localizer:main',
+            'aruco_localizer       = LocalizationMapping.aruco_localizer:main',
             'mapping_node          = LocalizationMapping.mapping_node:main',
             'aruco_map_publisher   = LocalizationMapping.aruco_map_publisher:main',
         ],
