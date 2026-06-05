@@ -1,52 +1,15 @@
 #!/usr/bin/env python3
 """
-bug_tangent.py  —  Capa Reflejo de Seguridad v5.1  (Tangent Bug + A* Replan)
-=============================================================================
+bug_tangent.py  —  Capa Reflejo de Seguridad v5.2  (Tangent Bug + A* Replan + Map Filter)
+========================================================================================
 Nodo intermedio entre nav_fsm/GoToGoal y puzzlebotController.
 
-Pipeline (drop-in replacement para bug_IBA.py):
-  A* ──/goal──► GoToGoal ──/cmd_raw──► [bug_tangent] ──/cmd_vel──► Controller
-                                              ▲  │
-                                         /scan  └──/replan_trigger──► A*
-
-Algoritmo: Tangent Bug
-──────────────────────
-Detecta discontinuidades en el LiDAR ("puntos tangentes") que representan los
-bordes de los obstáculos, y evalúa la heurística d() en cada uno:
-
-    d(robot→tangente) + d(tangente→goal) < d(robot→goal) * (1 - heuristic_margin)
-
-Cuando existe un punto tangente que satisface esta condición Y el gap hacia
-él es físicamente transitable (ancho ≥ 2 * robot_radius * safety_factor),
-el robot sale del wall-follow inmediatamente y dispara un replan A*.
-
-Cambios v5.1 sobre v5.0 — "Robot-aware gap filtering"
-──────────────────────────────────────────────────────
-[FIX-R1]  RADIO DEL ROBOT EXPLÍCITO (robot_radius_m):
-          Todos los umbrales de seguridad se derivan de este parámetro.
-          gap_min_width_m   → reemplazado por 2 * robot_radius * gap_safety_factor
-          wall_follow_dist  → forzado a ≥ robot_radius + wall_clearance_m
-          emergency_dist    → forzado a ≥ robot_radius (el cuerpo no puede penetrar)
-
-[FIX-R2]  ESTIMACIÓN DE ANCHO DE GAP CORREGIDA:
-          Se mide el ancho transitable real del gap proyectando la apertura
-          angular al rango del punto de entrada, en lugar de la cuerda entre
-          los dos rayos borde. Esto es más preciso a distancias variables.
-          Fórmula: gap_width = r * 2 * sin(delta_angle / 2)
-          donde r es la distancia al borde cercano del gap y delta_angle
-          es el arco angular entre los dos rayos que lo delimitan.
-
-[FIX-R3]  CLEARANCE LATERAL EN WALL-FOLLOW:
-          El P-controller lateral usa wall_follow_dist, pero ahora tiene un
-          floor explícito de robot_radius + wall_clearance_m para que nunca
-          el borde del robot roce la pared aunque el parámetro sea mal tuneado.
-
-Estados (por prioridad, más alto primero):
-  P1  REFLEX_STOP      front ≤ stop_dist → publica Twist() cero
-  P2  TANGENT_WALL     front ≤ emg_dist  → wall-follow con P-controller lateral
-                       salida por heurística d() sobre gap tangente
-  P3  PREDICTIVE_BRAKE front ≤ warn_dist → frena proporcionalmente
-  P4  PASS_THROUGH     pasa /cmd_raw sin modificar
+Algoritmo:
+1. Filtra el /scan contra el /map. Las paredes conocidas se ignoran.
+2. Detecta obstáculos DESCONOCIDOS que interrumpen la trayectoria.
+3. Al detectar uno, desactiva la navegación global (/nav_pause = True) y asume control.
+4. Esquiva el obstáculo mediante heurística Tangent Bug.
+5. Al librar el obstáculo, dispara un recálculo de ruta (/replan_trigger).
 """
 
 import math
@@ -57,7 +20,7 @@ from typing import Optional
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist, Pose2D
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
@@ -73,37 +36,23 @@ REFLEX_STOP      = "REFLEX_STOP"
 @dataclass
 class TangentGap:
     """Representa un gap navegable detectado en el LiDAR."""
-    bearing: float        # Ángulo del borde del gap [rad, frame robot]
-    gap_x: float          # Posición estimada del borde en frame mundo [m]
-    gap_y: float          # Posición estimada del borde en frame mundo [m]
-    d_heuristic: float    # d(robot→gap) + d(gap→goal)
-    width_m: float        # Ancho transitable estimado del gap [m]
+    bearing: float
+    gap_x: float
+    gap_y: float
+    d_heuristic: float
+    width_m: float
 
 
 class TangentBugReflex(Node):
-    """
-    Subsumption safety layer con Tangent Bug, braking predictivo y replan A*.
-    Drop-in replacement para BugReflex (bug_IBA.py v4.1).
-    """
-
     def __init__(self):
         super().__init__('bug_tangent')
 
         # ── Parámetros: geometría del robot ───────────────────────────────────
-        # Radio de circunscripción del Puzzlebot (mitad de la diagonal) [m].
-        # Mídelo físicamente: sqrt((largo/2)^2 + (ancho/2)^2).
-        # Todos los umbrales de clearance se derivan de este valor.
         self.declare_parameter('robot_radius_m',      0.18)
-
-        # Factor de seguridad multiplicado por 2*robot_radius para exigir
-        # que el gap sea más ancho que el robot. 1.5 = 50% de margen extra.
         self.declare_parameter('gap_safety_factor',   1.5)
-
-        # Clearance lateral mínimo entre el borde del robot y la pared [m].
-        # wall_follow_dist se fuerza a ≥ robot_radius + wall_clearance_m.
         self.declare_parameter('wall_clearance_m',    0.08)
 
-        # ── Parámetros heredados de v4.1 (nombres compatibles) ────────────────
+        # ── Parámetros heredados ──────────────────────────────────────────────
         self.declare_parameter('warn_dist',           0.65)
         self.declare_parameter('emergency_dist',      0.35)
         self.declare_parameter('stop_dist',           0.14)
@@ -120,18 +69,9 @@ class TangentBugReflex(Node):
         self.declare_parameter('wall_follow_w_max',   0.80)
 
         # ── Parámetros Tangent Bug ─────────────────────────────────────────────
-        # Relación mínima r[j]/r[i] entre rayos adyacentes para detectar un gap.
-        # 1.3 → el rayo libre debe ser ≥30% más largo que el rayo del obstáculo.
         self.declare_parameter('gap_jump_ratio',      1.30)
-
-        # Margen de la heurística: el gap debe ahorrar al menos este porcentaje
-        # sobre la distancia directa al goal. 0.10 = 10% de ahorro mínimo.
         self.declare_parameter('heuristic_margin',    0.10)
-
-        # Semisector de búsqueda de gaps a izquierda y derecha [deg].
         self.declare_parameter('tangent_sector_deg',  120.0)
-
-        # Distancia mínima de wall-follow antes de evaluar gaps de salida [m].
         self.declare_parameter('min_follow_m',        0.25)
 
         # ── Leer y validar parámetros ──────────────────────────────────────────
@@ -139,16 +79,10 @@ class TangentBugReflex(Node):
         self._gap_safety   = float(self.get_parameter('gap_safety_factor').value)
         self._wall_clr     = float(self.get_parameter('wall_clearance_m').value)
 
-        # [FIX-R1] gap_min_width_m derivado del radio del robot
         self._gap_min_w    = 2.0 * self._robot_r * self._gap_safety
 
         self.warn_d        = float(self.get_parameter('warn_dist').value)
-        # [FIX-R1] emergency_dist nunca puede ser menor que el radio del robot
-        self.emg_d         = max(
-            float(self.get_parameter('emergency_dist').value),
-            self._robot_r
-        )
-        # [FIX-R1] stop_dist nunca puede ser negativo (sanity check)
+        self.emg_d         = max(float(self.get_parameter('emergency_dist').value), self._robot_r)
         self.stop_d        = max(float(self.get_parameter('stop_dist').value), 0.05)
 
         self.ref_v         = float(self.get_parameter('reflex_v').value)
@@ -160,11 +94,7 @@ class TangentBugReflex(Node):
         self._lidar_yaw    = float(self.get_parameter('lidar_yaw_offset').value)
         self._replan_cd    = float(self.get_parameter('replan_cooldown_s').value)
 
-        # [FIX-R3] wall_follow_dist forzado a ≥ robot_radius + wall_clearance
-        self._wf_dist      = max(
-            float(self.get_parameter('wall_follow_dist').value),
-            self._robot_r + self._wall_clr
-        )
+        self._wf_dist      = max(float(self.get_parameter('wall_follow_dist').value), self._robot_r + self._wall_clr)
         self._wf_kp        = float(self.get_parameter('wall_follow_kp').value)
         self._wf_w_max     = float(self.get_parameter('wall_follow_w_max').value)
 
@@ -190,7 +120,6 @@ class TangentBugReflex(Node):
         self._goal_x: Optional[float] = None
         self._goal_y: Optional[float] = None
 
-        # Estado wall-follow
         self._hit_x          = 0.0
         self._hit_y          = 0.0
         self._traveled       = 0.0
@@ -199,18 +128,23 @@ class TangentBugReflex(Node):
         self._turn_sign      = +1.0
         self._best_gap: Optional[TangentGap] = None
 
-        # ── QoS best-effort para LiDAR ────────────────────────────────────────
-        scan_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=5)
+        # ── Variables del Mapa Estático ───────────────────────────────────────
+        self.grid_map     = None
+        self.map_origin_x = 0.0
+        self.map_origin_y = 0.0
+        self.map_res      = 0.05
+        self.map_width    = 0
+        self.map_height   = 0
 
         # ── Suscriptores ──────────────────────────────────────────────────────
-        self.create_subscription(Twist,     '/cmd_raw',      self._cb_cmd,   10)
-        self.create_subscription(LaserScan, '/scan',         self._cb_scan,  scan_qos)
-        self.create_subscription(Odometry,  '/odom',         self._cb_odom,  10)
-        self.create_subscription(String,    '/astar/status', self._cb_astar, 10)
-        self.create_subscription(Pose2D,    '/astar/goal',   self._cb_goal,  10)
+        scan_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=5)
+        
+        self.create_subscription(OccupancyGrid, '/map',          self._cb_map,   10)
+        self.create_subscription(Twist,         '/cmd_raw',      self._cb_cmd,   10)
+        self.create_subscription(LaserScan,     '/scan',         self._cb_scan,  scan_qos)
+        self.create_subscription(Odometry,      '/odom',         self._cb_odom,  10)
+        self.create_subscription(String,        '/astar/status', self._cb_astar, 10)
+        self.create_subscription(Pose2D,        '/astar/goal',   self._cb_goal,  10)
 
         # ── Publicadores ──────────────────────────────────────────────────────
         self._pub_cmd       = self.create_publisher(Twist,  '/cmd_vel',        10)
@@ -220,21 +154,16 @@ class TangentBugReflex(Node):
 
         self.create_timer(0.05, self._loop)   # 20 Hz
 
-        # Log efectivo para confirmar los floors aplicados
-        self.get_logger().info(
-            f'[TangentBug v5.1] Lista\n'
-            f'  robot_radius    = {self._robot_r:.3f} m\n'
-            f'  gap_min_width   = {self._gap_min_w:.3f} m  '
-            f'(2 * {self._robot_r:.3f} * {self._gap_safety:.1f})\n'
-            f'  wall_follow_dist= {self._wf_dist:.3f} m  '
-            f'(floor = robot_r + wall_clr = {self._robot_r + self._wall_clr:.3f})\n'
-            f'  emergency_dist  = {self.emg_d:.3f} m  '
-            f'(floor = robot_r = {self._robot_r:.3f})\n'
-            f'  warn_dist       = {self.warn_d:.3f} m\n'
-            f'  stop_dist       = {self.stop_d:.3f} m'
-        )
-
     # ── Callbacks ─────────────────────────────────────────────────────────────
+
+    def _cb_map(self, msg: OccupancyGrid):
+        """Procesa el mapa estático para poder filtrar paredes conocidas."""
+        self.map_origin_x = msg.info.origin.position.x
+        self.map_origin_y = msg.info.origin.position.y
+        self.map_res      = msg.info.resolution
+        self.map_width    = msg.info.width
+        self.map_height   = msg.info.height
+        self.grid_map     = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
 
     def _cb_cmd(self, msg: Twist):
         self._last_cmd = msg
@@ -254,15 +183,51 @@ class TangentBugReflex(Node):
         if msg.x != self._goal_x or msg.y != self._goal_y:
             self._goal_x = msg.x
             self._goal_y = msg.y
-            self.get_logger().info(
-                f'[TangentBug] Goal actualizado: ({msg.x:.2f}, {msg.y:.2f})')
 
     def _cb_astar(self, msg: String):
         if msg.data in ('EXECUTING', 'GOAL_REACHED', 'NO_PATH'):
             if self._replanning:
-                self.get_logger().info(
-                    f'[TangentBug] Replan completado (A*: {msg.data})')
+                self.get_logger().info(f'[TangentBug] Replan completado (A*: {msg.data})')
             self._replanning = False
+
+    # ── Lógica de Filtrado ────────────────────────────────────────────────────
+
+    def _filter_scan(self, scan: LaserScan) -> np.ndarray:
+        """
+        Retorna un array de rangos donde los puntos que coinciden con paredes 
+        del mapa estático se vuelven 'inf'. Solo quedan obstáculos desconocidos.
+        """
+        ranges = np.asarray(scan.ranges, dtype=np.float32)
+        if self.grid_map is None:
+            return ranges  # Si no hay mapa, tratar todo como desconocido
+
+        angles = scan.angle_min + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment + self._lidar_yaw
+
+        # Proyectar puntos al frame mundo
+        x_w = self._robot_x + ranges * np.cos(angles + self._robot_yaw)
+        y_w = self._robot_y + ranges * np.sin(angles + self._robot_yaw)
+
+        # Convertir a índices del mapa
+        ix = np.floor((x_w - self.map_origin_x) / self.map_res).astype(int)
+        iy = np.floor((y_w - self.map_origin_y) / self.map_res).astype(int)
+
+        # Validar fronteras y rangos válidos
+        valid_idx = (
+            (ix >= 0) & (ix < self.map_width) & 
+            (iy >= 0) & (iy < self.map_height) & 
+            (ranges > scan.range_min) & (ranges < scan.range_max)
+        )
+
+        is_known = np.zeros_like(ranges, dtype=bool)
+        
+        # Consultar celdas del mapa (Consideramos ocupado si el costo es > 50)
+        map_vals = self.grid_map[iy[valid_idx], ix[valid_idx]]
+        is_known[valid_idx] = map_vals > 50
+
+        # Crear nuevo array filtrado
+        filtered_ranges = ranges.copy()
+        filtered_ranges[is_known] = np.inf
+        return filtered_ranges
 
     # ── Loop principal ────────────────────────────────────────────────────────
 
@@ -272,9 +237,13 @@ class TangentBugReflex(Node):
             self._publish(self._last_cmd, PASS_THROUGH)
             return
 
-        front = self._sector_min(scan, 0.0,                self.front_h)
-        left  = self._sector_min(scan, math.radians( 90),  self.side_h)
-        right = self._sector_min(scan, math.radians(-90),  self.side_h)
+        # 1. Obtenemos el scan filtrado (solo obstáculos nuevos)
+        filtered_ranges = self._filter_scan(scan)
+
+        # 2. Las métricas de distancia usan el scan filtrado
+        front = self._sector_min(scan, filtered_ranges, 0.0,               self.front_h)
+        left  = self._sector_min(scan, filtered_ranges, math.radians( 90), self.side_h)
+        right = self._sector_min(scan, filtered_ranges, math.radians(-90), self.side_h)
 
         now         = time.monotonic()
         hold_active = (now - self._reflex_ts) < self.hold_s
@@ -293,7 +262,7 @@ class TangentBugReflex(Node):
             self._publish(Twist(), REFLEX_STOP)
             return
 
-        # ── P2: TANGENT_WALL ──────────────────────────────────────────────────
+        # ── P2: TANGENT_WALL (Evasión) ────────────────────────────────────────
         in_wall = (self._mode == TANGENT_WALL)
         emg_thr = self.emg_d + (self.hyst if in_wall else 0.0)
 
@@ -301,21 +270,15 @@ class TangentBugReflex(Node):
             if not in_wall:
                 self._enter_wall_follow(left, right, now)
             else:
-                step = math.hypot(self._robot_x - self._prev_x,
-                                  self._robot_y - self._prev_y)
+                step = math.hypot(self._robot_x - self._prev_x, self._robot_y - self._prev_y)
                 self._traveled += step
                 self._prev_x    = self._robot_x
                 self._prev_y    = self._robot_y
 
                 if self._traveled >= self._min_follow:
-                    gap = self._best_tangent_gap(scan)
+                    gap = self._best_tangent_gap(scan, filtered_ranges)
                     if gap is not None:
-                        self.get_logger().info(
-                            f'[TangentBug] Salida por gap tangente | '
-                            f'bearing={math.degrees(gap.bearing):.1f}° | '
-                            f'd_heur={gap.d_heuristic:.2f}m vs '
-                            f'd_direct={self._dist_to_goal(self._robot_x, self._robot_y):.2f}m | '
-                            f'ancho={gap.width_m:.2f}m (min={self._gap_min_w:.2f}m)')
+                        self.get_logger().info(f'[TangentBug] Evasión terminada, saliendo por gap.')
                         self._best_gap = gap
                         self._maybe_trigger_replan(now)
                         self._pub_nav_pause.publish(self._bool_msg(False))
@@ -342,8 +305,7 @@ class TangentBugReflex(Node):
 
         # ── P4: PASS_THROUGH ──────────────────────────────────────────────────
         if self._mode not in (PASS_THROUGH,):
-            self.get_logger().info(
-                f'[TangentBug] {self._mode} → PASS | frente={front:.2f}m')
+            self.get_logger().info(f'[TangentBug] {self._mode} → PASS (Despejado)')
         self._publish(self._last_cmd, PASS_THROUGH)
 
     # ── Entrada al wall-follow ────────────────────────────────────────────────
@@ -363,38 +325,18 @@ class TangentBugReflex(Node):
             self._turn_sign = self._last_turn_sign
         self._last_turn_sign = self._turn_sign
 
+        # 3. Desactivar la navegación global y tomar el control
         self._pub_nav_pause.publish(self._bool_msg(True))
-        self.get_logger().warn(
-            f'[TangentBug] Hit en ({self._hit_x:.2f}, {self._hit_y:.2f}) | '
-            f'bordeo={"IZQ" if self._turn_sign > 0 else "DER"} — nav PAUSADA')
+        self.get_logger().warn(f'[TangentBug] Obstáculo DESCONOCIDO detectado. Nav Pausada. Iniciando evasión.')
 
-    # ── Heurística Tangent Bug: detección de gaps robot-aware ────────────────
+    # ── Heurística Tangent Bug ────────────────────────────────────────────────
 
-    def _best_tangent_gap(self, scan: LaserScan) -> Optional[TangentGap]:
-        """
-        Detecta discontinuidades en el LiDAR y devuelve el gap con mejor
-        heurística d() que sea físicamente transitable por el robot.
-
-        [FIX-R2] Ancho del gap:
-          Se calcula como la cuerda del arco angular subtendido por el gap
-          a la distancia del rayo más corto (borde del obstáculo):
-
-              gap_width = r_near * 2 * sin(delta_angle / 2)
-
-          donde delta_angle es el ángulo entre los dos rayos que delimitan
-          el gap. Esto mide el ancho real de la apertura en el plano del
-          obstáculo, no la distancia entre puntos en el espacio 3D.
-
-        [FIX-R1] Umbral de ancho:
-          gap_width ≥ 2 * robot_radius * gap_safety_factor
-        """
+    def _best_tangent_gap(self, scan: LaserScan, filtered_ranges: np.ndarray) -> Optional[TangentGap]:
         if self._goal_x is None:
             return None
 
-        ranges = np.asarray(scan.ranges, dtype=np.float32)
-        angles = (scan.angle_min
-                  + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
-                  + self._lidar_yaw)
+        ranges = filtered_ranges # Usamos el scan ya sin el mapa estático
+        angles = scan.angle_min + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment + self._lidar_yaw
         angles = np.arctan2(np.sin(angles), np.cos(angles))
 
         sector_mask = (
@@ -426,32 +368,32 @@ class TangentBugReflex(Node):
             r_near = float(ranges[i])
             r_far  = float(ranges[j])
 
-            # Salto: rayo corto (obstáculo) seguido de rayo largo (espacio libre)
+            # Si r_near es inf, no hay obstáculo
+            if math.isinf(r_near):
+                continue
+
+            # Detectar discontinuidad (gap)
             if r_far < r_near * self._gap_ratio:
                 continue
 
-            # [FIX-R2] Ancho real del gap: cuerda angular a distancia r_near
             delta_angle = abs(float(angles[j]) - float(angles[i]))
-            # Normalizar por si el salto cruza ±π
             delta_angle = min(delta_angle, 2.0 * math.pi - delta_angle)
             gap_width   = r_near * 2.0 * math.sin(delta_angle / 2.0)
 
-            # [FIX-R1] El gap debe ser transitable por el robot completo
             if gap_width < self._gap_min_w:
                 continue
 
-            # Punto tangente: extremo del rayo largo (borde libre del gap)
             tang_angle = float(angles[j])
-            tang_x_rob = r_far * math.cos(tang_angle)
-            tang_y_rob = r_far * math.sin(tang_angle)
+            # Si el rayo libre r_far es inf, usar un rango nominal para proyectar
+            proj_r = r_far if not math.isinf(r_far) else scan.range_max
+            tang_x_rob = proj_r * math.cos(tang_angle)
+            tang_y_rob = proj_r * math.sin(tang_angle)
 
-            # Transformar al frame mundo con el yaw actual del robot
             tang_x_w = self._robot_x + cos_y * tang_x_rob - sin_y * tang_y_rob
             tang_y_w = self._robot_y + sin_y * tang_x_rob + cos_y * tang_y_rob
 
             d_to_tang   = math.hypot(tang_x_rob, tang_y_rob)
-            d_tang_goal = math.hypot(self._goal_x - tang_x_w,
-                                     self._goal_y - tang_y_w)
+            d_tang_goal = math.hypot(self._goal_x - tang_x_w, self._goal_y - tang_y_w)
             d_heur = d_to_tang + d_tang_goal
 
             if d_heur >= d_threshold:
@@ -468,26 +410,24 @@ class TangentBugReflex(Node):
 
         return best
 
-    # ── Wall-follow con P-controller lateral ──────────────────────────────────
+    # ── Control y Helpers ─────────────────────────────────────────────────────
 
     def _wall_follow_cmd(self, front: float, left: float, right: float) -> Twist:
-        """
-        [FIX-R3] wall_follow_dist tiene un floor de robot_radius + wall_clearance_m
-        aplicado en __init__, por lo que este método no necesita cambiarse.
-        El P-controller ya usa self._wf_dist que incluye el floor.
-        """
         turn_sign = self._turn_sign
         wall_dist = right if turn_sign > 0 else left
+
+        # Si perdemos la pared temporalmente (ej. por ser inf), limitamos el error
+        if math.isinf(wall_dist): wall_dist = self._wf_dist * 1.5
 
         lat_error = self._wf_dist - wall_dist
         w_lateral = -turn_sign * self._wf_kp * lat_error
         w_lateral = max(-self._wf_w_max, min(self._wf_w_max, w_lateral))
 
-        front_ratio = (front - self.emg_d) / max(self.warn_d - self.emg_d, 1e-6)
+        front_val = front if not math.isinf(front) else self.warn_d
+        front_ratio = (front_val - self.emg_d) / max(self.warn_d - self.emg_d, 1e-6)
         front_ratio = max(0.1, min(1.0, front_ratio))
         v_linear    = self.ref_v * front_ratio
 
-        # Esquina detectada: parar y girar
         if front < self.emg_d * 1.4:
             v_linear  = 0.0
             w_lateral = turn_sign * self.ref_w
@@ -496,8 +436,6 @@ class TangentBugReflex(Node):
         cmd.linear.x  = v_linear
         cmd.angular.z = w_lateral
         return cmd
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _dist_to_goal(self, x: float, y: float) -> float:
         if self._goal_x is None:
@@ -515,30 +453,17 @@ class TangentBugReflex(Node):
         self._pub_replan.publish(msg)
         self._replanning     = True
         self._last_replan_ts = now
-        self.get_logger().warn(
-            f'[TangentBug] Replan desde ({self._robot_x:.2f}, {self._robot_y:.2f})')
+        self.get_logger().warn(f'[TangentBug] Disparando REPLANIFICACIÓN desde ({self._robot_x:.2f}, {self._robot_y:.2f})')
 
-    def _sector_min(self, scan: LaserScan, center_rad: float, half_rad: float) -> float:
-        """
-        Devuelve la distancia mínima al obstáculo más cercano dentro del cono
-        definido por center_rad ± half_rad, corregido por lidar_yaw_offset.
-
-        Se usan tres conos:
-          - Frente : center=0.0 rad,   half=front_half_deg
-          - Izq    : center=+π/2 rad,  half=side_half_deg
-          - Der    : center=-π/2 rad,  half=side_half_deg
-        """
-        ranges = np.asarray(scan.ranges, dtype=np.float32)
-        angles = (scan.angle_min
-                  + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
-                  + self._lidar_yaw)
+    def _sector_min(self, scan: LaserScan, filtered_ranges: np.ndarray, center_rad: float, half_rad: float) -> float:
+        angles = scan.angle_min + np.arange(len(filtered_ranges), dtype=np.float32) * scan.angle_increment + self._lidar_yaw
         diff = np.arctan2(np.sin(angles - center_rad), np.cos(angles - center_rad))
         mask = (
             (np.abs(diff) <= half_rad) &
-            (ranges > scan.range_min) &
-            (ranges < scan.range_max)
+            (filtered_ranges > scan.range_min) &
+            (filtered_ranges < scan.range_max)
         )
-        valid = ranges[mask]
+        valid = filtered_ranges[mask]
         return float(np.min(valid)) if valid.size > 0 else float('inf')
 
     def _bool_msg(self, val: bool) -> Bool:
@@ -547,9 +472,7 @@ class TangentBugReflex(Node):
     def _publish(self, cmd: Twist, mode: str):
         if mode != self._mode:
             if mode not in (PASS_THROUGH, PREDICTIVE_BRAKE):
-                self.get_logger().warn(
-                    f'[TangentBug] {self._mode} → {mode}',
-                    throttle_duration_sec=0.4)
+                self.get_logger().warn(f'[TangentBug] {self._mode} → {mode}', throttle_duration_sec=0.4)
             if self._mode == TANGENT_WALL and mode == PASS_THROUGH:
                 self._pub_nav_pause.publish(self._bool_msg(False))
             self._mode = mode

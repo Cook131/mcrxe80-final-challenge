@@ -151,7 +151,7 @@ def generate_launch_description():
             'goal_out_topic':     '/goal',
             'inflation_radius':   0.2,
             'waypoint_threshold': 0.10,
-            'occupied_threshold': 65,
+            'occupied_threshold': 50,
             'allow_diagonal':     False,
         }]
     )
@@ -164,22 +164,6 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 7. Bug IBA — safety reflex layer BUG2 + lateral control v4.1 ───────
-    #
-    # Cambios v4.1 respecto a v4.0:
-    #   stop_dist        0.14m   era 0.13 — margen sobre diagonal robot (0.186m)
-    #   emergency_dist   0.35m   era 0.30 — reacciona ~13cm antes de estar pegado
-    #   warn_dist        0.65m   sin cambio
-    #   hysteresis       0.05m   era 0.03 — recalculado: 25% * (0.35-0.14)
-    #   reflex_v         0.06    era 0.10 — velocidad BASE del wall-follow;
-    #                             la velocidad real es adaptativa (ver FIX-3)
-    #   reflex_w         0.65    era 0.50 — restaurado para giros de esquina
-    #   wall_follow_dist 0.40m   NEW — distancia lateral deseada al muro (P-ctrl)
-    #   wall_follow_kp   1.20    NEW — ganancia P-controller lateral
-    #   wall_follow_w_max 0.80   NEW — límite angular del P-controller [rad/s]
-    #   m_line_tol       0.15m   era 0.12 — más tolerante para salida BUG2
-    #   bug2_min_follow  0.30m   era 0.20 — más distancia antes de chequear salida
-    #   bug2_min_time_s  1.0s    NEW — tiempo mínimo en wall-follow (anti-ruido odom)
     bug_node = Node(
         package    = 'iolair',
         executable = 'bug_tangent',
