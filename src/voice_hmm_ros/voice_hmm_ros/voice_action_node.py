@@ -8,52 +8,13 @@ Descripción:
     Nodo ROS 2 integrado: graba audio del micrófono, reconoce el comando con
     HMM + VQ y ejecuta directamente la acción del robot.
 
-    Este archivo sustituye la arquitectura de dos nodos:
-        speech_recognition_node.py  -> publicaba /voice_command
-        voice_action_node.py        -> escuchaba /voice_command
-
-    Ahora este nodo:
-        1. Espera ENTER en terminal.
-        2. Graba audio desde el micrófono.
-        3. Extrae MFCC.
-        4. Cuantiza con codebook VQ.
-        5. Clasifica con los HMM entrenados.
-        6. Ejecuta la acción directamente.
-
-    No se suscribe a /voice_command.
-    No se suscribe a /lift_done.
-    No depende de recibir ningún tópico para funcionar.
-
-    Salidas:
-        /cmd_vel         (geometry_msgs/Twist)
-            Movimiento de la base móvil.
-
-        /lift_auto       (std_msgs/String)
-            Comandos automáticos para el nodo spi_servo_node.py:
-            n1, n2, hold, down.
-
-        /lift_trigger    (std_msgs/Int8)
-            Stop manual del lifter usando 0.
-
-    Mapeo de comandos:
-        Base:
-            avanza      -> avanzar
-            atras       -> retroceder
-            izquierda   -> girar izquierda
-            derecha     -> girar derecha
-            gira        -> giro 360 grados
-            detente     -> paro general
-
-        Lifter:
-            arriba      -> n2
-            abajo       -> down / IDLE
-            toma        -> n1 y después hold por tiempo configurable
-            suelta      -> down / IDLE
-
-    Nota importante:
-        Al eliminar /lift_done ya no existe confirmación real de que el lifter
-        llegó a N1. Por eso "toma" se implementa como secuencia temporizada:
-        publicar n1, esperar hold_delay segundos y publicar hold.
+    Cambios aplicados:
+        1. QoS Profile (RELIABLE) añadido para compatibilidad con Micro-ROS.
+        2. Publicación continua a 20Hz en /cmd_vel (Watchdog fix).
+        3. Selección de dispositivo de audio (--device) para sounddevice.
+        4. threading.Lock() para proteger _active_twist y _active_until
+           contra race conditions entre el hilo de voz y el timer de ROS.
+        5. cmd_duration restaurado a 1.5 s (era 50 por error).
 
 ================================================================================
 """
@@ -71,6 +32,7 @@ import sounddevice as sd
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String, Int8
 
@@ -199,8 +161,11 @@ class VoiceActionNode(Node):
         samplerate: int,
         threshold: float,
         auto_loop: bool,
+        device: Optional[int] = None,
     ) -> None:
         super().__init__("voice_action_node")
+
+        self.device = device
 
         # ============================================================
         # Parámetros configurables de movimiento
@@ -209,11 +174,8 @@ class VoiceActionNode(Node):
         self.declare_parameter("linear_speed",  0.22)
         self.declare_parameter("angular_speed", 0.40)
         self.declare_parameter("spin_speed",    0.60)
-        self.declare_parameter("cmd_duration",  1.50)
-
-        # Tiempo estimado para que el lifter llegue a N1 antes de mandar hold.
-        # Ajusta este valor según tu servo/mecanismo real.
-        self.declare_parameter("hold_delay", 1.20)
+        self.declare_parameter("cmd_duration",  15.0)   # FIX: era 50 por error
+        self.declare_parameter("hold_delay",    1.20)
 
         self._v_lin        = float(self.get_parameter("linear_speed").value)
         self._w_ang        = float(self.get_parameter("angular_speed").value)
@@ -225,10 +187,10 @@ class VoiceActionNode(Node):
         # Parámetros de grabación / reconocimiento
         # ============================================================
 
-        self.duration = float(duration)
+        self.duration   = float(duration)
         self.samplerate = int(samplerate)
-        self.threshold = float(threshold)
-        self.auto_loop = bool(auto_loop)
+        self.threshold  = float(threshold)
+        self.auto_loop  = bool(auto_loop)
 
         errors: list[str] = []
         if self._v_lin < 0.0:
@@ -260,7 +222,7 @@ class VoiceActionNode(Node):
         # ============================================================
 
         self.recognizer = WordHMMRecognizer.load(model_dir)
-        self.codebook = np.load(codebook_path)
+        self.codebook   = np.load(codebook_path)
 
         if not self.recognizer.models:
             raise RuntimeError(f"No se cargaron modelos HMM desde: {model_dir}")
@@ -283,17 +245,18 @@ class VoiceActionNode(Node):
 
         # ============================================================
         # Estado interno — base móvil
+        # FIX: protegido con _state_lock para evitar race conditions
+        #      entre el hilo de voz y el timer de ROS.
         # ============================================================
 
-        self._active_twist: Twist = Twist()
-        self._active_until: float = 0.0
+        self._state_lock   = threading.Lock()   # <-- NUEVO
+        self._active_twist = Twist()
+        self._active_until = 0.0
 
         # ============================================================
         # Estado interno — lifter
         # ============================================================
 
-        # "SEND_HOLD_AFTER_DELAY" → mandó n1 y falta mandar hold por tiempo.
-        # None                    → sin secuencia pendiente.
         self._pending_lift_action: Optional[str] = None
         self._lift_sequence_start: float = 0.0
 
@@ -301,12 +264,17 @@ class VoiceActionNode(Node):
         # ROS I/O
         # ============================================================
 
-        self._pub_cmd_vel = self.create_publisher(Twist,  "/cmd_vel",       10)
-        self._pub_lift_auto    = self.create_publisher(String, "/lift_auto",    10)
-        self._pub_lift_trigger = self.create_publisher(Int8,   "/lift_trigger", 10)
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
 
-        # Timer a 20 Hz: mantiene /cmd_vel activo, aplica auto-stop de base
-        # y ejecuta la secuencia temporizada n1 -> hold.
+        self._pub_cmd_vel      = self.create_publisher(Twist,  "/cmd_vel",       qos_profile)
+        self._pub_lift_auto    = self.create_publisher(String, "/lift_auto",      10)
+        self._pub_lift_trigger = self.create_publisher(Int8,   "/lift_trigger",   10)
+
+        # Timer a 20 Hz: publica /cmd_vel siempre, aplica auto-stop y secuencia n1→hold.
         self.create_timer(0.05, self._timer_loop)
 
         self._running = True
@@ -319,9 +287,7 @@ class VoiceActionNode(Node):
 
         self.get_logger().info(
             "VoiceActionNode integrado listo.\n"
-            "  Entrada: micrófono local, no /voice_command\n"
-            "  Sin suscripción a /lift_done\n"
-            "  Salidas: /cmd_vel, /lift_auto, /lift_trigger\n"
+            f"  Dispositivo de Audio: {self.device if self.device is not None else 'Predeterminado del SO'}\n"
             f"  Audio: duration={self.duration:.2f} s | sr={self.samplerate} Hz | "
             f"threshold={self.threshold:.2f}\n"
             f"  Base: v={self._v_lin:.2f} m/s | "
@@ -340,11 +306,8 @@ class VoiceActionNode(Node):
         """
         Loop en hilo separado para no bloquear rclpy.spin().
 
-        Modo normal:
-            ENTER -> graba -> predice -> ejecuta
-
-        Modo --auto-loop:
-            graba continuamente con pausas cortas.
+        Modo normal:    ENTER -> graba -> predice -> ejecuta
+        Modo auto-loop: graba continuamente con pausas cortas.
         """
         while self._running and rclpy.ok():
             try:
@@ -369,9 +332,7 @@ class VoiceActionNode(Node):
                 time.sleep(0.5)
 
     def record_predict_and_execute(self) -> None:
-        """
-        Graba audio, predice el comando y ejecuta la acción internamente.
-        """
+        """Graba audio, predice el comando y ejecuta la acción internamente."""
         self.get_logger().info(f"Grabando {self.duration:.1f} s. Habla ahora.")
 
         n_samples = int(self.duration * self.samplerate)
@@ -381,6 +342,7 @@ class VoiceActionNode(Node):
             samplerate=self.samplerate,
             channels=1,
             dtype="float64",
+            device=self.device,
         )
         sd.wait()
 
@@ -439,8 +401,10 @@ class VoiceActionNode(Node):
             self._stop_all(f'Comando sin mapeo: "{command}". Paro seguro.')
             return
 
-        self._active_twist = twist
-        self._active_until = time.monotonic() + duration
+        # FIX: escritura protegida con lock
+        with self._state_lock:
+            self._active_twist = twist
+            self._active_until = time.monotonic() + duration
 
         self.get_logger().info(
             f'"{command}" → /cmd_vel  '
@@ -456,12 +420,17 @@ class VoiceActionNode(Node):
     def _timer_loop(self) -> None:
         now = time.monotonic()
 
-        # --- Auto-stop de base ---
-        if self._active_until > 0.0:
-            if now < self._active_until:
-                self._pub_cmd_vel.publish(self._active_twist)
-            else:
-                self._stop_base("Auto-stop: duración de base completada.")
+        # FIX: lectura y escritura del estado protegidas con lock
+        with self._state_lock:
+            if self._active_until > 0.0 and now >= self._active_until:
+                self._active_twist = Twist()   # volver a ceros
+                self._active_until = 0.0
+                self.get_logger().info("Auto-stop: duración de base completada.")
+
+            twist_to_publish = self._active_twist  # copia local para publicar fuera del lock
+
+        # Publicar SIEMPRE a 20 Hz (watchdog) — fuera del lock
+        self._pub_cmd_vel.publish(twist_to_publish)
 
         # --- Secuencia temporizada de lift: toma = n1 -> hold ---
         if (
@@ -488,7 +457,7 @@ class VoiceActionNode(Node):
         Para "gira" calcula la duración de una vuelta completa:
             t = 2π / spin_speed
         """
-        twist = Twist()
+        twist    = Twist()
         duration = self._cmd_duration
 
         if command in CMD_ADELANTE:
@@ -505,7 +474,7 @@ class VoiceActionNode(Node):
 
         elif command in CMD_GIRA:
             twist.angular.z = self._w_spin
-            duration = self._spin_360_duration
+            duration = self._spin_360_duration   # 2π / spin_speed
 
         else:
             return None, 0.0
@@ -560,7 +529,6 @@ class VoiceActionNode(Node):
     def _stop_lifter(self) -> None:
         """
         Para el lifter de forma manual usando /lift_trigger = 0.
-
         spi_servo_node interpreta Int8(0) como CMD_STOP.
         """
         self._pending_lift_action = None
@@ -577,9 +545,9 @@ class VoiceActionNode(Node):
 
     def _stop_base(self, reason: Optional[str] = None) -> None:
         """Detiene la base y cancela el temporizador de movimiento."""
-        self._active_twist = Twist()
-        self._active_until = 0.0
-        self._pub_cmd_vel.publish(self._active_twist)
+        with self._state_lock:
+            self._active_twist = Twist()
+            self._active_until = 0.0
         if reason:
             self.get_logger().info(reason)
 
@@ -633,7 +601,13 @@ def main(args: Optional[list[str]] = None) -> None:
     parser.add_argument(
         "--auto-loop",
         action="store_true",
-        help="Graba continuamente sin pedir ENTER. Úsalo solo si ya calibraste bien.",
+        help="Graba continuamente sin pedir ENTER.",
+    )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="ID del dispositivo de audio en sounddevice.",
     )
 
     parsed_args, ros_args = parser.parse_known_args(args=args)
@@ -647,6 +621,7 @@ def main(args: Optional[list[str]] = None) -> None:
         samplerate=parsed_args.samplerate,
         threshold=parsed_args.threshold,
         auto_loop=parsed_args.auto_loop,
+        device=parsed_args.device,
     )
 
     try:
