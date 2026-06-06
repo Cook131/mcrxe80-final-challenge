@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'speech_recognition_node = voice_hmm_ros.speech_recognition_node:main',
+            'voice_action_node = voice_hmm_ros.voice_action_node:main',
         ],
     },
 )
