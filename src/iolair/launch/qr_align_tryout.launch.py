@@ -9,8 +9,8 @@ Nodos levantados:
   qr_collect_node      — FSM alignment QR
 
 Uso:
-  ros2 launch puzzlebot qr_align_tryout.launch.py zone:=rack
-  ros2 launch puzzlebot qr_align_tryout.launch.py zone:=conveyor
+  ros2 launch iolair qr_align_tryout.launch.py zone:=rack
+  ros2 launch iolair qr_align_tryout.launch.py zone:=conveyor
 
 Trigger manual (otra terminal):
   ros2 topic pub --once /collect/trigger std_msgs/String "data: rack"
@@ -24,6 +24,12 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
+
+    zone_arg = DeclareLaunchArgument(
+        'zone',
+        default_value='rack',
+        description="Zona de recolección: 'rack' (N1) o 'conveyor' (N2)",
+    )
 
     # ── ArUco Detector ────────────────────────────────────────────────────────
     # Suscribe /camera_raw/compressed directamente — sin remap necesario.
@@ -73,7 +79,7 @@ def generate_launch_description():
             '║                                                      ║\n',
             '║  Dispara (otra terminal):                            ║\n',
             '║    ros2 topic pub --once /collect/trigger \\          ║\n',
-            '║      std_msgs/String "data: rack"                    ║\n',
+            '║      std_msgs/String "data: ', LaunchConfiguration('zone'), '"\n',
             '║                                                      ║\n',
             '║  Monitorea:                                          ║\n',
             '║    ros2 topic echo /collect/done                     ║\n',
@@ -84,6 +90,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        zone_arg,
         log_ready,
         qr_collect,
         qr_zone_checker,
