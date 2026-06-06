@@ -1,0 +1,11 @@
+,abajo,arriba,atras,avanza,derecha,detente,gira,izquierda,suelta,toma
+abajo,24,0,0,1,0,0,0,0,0,0
+arriba,0,25,0,0,0,0,0,0,0,0
+atras,0,0,25,0,0,0,0,0,0,0
+avanza,1,0,0,24,0,0,0,0,0,0
+derecha,0,0,0,0,25,0,0,0,0,0
+detente,0,0,0,0,0,25,0,0,0,0
+gira,0,0,0,0,1,0,23,0,1,0
+izquierda,0,0,0,0,0,1,0,24,0,0
+suelta,0,0,0,0,0,0,0,0,25,0
+toma,0,0,0,0,0,0,0,0,0,25

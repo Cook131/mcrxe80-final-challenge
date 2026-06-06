@@ -159,7 +159,6 @@ class DiscreteBakisHMM:
                     A_counts[s, s] += max(dur - 1, 0)
                     A_counts[s, s + 1] += 1
                 else:
-                    # última región: el estado final absorbe el resto
                     A_counts[s, s] += max(len(seg) - 1, 0)
 
         eps = self.smoothing
@@ -211,7 +210,6 @@ class DiscreteBakisHMM:
                 terms = alpha[t - 1] + logA[:, j]
                 alpha[t, j] = float(np.asarray(logsumexp(terms)).item()) + logB_t[j, t]
 
-        # La palabra debe terminar en el último estado.
         loglik = float(alpha[T - 1, self.n_states - 1])
         return alpha, loglik
 
@@ -262,16 +260,49 @@ class DiscreteBakisHMM:
             path[t] = psi[t + 1, path[t + 1]]
         return best, path
 
-    def baum_welch_refine(self, sequences: Sequence[np.ndarray], max_iters: int = 5, tol: float = 1e-4) -> List[float]:
+    def baum_welch_refine(
+        self,
+        sequences: Sequence[np.ndarray],
+        max_iters: int = 5,
+        tol: float = 1e-4,
+        patience: int = 3,
+    ) -> List[float]:
+        """Reestimación de Baum-Welch con early stopping basado en log-likelihood de entrenamiento.
+
+        Early stopping:
+            - Se detiene si la mejora absoluta en LL promedio es menor que `tol` durante
+              `patience` iteraciones consecutivas sin batir el mejor valor histórico.
+            - Al terminar (por patience o por max_iters), restaura los parámetros (A, B)
+              de la iteración con mayor LL promedio observado.
+
+        Args:
+            sequences:  Secuencias de observaciones (enteros 0..M-1).
+            max_iters:  Tope duro de iteraciones (igual que antes).
+            tol:        Umbral mínimo de mejora para considerar progreso real.
+            patience:   Iteraciones consecutivas sin superar el mejor LL antes de parar.
+                        patience=1 reproduce el comportamiento original (para en la primera
+                        iteración sin mejora).
+
+        Returns:
+            history:    Lista de LL promedios por iteración (longitud <= max_iters).
+                        El índice del máximo indica la iteración óptima.
+                        Ejemplo: np.argmax(history) + 1  →  mejor número de iteraciones.
+        """
         sequences = [as_1d_int(seq) for seq in sequences if len(seq) >= self.n_states]
         if not sequences:
             return []
 
         history: List[float] = []
-        prev = -np.inf
         eps = self.smoothing
 
-        for _ in range(max_iters):
+        # ── Snapshot del mejor modelo ──────────────────────────────────────────
+        best_ll: float = -np.inf
+        best_A: np.ndarray = self.A.copy()
+        best_B: np.ndarray = self.B.copy()
+        no_improve_count: int = 0   # iteraciones consecutivas sin mejora real
+        # ───────────────────────────────────────────────────────────────────────
+
+        for iteration in range(max_iters):
             A_num = np.zeros_like(self.A)
             B_num = np.zeros_like(self.B)
             ll_total = 0.0
@@ -311,6 +342,7 @@ class DiscreteBakisHMM:
             if used == 0:
                 break
 
+            # ── Actualizar parámetros ──────────────────────────────────────────
             for i in range(self.n_states):
                 allowed = [i]
                 if i + 1 < self.n_states:
@@ -328,9 +360,29 @@ class DiscreteBakisHMM:
 
             avg = ll_total / used
             history.append(float(avg))
-            if len(history) > 1 and abs(avg - prev) < tol:
-                break
-            prev = avg
+
+            # ── Early stopping ─────────────────────────────────────────────────
+            if avg > best_ll + tol:
+                # Mejora real: actualizar snapshot y reiniciar contador
+                best_ll = avg
+                best_A = self.A.copy()
+                best_B = self.B.copy()
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+                if no_improve_count >= patience:
+                    # patience agotada → restaurar el mejor snapshot y salir
+                    self.A = best_A
+                    self.B = best_B
+                    self._sanitize()
+                    break
+            # ───────────────────────────────────────────────────────────────────
+
+        else:
+            # Terminó el bucle por max_iters (no por break): restaurar igualmente
+            self.A = best_A
+            self.B = best_B
+            self._sanitize()
 
         return history
 
@@ -380,7 +432,8 @@ class WordHMMRecognizer:
         states_per_word: Optional[Dict[str, int]] = None,
         smoothing: float = 1e-6,
         bw_iters: int = 0,
-        bw_tol: float = 1e-4,
+        bw_tol: float = 0.01,
+        bw_patience: int = 3,
     ) -> Dict[str, List[float]]:
         self.models = {}
         histories: Dict[str, List[float]] = {}
@@ -399,7 +452,7 @@ class WordHMMRecognizer:
             model.initialize_from_counts(seqs)
             hist: List[float] = []
             if bw_iters > 0:
-                hist = model.baum_welch_refine(seqs, max_iters=bw_iters, tol=bw_tol)
+                hist = model.baum_welch_refine(seqs, max_iters=bw_iters, tol=bw_tol, patience=bw_patience)
             self.models[word] = model
             histories[word] = hist
         return histories

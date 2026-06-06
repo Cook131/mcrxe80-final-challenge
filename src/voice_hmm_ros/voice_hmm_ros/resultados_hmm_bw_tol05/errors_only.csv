@@ -1,0 +1,6 @@
+file,speaker,y_true,y_pred,correct,top1_score,top2_label,top2_score,margin,seq_len
+dataset_unificado_6/abajo/dataset_serch/abajo_serch_7.wav,dataset_serch,abajo,avanza,0,-214.00360936560764,abajo,-216.44457369363442,2.44096432802678,65
+dataset_unificado_6/avanza/dataset_arah/avanza_arah_2.wav,dataset_arah,avanza,abajo,0,-143.41969762710548,arriba,-160.9495050314785,17.52980740437303,41
+dataset_unificado_6/gira/dataset_EugenioMtz/gira_EugenioMtz_24.wav,dataset_EugenioMtz,gira,suelta,0,-436.66342600804774,arriba,-439.47749791784565,2.814071909797917,88
+dataset_unificado_6/gira/dataset_EugenioMtz/gira_EugenioMtz_21.wav,dataset_EugenioMtz,gira,derecha,0,-172.08398956218656,gira,-186.03416325550944,13.950173693322881,53
+dataset_unificado_6/izquierda/dataset_arah/izquierda_arah_1.wav,dataset_arah,izquierda,detente,0,-465.0987610754527,toma,-472.0266145741981,6.927853498745378,118

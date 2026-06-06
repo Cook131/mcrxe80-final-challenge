@@ -1,3 +1,25 @@
+# Datasets personales
+**/dataset_arah/
+**/dataset_jorge/
+**/dataset_nahomi/
+**/dataset_serch/
+**/dataset_EugenioMtz/
+
+# Mini reto
+**/mini_reto_pkg/
+**/resultados_mini_reto/
+
+# Python
+__pycache__/
+*.pyc
+
+# Audios
+*.wav
+
+# ROS
+build/
+install/
+log/
 # Colcon build artifacts
 build/
 install/

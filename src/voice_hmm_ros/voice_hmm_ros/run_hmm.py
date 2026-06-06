@@ -2,31 +2,65 @@
 ================================================================================
 Proyecto:    voice_hmm_ros (Módulo de Entrenamiento)
 Módulo:      run_hmm.py
-Descripción: Pipeline completo de entrenamiento y evaluación para el clasificador
-             de palabras aisladas. Realiza extracción de MFCC, cuantización vectorial
-             mediante el algoritmo LBG, inicialización de HMMs Bakis por conteo
-             lineal y refinamiento opcional con Baum-Welch.
 
-             Esta versión incluye análisis detallado:
-             - accuracy global
-             - matriz de confusión
-             - predicciones detalladas por audio
-             - errores individuales
-             - precision, recall y F1 por clase
-             - accuracy por locutor
-             - distribución de margen de confianza
-             - longitud de secuencia después del VAD
-             - curvas de log-likelihood Baum-Welch
+Descripción:
+    Pipeline completo de entrenamiento y evaluación para el clasificador de
+    palabras aisladas basado en MFCC + VQ + HMM discreto tipo Bakis.
+
+    El flujo principal realiza:
+        1. Carga y balanceo del dataset por palabra y locutor.
+        2. Preprocesamiento de audio con VAD, normalización y pre-énfasis.
+        3. Extracción de características MFCC.
+        4. Cuantización vectorial mediante codebook global LBG de 256 símbolos.
+        5. Entrenamiento de un HMM Bakis por comando.
+        6. Refinamiento opcional con Baum-Welch y early stopping.
+        7. Evaluación con accuracy, matriz de confusión, métricas por clase,
+           accuracy por locutor, errores individuales y margen de confianza.
+
+Configuración recomendada:
+    La configuración final recomendada usa Baum-Welch con un máximo de 20
+    iteraciones, tolerancia de early stopping de 0.05 y paciencia de 3
+    iteraciones. Esta configuración mantuvo el accuracy de prueba en 98% y
+    redujo iteraciones innecesarias en los modelos que ya habían saturado.
 
 Uso en Terminal:
-    1. Entrenamiento básico y evaluación:
-       $ python3 run_hmm.py --dataset-dir /ruta/al/dataset --results-dir resultados_hmm
 
-    2. Entrenamiento avanzado con refinamiento Baum-Welch y modo detallado:
-       $ python3 run_hmm.py --dataset-dir ./dataset --results-dir ./resultados --refine-bw --verbose
+    1. Entrenamiento recomendado con Baum-Welch + early stopping:
+       $ python3 run_hmm.py \
+           --dataset-dir ./dataset_unificado_6 \
+           --results-dir resultados_hmm_final \
+           --refine-bw \
+           --bw-iters 20 \
+           --bw-tol 0.05 \
+           --bw-patience 3 \
+           --n-states 5 \
+           --verbose
 
-    3. Inferencia o prueba con un único archivo WAV:
-       $ python3 run_hmm.py --dataset-dir ./dataset --load-only --predict-file /ruta/audio_test.wav
+    2. Entrenamiento básico sin refinamiento Baum-Welch:
+       $ python3 run_hmm.py \
+           --dataset-dir ./dataset_unificado_6 \
+           --results-dir resultados_hmm_baseline \
+           --n-states 5
+
+    3. Inferencia o prueba con un único archivo WAV usando modelos guardados:
+       $ python3 run_hmm.py \
+           --dataset-dir ./dataset_unificado_6 \
+           --results-dir resultados_hmm_final \
+           --load-only \
+           --predict-file /ruta/audio_test.wav
+
+Archivos generados:
+    - codebook.npy
+    - models/
+    - training_history.json
+    - run_config.json
+    - accuracy_test.txt
+    - confusion_matrix.csv
+    - predictions_detailed.csv
+    - errors_only.csv
+    - classification_report_by_class.csv
+    - accuracy_by_speaker.csv
+    - analysis_plots/
 
 ================================================================================
 """
@@ -847,7 +881,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refine-bw", action="store_true", help="Aplicar Baum-Welch después de conteos")
     parser.add_argument("--bw-iters", type=int, default=3, help="Iteraciones Baum-Welch si se activa --refine-bw")
     parser.add_argument("--bw-tol", type=float, default=1e-4)
-
+    parser.add_argument("--bw-patience", type=int, default=3, help="Iteraciones consecutivas sin mejora antes de early stopping (default: 3)")
     parser.add_argument("--load-only", action="store_true", help="No entrenar; cargar modelos y codebook ya guardados")
     parser.add_argument("--predict-file", default=None, help="Clasificar un archivo WAV individual")
     parser.add_argument("--verbose", action="store_true")
@@ -914,6 +948,7 @@ def main() -> None:
         "refine_bw": args.refine_bw,
         "bw_iters": args.bw_iters,
         "bw_tol": args.bw_tol,
+        "bw_patience": args.bw_patience,
         "random_seed": args.random_seed,
     }
 
@@ -989,6 +1024,7 @@ def main() -> None:
             smoothing=args.smoothing,
             bw_iters=args.bw_iters if args.refine_bw else 0,
             bw_tol=args.bw_tol,
+            bw_patience=args.bw_patience,
         )
 
         recognizer.save(model_dir)
@@ -996,6 +1032,22 @@ def main() -> None:
 
         with open(results_dir / "training_history.json", "w", encoding="utf-8") as f:
             json.dump(histories, f, ensure_ascii=False, indent=2)
+
+        print("\nIteraciones Baum-Welch utilizadas por palabra:")
+
+        for word, hist in histories.items():
+            if hist:
+                best_iter = int(np.argmax(hist)) + 1
+                best_ll = float(np.max(hist))
+
+                print(
+                    f"  {word:15s} "
+                    f"usadas={len(hist):2d} "
+                    f"mejor_iter={best_iter:2d} "
+                    f"best_ll={best_ll:.6f}"
+                )
+            else:
+                print(f"  {word:15s} usadas=0")
 
         acc, cm, labels, detailed_rows = evaluate_detailed(
             recognizer=recognizer,
