@@ -27,3 +27,6 @@ Terminal Compu
 cd mcr
 
 ros2 launch iolair manchester.launch.py
+
+
+ ros2 launch rosbridge_server rosbridge_websocket_launch.xml
