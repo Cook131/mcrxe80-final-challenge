@@ -133,6 +133,7 @@ class VFHPlus(Node):
         self._replanning     = False
         self._last_replan_ts = -999.0
         self._sector_rad     = (2.0 * math.pi) / self._N   # tamaño de cada sector [rad]
+        self._collect_bypass = False   # True mientras qr_align esté en ALIGN/ADVANCE/etc.
 
         # Mapa estático (filtro opcional)
         self.grid_map     = None
@@ -148,12 +149,13 @@ class VFHPlus(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=5
         )
-        self.create_subscription(LaserScan,     '/scan',         self._cb_scan,  scan_qos)
-        self.create_subscription(Odometry,      '/odom',         self._cb_odom,  10)
-        self.create_subscription(Twist,         '/cmd_raw',      self._cb_cmd,   10)
-        self.create_subscription(Pose2D,        '/astar/goal',   self._cb_goal,  10)
-        self.create_subscription(String,        '/astar/status', self._cb_astar, 10)
-        self.create_subscription(OccupancyGrid, '/map',          self._cb_map,   10)
+        self.create_subscription(LaserScan,     '/scan',           self._cb_scan,    scan_qos)
+        self.create_subscription(Odometry,      '/odom',           self._cb_odom,    10)
+        self.create_subscription(Twist,         '/cmd_raw',        self._cb_cmd,     10)
+        self.create_subscription(Pose2D,        '/astar/goal',     self._cb_goal,    10)
+        self.create_subscription(String,        '/astar/status',   self._cb_astar,   10)
+        self.create_subscription(OccupancyGrid, '/map',            self._cb_map,     10)
+        self.create_subscription(Bool,          '/collect/active', self._cb_collect, 10)
 
         # ── Publicadores ──────────────────────────────────────────────────
         self._pub_cmd    = self.create_publisher(Twist,  '/cmd_vel',        10)
@@ -196,6 +198,21 @@ class VFHPlus(Node):
         self.map_height   = msg.info.height
         self.grid_map     = np.array(msg.data, dtype=np.int8).reshape(
             (msg.info.height, msg.info.width))
+
+    def _cb_collect(self, msg: Bool):
+        """
+        Recibe la flag de qr_align_node.
+        True  → modo COLLECT_BYPASS: el VFH deja pasar cmd_raw sin intervenir.
+        False → regresa al comportamiento normal de evasión.
+        """
+        prev = self._collect_bypass
+        self._collect_bypass = msg.data
+        if self._collect_bypass != prev:
+            self.get_logger().warn(
+                f'[VFH+] collect_bypass → {"ON  — evasión inhibida para recolección"
+                                           if self._collect_bypass
+                                           else "OFF — evasión reactiva normal"}'
+            )
 
     # ── Filtro de mapa (ignora paredes conocidas igual que bug_tangent) ────────
 
@@ -442,6 +459,20 @@ class VFHPlus(Node):
         scan = self._scan
         if scan is None:
             self._publish(self._last_cmd, PASS_THROUGH)
+            return
+
+        # ── COLLECT_BYPASS — qr_align tiene el control fino ───────────────
+        # Mientras la operación de recolección esté activa, el VFH pasa
+        # cmd_raw sin tocar nada. El robot ya está muy cerca del objetivo
+        # y el QR (a ~28 cm) dispararía falsos positivos de obstáculo.
+        if self._collect_bypass:
+            if self._mode != PASS_THROUGH:
+                self.get_logger().info(
+                    '[VFH+] COLLECT_BYPASS activo — cediendo control a qr_align')
+                self._mode = PASS_THROUGH
+            self._pub_cmd.publish(self._last_cmd)
+            s = String(); s.data = 'COLLECT_BYPASS'
+            self._pub_status.publish(s)
             return
 
         ranges       = self._filter_scan(scan)

@@ -100,7 +100,7 @@ from rclpy.qos  import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import Twist, Pose2D
 from nav_msgs.msg      import Odometry
-from std_msgs.msg      import Float32, String
+from std_msgs.msg      import Bool, Float32, String
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -209,6 +209,7 @@ class QRCollectNode(Node):
         self._pub_done    = self.create_publisher(String, '/collect/done',       10)
         self._pub_payload = self.create_publisher(String, '/collect/qr_payload', 10)
         self._pub_goal    = self.create_publisher(Pose2D, '/astar/goal',         10)
+        self._pub_active  = self.create_publisher(Bool,   '/collect/active',     10)
 
         # ── Timer FSM ─────────────────────────────────────────────────────
         rate = float(self._p('fsm_rate_hz'))
@@ -253,6 +254,7 @@ class QRCollectNode(Node):
             self._publish_approach_goal()
             self._transition(_S.NAV_APPROACH)
         else:
+            self._set_vfh_bypass(True)
             self._transition(_S.ALIGN)
 
     def _cb_qr(self, msg: String):
@@ -357,6 +359,7 @@ class QRCollectNode(Node):
                     self.get_logger().info(
                         f'[NAV_APPROACH] Handoff alcanzado '
                         f'dist={self._qr_dist:.3f}m → ALIGN')
+                    self._set_vfh_bypass(True)
                     self._transition(_S.ALIGN)
                     return
                 # Else: todavía lejos, A* sigue navegando. No republiquemos
@@ -371,6 +374,7 @@ class QRCollectNode(Node):
             # Esperar confirmación de A*
             if self._astar_status == 'GOAL_REACHED':
                 self.get_logger().info('[NAV_APPROACH] A* GOAL_REACHED → ALIGN')
+                self._set_vfh_bypass(True)
                 self._transition(_S.ALIGN)
 
         # ── ALIGN ─────────────────────────────────────────────────────────
@@ -491,6 +495,7 @@ class QRCollectNode(Node):
             self.get_logger().info(
                 f'[Collect] ✅ SUCCESS — payload="{self._qr_payload}" '
                 f'zona="{self._zone}"')
+            self._set_vfh_bypass(False)
             self._pub_done.publish(String(data='SUCCESS'))
             self._reset()
             self._transition(_S.IDLE)
@@ -501,6 +506,7 @@ class QRCollectNode(Node):
             if self._lift_cmd:
                 self._pub_lift.publish(String(data='down'))
             self.get_logger().warn('[Collect] ❌ ABORT')
+            self._set_vfh_bypass(False)
             self._pub_done.publish(String(data='ABORT'))
             self._reset()
             self._transition(_S.IDLE)
@@ -555,6 +561,18 @@ class QRCollectNode(Node):
         return (
             self._qr_payload != ''
             and (time.monotonic() - self._qr_stamp) < self._p('qr_timeout')
+        )
+
+    def _set_vfh_bypass(self, active: bool):
+        """
+        Publica en /collect/active para inhibir (True) o reactivar (False) el VFH.
+        Llamar al entrar a ALIGN y al salir de la operación (DONE/ABORT).
+        """
+        msg = Bool()
+        msg.data = active
+        self._pub_active.publish(msg)
+        self.get_logger().info(
+            f'[Collect] VFH bypass → {"ON  (inhibido)" if active else "OFF (normal)"}'
         )
 
     def _stop(self):

@@ -4,13 +4,12 @@ ArUco Detector Doble-Diccionario + QR Node para Puzzlebot - Manchester Robotics
 
 Detecta marcadores usando DOS diccionarios en paralelo + QR codes:
   - Diccionario 4X4_50  IDs 0-4   → External WP 1…5  (paredes/esquinas)
-  - Diccionario 4X4_50  IDs 5-8   → Internal WP 1…4  (objetivos internos)
-  - Diccionario 4X4_50  IDs 9-10  → External WP 6-7  (también externos)
+  - Diccionario 4X4_50  IDs 5-10  → Internal WP 1…6  (objetivos internos)
   - QR codes                      → contenido del QR + distancia/ángulo
 
 Mapeo de IDs publicados:
-  20…29  → External WPs  (4X4_50 IDs 0-4, 9-10 → pub 20-24, 29-30)
-  10…15  → Internal WPs  (4X4_50 IDs 5-8   → pub 10-13)
+  20…24  → External WPs  (4X4_50 IDs 0-4   → pub 20-24)
+  10…15  → Internal WPs  (4X4_50 IDs 5-10  → pub 10-15)
 
 Tópicos:
   Suscribe:  /camera_raw/compressed   (sensor_msgs/CompressedImage)
@@ -28,11 +27,17 @@ Tópicos:
              /aruco/qr/distance       (std_msgs/msg/Float32)  metros en plano XZ
              /aruco/qr/angle          (std_msgs/msg/Float32)  grados, + = derecha
 
-Calibración:
-  Busca automáticamente camera_params.npz o camera_params.json
+Calibración FISHEYE:
+  Busca automáticamente fisheye_params.npz o fisheye_params.json
   en la misma carpeta que este script.
-  Calibración esperada a 1080x720 (resolución de entrada de la cámara).
-  El tamaño físico del QR se configura con el parámetro 'qr_size' (default 0.08 m).
+  IMPORTANTE: los coeficientes de distorsión deben ser del modelo FISHEYE de
+  OpenCV (cv2.fisheye.*), que usa 4 coeficientes (k1,k2,k3,k4), NO el modelo
+  estándar de 5 coeficientes.
+  El flujo correcto es:
+    1. cv2.fisheye.undistortPoints()  → puntos corregidos
+    2. cv2.solvePnP(..., distCoeffs=zeros)  → pose sin distorsión
+  Esto elimina el offset sistemático de 10-20 cm que produce solvePnP estándar
+  con lentes fisheye.
 """
 
 import json
@@ -65,8 +70,8 @@ LABEL_INTERNAL = {
     8: "Internal WP 4", 9: "Internal WP 5", 10: "Internal WP 6",
 }
 
-def external_pub_id(mid: int) -> int:  return 20 + mid
-def internal_pub_id(mid: int) -> int:  return 10 + (mid - 5)   # 5→10 … 10→15
+def external_pub_id(mid: int) -> int: return 20 + mid
+def internal_pub_id(mid: int) -> int: return 10 + (mid - 5)   # 5→10 … 10→15
 
 # ─────────────────────────────────────────────────────────────────────
 # Calibración
@@ -93,12 +98,21 @@ def _load_calibration(path: str):
     D = _find_key(data, _KEY_D)
     if K is None or D is None:
         raise KeyError(f"Claves de calibración no encontradas en '{path}'")
-    return np.array(K, dtype=np.float64).reshape(3, 3), np.array(D, dtype=np.float64).flatten()
+    K_arr = np.array(K, dtype=np.float64).reshape(3, 3)
+    D_arr = np.array(D, dtype=np.float64).flatten()
+    # Fisheye necesita exactamente 4 coeficientes (k1,k2,k3,k4)
+    if D_arr.size < 4:
+        raise ValueError(
+            f"Fisheye necesita 4 coeficientes de distorsión, "
+            f"se encontraron {D_arr.size} en '{path}'"
+        )
+    return K_arr, D_arr[:4].reshape(1, 4)   # shape (1,4) que pide cv2.fisheye
 
 def _auto_find_calib(script_dir: str):
     search = [script_dir, os.path.join(script_dir, '..', 'puzzlebot')]
     for d in search:
-        for name in ["fisheye_params.npz", "fisheye_params.json"]:
+        for name in ["fisheye_params.npz", "fisheye_params.json",
+                     "camera_params.npz",  "camera_params.json"]:
             p = os.path.normpath(os.path.join(d, name))
             if os.path.isfile(p):
                 return p
@@ -148,8 +162,12 @@ class ArucoDetectorNode(Node):
         self.declare_parameter('calib_file',    '')
         self.declare_parameter('marker_size',   self.MARKER_SIZE)
         self.declare_parameter('qr_size',       self.QR_SIZE)
-        # Offset cámara→base_link en metros [x, y, z] (frame de cámara)
-        self.declare_parameter('cam_offset', [0.07, 0.05, 0.13])
+        # Offset cámara→base_link en metros [x, y, z] (frame de cámara).
+        # Solo se usa para corregir la distancia/ángulo reportado al robot.
+        # FIX: solo compensamos tz (profundidad) para no introducir error
+        # al mezclar frames. Si necesitas compensación completa, aplica
+        # la rotación base_link→camera antes de restar.
+        self.declare_parameter('cam_offset', [0.0, 0.0, 0.13])
 
         camera_topic     = self.get_parameter('camera_topic').value
         self.marker_size = float(self.get_parameter('marker_size').value)
@@ -157,7 +175,7 @@ class ArucoDetectorNode(Node):
 
         # ── Calibración ───────────────────────────────────────────────
         self.camera_matrix = None
-        self.dist_coeffs   = None
+        self.dist_coeffs   = None   # shape (1,4) para cv2.fisheye
         self.pose_ready    = False
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -170,9 +188,10 @@ class ArucoDetectorNode(Node):
                 self.pose_ready = True
                 K = self.camera_matrix
                 self.get_logger().info(
-                    f"Calibración OK: '{calib_file}' | marker={self.marker_size}m\n"
+                    f"Calibración FISHEYE OK: '{calib_file}' | marker={self.marker_size}m\n"
                     f"  fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
-                    f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}"
+                    f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}\n"
+                    f"  dist(k1..k4)={self.dist_coeffs.flatten()}"
                 )
             except Exception as e:
                 self.get_logger().warn(f"Calibración fallida: {e} → Pose DESACTIVADA")
@@ -185,8 +204,6 @@ class ArucoDetectorNode(Node):
         self.qr_detector = cv2.QRCodeDetector()
 
         # ── Suscriptor — CompressedImage ──────────────────────────────
-        # BEST_EFFORT para no bloquear si el publisher también es BEST_EFFORT.
-        # Si camera_node publica RELIABLE, ambas políticas son compatibles.
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
         qos_cam = QoSProfile(
             reliability = QoSReliabilityPolicy.BEST_EFFORT,
@@ -211,9 +228,9 @@ class ArucoDetectorNode(Node):
         self._prev_qr  = ""
 
         self.get_logger().info(
-            f"ArUco Dual-Dict + QR listo | topic: {camera_topic}\n"
-            f"  4X4_50 IDs 0-4,9-10 → External WPs (pub 20-24, 29-30)\n"
-            f"  4X4_50 IDs 5-8      → Internal WPs (pub 10-13)\n"
+            f"ArUco Dual-Dict + QR listo [MODO FISHEYE] | topic: {camera_topic}\n"
+            f"  4X4_50 IDs 0-4   → External WPs (pub 20-24)\n"
+            f"  4X4_50 IDs 5-10  → Internal WPs (pub 10-15)\n"
             f"  QR → /aruco/qr  |  /aruco/qr/distance  |  /aruco/qr/angle\n"
             f"  ArUco → /aruco/distance  |  /aruco/angle"
         )
@@ -225,6 +242,29 @@ class ArucoDetectorNode(Node):
     def _build_4x4_detector(self):
         d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         return cv2.aruco.ArucoDetector(d, cv2.aruco.DetectorParameters())
+
+    # ─────────────────────────────────────────────────────────────────
+    # Undistort de puntos 2D — modelo FISHEYE
+    # ─────────────────────────────────────────────────────────────────
+
+    def _undistort_points(self, pts_2d: np.ndarray) -> np.ndarray:
+        """
+        Corrige distorsión fisheye en puntos 2D.
+
+        pts_2d: array de forma (N, 2) float32
+        Devuelve array de forma (N, 2) float32 en coordenadas de imagen
+        corregidas (misma escala focal, listo para solvePnP con dist=0).
+        """
+        pts = pts_2d.reshape(-1, 1, 2).astype(np.float32)
+        # P=camera_matrix reproyecta al mismo plano focal → unidades píxel
+        undist = cv2.fisheye.undistortPoints(
+            pts,
+            self.camera_matrix,
+            self.dist_coeffs,
+            R=np.eye(3),
+            P=self.camera_matrix,
+        )
+        return undist.reshape(-1, 2).astype(np.float32)
 
     # ─────────────────────────────────────────────────────────────────
     # Detección
@@ -250,20 +290,37 @@ class ArucoDetectorNode(Node):
         return external_hits, internal_hits, qr_data, qr_points
 
     # ─────────────────────────────────────────────────────────────────
-    # Pose
+    # Pose — FISHEYE CORRECTED
     # ─────────────────────────────────────────────────────────────────
 
     def _estimate_pose(self, corner):
+        """
+        Estima la pose de un marcador ArUco con cámara fisheye.
+
+        Flujo correcto:
+          1. Undistort los 4 puntos de esquina con cv2.fisheye.undistortPoints
+          2. solvePnP con distCoeffs=zeros (imagen ya rectificada)
+        Evita el offset sistemático de 10-20 cm que produce pasar los puntos
+        distorsionados directamente a solvePnP estándar.
+        """
         if not self.pose_ready:
             return None, None
+
         half = self.marker_size / 2.0
         obj_pts = np.array([
             [-half,  half, 0], [ half,  half, 0],
             [ half, -half, 0], [-half, -half, 0],
         ], dtype=np.float32)
+
+        # Paso 1: corregir distorsión fisheye en los puntos detectados
+        img_pts_undist = self._undistort_points(corner[0])
+
+        # Paso 2: solvePnP con distorsión = 0 (ya corregida)
         ok, rvec, tvec = cv2.solvePnP(
-            obj_pts, corner[0].astype(np.float32),
-            self.camera_matrix, self.dist_coeffs,
+            obj_pts,
+            img_pts_undist,
+            self.camera_matrix,
+            np.zeros((1, 4), dtype=np.float64),   # dist = 0
             flags=cv2.SOLVEPNP_IPPE_SQUARE
         )
         return (rvec.flatten(), tvec.flatten()) if ok else (None, None)
@@ -273,15 +330,25 @@ class ArucoDetectorNode(Node):
     # ─────────────────────────────────────────────────────────────────
 
     def _angle_distance(self, tvec):
-        offset = self.get_parameter('cam_offset').value
-        tx = float(tvec[0]) - float(offset[0])
-        ty = float(tvec[1]) - float(offset[1])
-        tz = float(tvec[2]) - float(offset[2])
+        """
+        Calcula distancia y ángulo desde tvec (frame cámara).
 
-        dist_3d  = math.sqrt(tx*tx + ty*ty + tz*tz)
-        dist_xz  = math.sqrt(tx*tx + tz*tz)
-        angle_h  = math.degrees(math.atan2(tx,  tz))
-        angle_v  = math.degrees(math.atan2(-ty, tz))
+        FIX respecto a versión original:
+        - Solo se compensa tz (profundidad hacia adelante) con cam_offset[2].
+        - tx/ty no se compensan porque cam_offset está en frame del robot,
+          no en frame de cámara; mezclarlos introduce error adicional.
+        - Si necesitas compensación completa, aplica la rotación
+          R_cam_to_base antes de restar el offset.
+        """
+        offset = self.get_parameter('cam_offset').value
+        tx = float(tvec[0])
+        ty = float(tvec[1])
+        tz = float(tvec[2]) - float(offset[2])   # solo profundidad
+
+        dist_3d = math.sqrt(tx*tx + ty*ty + tz*tz)
+        dist_xz = math.sqrt(tx*tx + tz*tz)
+        angle_h = math.degrees(math.atan2(tx,  tz))
+        angle_v = math.degrees(math.atan2(-ty, tz))
 
         return dist_3d, dist_xz, angle_h, angle_v
 
@@ -296,7 +363,11 @@ class ArucoDetectorNode(Node):
         cv2.polylines(out, [pts], True, color, 2)
 
         if rvec is not None and self.pose_ready:
-            cv2.drawFrameAxes(out, self.camera_matrix, self.dist_coeffs,
+            # drawFrameAxes usa el modelo estándar internamente; con fisheye
+            # los ejes se ven desplazados visualmente si el frame NO fue
+            # undistorteado. Para visualización exacta, usa frame_undist.
+            cv2.drawFrameAxes(out, self.camera_matrix,
+                              np.zeros((1, 4), dtype=np.float64),
                               rvec, tvec, self.marker_size * 0.5)
             _, dist_xz, angle_h, angle_v = self._angle_distance(tvec)
             h, w = out.shape[:2]
@@ -373,8 +444,8 @@ class ArucoDetectorNode(Node):
 
         unknown_id = self.get_parameter('unknown_id').value
 
-        poses_ext  = [self._estimate_pose(c) for _, c in external_hits]
-        poses_int  = [self._estimate_pose(c) for _, c in internal_hits]
+        poses_ext = [self._estimate_pose(c) for _, c in external_hits]
+        poses_int = [self._estimate_pose(c) for _, c in internal_hits]
 
         # ── QR ────────────────────────────────────────────────────────
         if qr_data and qr_points is not None:
@@ -383,8 +454,6 @@ class ArucoDetectorNode(Node):
                 self.get_logger().info(f"  [QR] {qr_data}")
                 self._prev_qr = qr_data
 
-            # Pose del QR con solvePnP — misma técnica que los ArUcos.
-            # qr_points shape: (1,4,2), orden OpenCV: TL, TR, BR, BL.
             if self.pose_ready:
                 half_qr = self.qr_size / 2.0
                 qr_obj_pts = np.array([
@@ -393,10 +462,16 @@ class ArucoDetectorNode(Node):
                     [ half_qr, -half_qr, 0],
                     [-half_qr, -half_qr, 0],
                 ], dtype=np.float32)
+
+                # FIX FISHEYE: undistort primero, luego solvePnP con dist=0
+                qr_pts_undist = self._undistort_points(
+                    qr_points[0].astype(np.float32)
+                )
                 ok_qr, _, qr_tvec = cv2.solvePnP(
                     qr_obj_pts,
-                    qr_points[0].astype(np.float32),
-                    self.camera_matrix, self.dist_coeffs,
+                    qr_pts_undist,
+                    self.camera_matrix,
+                    np.zeros((1, 4), dtype=np.float64),   # dist = 0
                     flags=cv2.SOLVEPNP_IPPE_SQUARE,
                 )
                 if ok_qr:
@@ -424,8 +499,8 @@ class ArucoDetectorNode(Node):
             self.pub_label.publish(String(data=label))
 
             for poses, hits in [
-                (poses_ext,  external_hits),
-                (poses_int,  internal_hits),
+                (poses_ext, external_hits),
+                (poses_int, internal_hits),
             ]:
                 for i, (_, _corner) in enumerate(hits):
                     rv, tv = poses[i]
@@ -441,8 +516,10 @@ class ArucoDetectorNode(Node):
             )
             if curr_key != self._prev_key:
                 for hits, poses, label_fn, id_fn, tag in [
-                    (external_hits, poses_ext, lambda m: LABEL_EXTERNAL[m], external_pub_id, "EXT"),
-                    (internal_hits, poses_int, lambda m: LABEL_INTERNAL[m], internal_pub_id, "INT"),
+                    (external_hits, poses_ext,
+                     lambda m: LABEL_EXTERNAL[m], external_pub_id, "EXT"),
+                    (internal_hits, poses_int,
+                     lambda m: LABEL_INTERNAL[m], internal_pub_id, "INT"),
                 ]:
                     for i, (mid, _) in enumerate(hits):
                         rv, tv = poses[i]
