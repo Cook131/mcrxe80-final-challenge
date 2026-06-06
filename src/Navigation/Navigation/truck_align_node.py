@@ -70,7 +70,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Twist, Pose2D
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +158,7 @@ class TruckAlignNode(Node):
         self._pub_status = self.create_publisher(String, '/truck_align/status', 10)
         self._pub_cmd    = self.create_publisher(Twist,  '/cmd_vel',            10)
         self._pub_goal   = self.create_publisher(Pose2D, '/astar/goal',         10)
+        self._pub_active = self.create_publisher(Bool,   '/align/active',     10)
 
         # ── Timer ─────────────────────────────────────────────────────────────
         self.create_timer(1.0 / fsm_rate, self._tick)
@@ -195,6 +196,9 @@ class TruckAlignNode(Node):
         self._ok_ticks     = 0
         self._result       = ''
         self._transition(AlignState.SCAN)
+        # Notificar al VFH que truck_align tiene el control
+        self._pub_active.publish(Bool(data=True))
+        self.get_logger().info('[TruckAlign] /align/active → True (VFH bypass ON)')
 
     def _cb_yolo(self, msg: String):
         try:
@@ -235,6 +239,8 @@ class TruckAlignNode(Node):
                 f'[TruckAlign] Abort por mode="{self._mission_mode}"')
             self._stop()
             self._publish_result('FAILED')
+            self._pub_active.publish(Bool(data=False))
+            self.get_logger().info('[TruckAlign] /align/active → False (VFH bypass OFF)')
             self._transition(AlignState.IDLE)
             return
 
@@ -275,6 +281,7 @@ class TruckAlignNode(Node):
                 f'[SCAN] Timeout {self._scan_timeout}s sin encontrar "{self._target_class}"')
             self._stop()
             self._publish_result('TIMEOUT')
+            self._pub_active.publish(Bool(data=False))
             self._transition(AlignState.IDLE)
             return
 
@@ -304,6 +311,7 @@ class TruckAlignNode(Node):
             self.get_logger().warning(f'[ALIGN] Timeout {self._align_timeout}s')
             self._stop()
             self._publish_result('TIMEOUT')
+            self._pub_active.publish(Bool(data=False))
             self._transition(AlignState.IDLE)
             return
 
@@ -342,6 +350,7 @@ class TruckAlignNode(Node):
                 # No se pudo estimar distancia (bbox demasiado pequeño) → FAILED
                 self.get_logger().error('[ALIGN] No se pudo estimar distancia al logo → FAILED')
                 self._publish_result('FAILED')
+                self._pub_active.publish(Bool(data=False))
                 self._transition(AlignState.IDLE)
 
     def _do_nav_approach(self):
@@ -355,6 +364,7 @@ class TruckAlignNode(Node):
             self.get_logger().error(
                 f'[NAV_APPROACH] Timeout {self._nav_timeout}s → FAILED')
             self._publish_result('TIMEOUT')
+            self._pub_active.publish(Bool(data=False))
             self._transition(AlignState.IDLE)
             return
 
@@ -391,6 +401,7 @@ class TruckAlignNode(Node):
             self.get_logger().error(
                 f'[LOGO_LOST_APPROACH] Timeout {self._nav_timeout}s → FAILED')
             self._publish_result('TIMEOUT')
+            self._pub_active.publish(Bool(data=False))
             self._transition(AlignState.IDLE)
             return
 
@@ -405,6 +416,8 @@ class TruckAlignNode(Node):
     def _do_done(self):
         if self._just_entered:
             self._publish_result(self._result)
+            self._pub_active.publish(Bool(data=False))
+            self.get_logger().info('[TruckAlign] /align/active → False (VFH bypass OFF)')
         if self._time_in_state() > 0.1:
             self._target_class = ''
             self._result       = ''

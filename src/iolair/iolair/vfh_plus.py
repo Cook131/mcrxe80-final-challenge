@@ -155,7 +155,7 @@ class VFHPlus(Node):
         self.create_subscription(Pose2D,        '/astar/goal',     self._cb_goal,    10)
         self.create_subscription(String,        '/astar/status',   self._cb_astar,   10)
         self.create_subscription(OccupancyGrid, '/map',            self._cb_map,     10)
-        self.create_subscription(Bool,          '/collect/active', self._cb_collect, 10)
+        self.create_subscription(Bool,          '/align/active', self._cb_collect, 10)
 
         # ── Publicadores ──────────────────────────────────────────────────
         self._pub_cmd    = self.create_publisher(Twist,  '/cmd_vel',        10)
@@ -208,11 +208,8 @@ class VFHPlus(Node):
         prev = self._collect_bypass
         self._collect_bypass = msg.data
         if self._collect_bypass != prev:
-            self.get_logger().warn(
-                f'[VFH+] collect_bypass → {"ON  — evasión inhibida para recolección"
-                                           if self._collect_bypass
-                                           else "OFF — evasión reactiva normal"}'
-            )
+            _bp_str = 'ON  — evasión inhibida para recolección' if self._collect_bypass else 'OFF — evasión reactiva normal'
+            self.get_logger().warn(f'[VFH+] collect_bypass → {_bp_str}')
 
     # ── Filtro de mapa (ignora paredes conocidas igual que bug_tangent) ────────
 

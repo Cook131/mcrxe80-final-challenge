@@ -165,6 +165,9 @@ def generate_launch_description():
         executable='go_to_goal',
         name='puzzlebot_go_to_goal',
         output='screen',
+        remappings=[
+            ('/cmd_vel', '/cmd_raw'),   # VFH+ filtra /cmd_raw → /cmd_vel
+        ],
     )
 
     # ── 8. Controller — PID wheel velocity controller ──────────────────────
@@ -252,6 +255,36 @@ def generate_launch_description():
     )
 
 
+    # ── 11. VFH+ — capa de evasión (bypass activo durante qr_align) ────────
+    # go_to_goal publica en /cmd_raw → vfh_plus filtra → /cmd_vel
+    # Durante ALIGN/ADVANCE/EXTRACT qr_align publica /align/active=True
+    # y vfh_plus cede el control directo sin tocar cmd_raw.
+    vfh_plus_node = Node(
+        package='Navigation',
+        executable='vfh_plus',
+        name='vfh_plus',
+        output='screen',
+        parameters=[{
+            'robot_radius_m'    : 0.18,
+            'safety_margin_m'   : 0.10,
+            'warn_dist'         : 0.65,
+            'emergency_dist'    : 0.35,
+            'stop_dist'         : 0.14,
+            'num_sectors'       : 180,
+            'hist_threshold'    : 8.0,
+            'smoothing_window'  : 5,
+            'influence_radius_m': 1.20,
+            'max_v'             : 0.22,
+            'max_w'             : 1.20,
+            'kp_heading'        : 2.00,
+            'lidar_yaw_offset'  : 3.14159,
+        }],
+        remappings=[
+            ('/cmd_raw', '/cmd_raw'),   # recibe de go_to_goal
+            ('/cmd_vel', '/cmd_vel'),   # publica al controller
+        ],
+    )
+
     return LaunchDescription([
         qr_align,
         qr_zone_checker,
@@ -284,4 +317,5 @@ def generate_launch_description():
         # Actuation
         controller_node,
         rviz_goal_bridge_node,
+        vfh_plus_node,
     ])

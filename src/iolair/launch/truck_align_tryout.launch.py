@@ -99,6 +99,32 @@ def generate_launch_description():
         ],
     )
 
+    # ── VFHPlus — capa de evasión de obstáculos (bypass durante align) ────────
+    vfh_plus = Node(
+        package    = 'puzzlebot',
+        executable = 'vfh_plus',
+        name       = 'vfh_plus',
+        output     = 'screen',
+        parameters = [{
+            'robot_radius_m'    : 0.18,
+            'safety_margin_m'   : 0.10,
+            'warn_dist'         : 0.65,
+            'emergency_dist'    : 0.35,
+            'stop_dist'         : 0.14,
+            'num_sectors'       : 180,
+            'hist_threshold'    : 8.0,
+            'smoothing_window'  : 5,
+            'influence_radius_m': 1.20,
+            'max_v'             : 0.22,
+            'max_w'             : 1.20,
+            'kp_heading'        : 2.00,
+            'lidar_yaw_offset'  : 3.14159,
+        }],
+        remappings = [
+            ('/cmd_raw', '/cmd_vel_raw'),   # GoToGoal publica aquí sin filtro
+        ],
+    )
+
     # ── One-shot publisher — dispara el cmd de alineación ─────────────────────
     # Publica  "align:<yolo_class>"  en /truck_align/cmd
     # El mapeo wolmar→nalmart / emezon→nemezon / popsi→nepsi se hace aquí.
@@ -146,6 +172,7 @@ def generate_launch_description():
         log_ready,
         yolo_detector,
         truck_align,
+        vfh_plus,
         # trigger_node,   # <-- descomenta si tienes truck_align_trigger.py
         # Si no, usa el one-liner de arriba en la terminal
     ])

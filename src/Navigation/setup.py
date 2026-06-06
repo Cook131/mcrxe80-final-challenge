@@ -38,6 +38,7 @@ setup(
             'mission_planner = Navigation.mission_planner:main',
             'mission_manager = Navigation.mission_manager:main',
             'qr_align_node  = Navigation.qr_align_node:main',
+            'truck_align_node = Navigation.truck_align_node:main',
         ],
     },
 )
