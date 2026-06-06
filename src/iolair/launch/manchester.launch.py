@@ -107,9 +107,9 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'landmarks_file':   landmarks_yaml_file,
-            'camera_to_base_x': 0.05,
-            'camera_to_base_y': 0.07,
-            'camera_to_base_z': 0.13,
+            'camera_to_base_x': 0.07,
+            'camera_to_base_y': 0.08,
+            'camera_to_base_z': 0.15,
             'anchor_min_dist':  0.2,
             'anchor_max_dist':  3.50,
             'anchor_reobserve': 0.1,
@@ -164,38 +164,37 @@ def generate_launch_description():
         output='screen',
     )
 
-    bug_node = Node(
+    vfh_node = Node(
         package    = 'iolair',
-        executable = 'bug_tangent',
-        name       = 'bug_tangent',
+        executable = 'vfh_plus',
+        name       = 'vfh_plus',
         output     = 'screen',
-        parameters =[{# Geometría del robot
-            'robot_radius_m':      0.2,  # distancia del centro a la esquina (diagonal/2)
-            'gap_safety_factor':   1.5,
-            'wall_clearance_m':    0.08,
-            # Umbrales de distancia
-            'warn_dist':           0.65,
-            'emergency_dist':      0.35,
-            'stop_dist':           0.14,
-            # Wall-follow
-            'wall_follow_dist':    0.3,
-            'wall_follow_kp':      1.2,
-            'wall_follow_w_max':   0.8,
-            'reflex_v':            0.06,
-            'reflex_w':            0.65,
-            'reflex_hold_ms':      500,
-            # Tangent Bug
-            'gap_jump_ratio':      1.3,
-            'heuristic_margin':    0.1,
-            'tangent_sector_deg':  120,
-            'min_follow_m':        0.25,
-            # LiDAR
-            'front_half_deg':      30,
-            'side_half_deg':       35,
-            'lidar_yaw_offset':    math.pi,  # LiDAR montado mirando hacia atrás
-            # Sistema
-            'hysteresis':          0.06,
-            'replan_cooldown_s':  2.0,
+        parameters =[{
+            # Geometria del Robot
+            'robot_radius': 0.18,      # m (half-width of the robot)
+            'safety_margin': 0.7,      # m (extra clearance to avoid collisions)
+
+            # Parámetros de comportamiento
+            'warn_dist': 0.9,          # m (start soft braking zone)
+            'emergency_dist': 0.30,    # m (start hard braking zone)
+            'stop_dist': 0.14,         # m (distance to consider a collision)
+            'hysteresis': 0.04,        # m (hysteresis for collision detection)
+
+            'num_sectors': 200,        # number of sectors in the polar histogram
+            'hist_threshold': 8.0,     # threshold for obstacle detection in the histogram
+            'smoothing_window': 5,     # window size for smoothing the histogram
+            'influence_radius': 1.0,   # radius of influence for obstacles in the histogram
+            'a_weight': 1.0,           # weight for the angle difference in the cost function
+            'b_weight': 1.0,           # weight for the distance to the goal
+
+            'max_v': 0.22,             # m/s (maximum linear velocity)
+            'min_v': 0.05,             # m/s (minimum linear velocity)
+            'max_w': 1.00,              # rad/s (maximum angular velocity)
+            'kp_heading': 2.0,         # proportional gain for heading control
+            'speed_reduction': 0.5,    # factor to reduce speed when obstacles are detected
+
+            'lidar_yaw_offset': math.pi,  # radians (rotation from LiDAR frame to robot forward)
+            'replan_cooldown_s': 2.0,     # seconds (minimum time between replanning)
         }]
     )
 
@@ -312,7 +311,7 @@ def generate_launch_description():
         go_to_goal_node,
 
         # Safety layer
-        bug_node,
+        vfh_node,
 
         # Actuation
         controller_node,
