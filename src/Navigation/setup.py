@@ -37,6 +37,7 @@ setup(
             'rviz_goal_bridge = Navigation.goal_bridge:main',
             'mission_planner = Navigation.mission_planner:main',
             'mission_manager = Navigation.mission_manager:main',
+            'qr_align_node  = Navigation.qr_align_node:main',
         ],
     },
 )
