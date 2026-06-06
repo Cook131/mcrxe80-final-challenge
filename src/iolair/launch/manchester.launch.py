@@ -92,7 +92,7 @@ def generate_launch_description():
         name='puzzlebot_odometry',
         output='screen',
         parameters=[{
-            'wheel_radius': 0.05,
+            'wheel_radius': 0.045,
             'wheel_base':   0.19,
             'rate':         50.0,
             'initial_yaw':  math.pi,
