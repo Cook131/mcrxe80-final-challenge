@@ -11,8 +11,8 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('lib/python3.10/site-packages/Vision', [
-            'Vision/camera_params.npz',
-            'Vision/camera_params.json',
+            'Vision/fisheye_params.npz',
+            'Vision/fisheye_params.json',
         ]),
     ],
     install_requires=['setuptools'],

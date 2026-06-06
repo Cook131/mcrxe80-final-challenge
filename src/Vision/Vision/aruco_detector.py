@@ -98,7 +98,7 @@ def _load_calibration(path: str):
 def _auto_find_calib(script_dir: str):
     search = [script_dir, os.path.join(script_dir, '..', 'puzzlebot')]
     for d in search:
-        for name in ["camera_params.npz", "camera_params.json"]:
+        for name in ["fisheye_params.npz", "fisheye_params.json"]:
             p = os.path.normpath(os.path.join(d, name))
             if os.path.isfile(p):
                 return p
@@ -149,7 +149,7 @@ class ArucoDetectorNode(Node):
         self.declare_parameter('marker_size',   self.MARKER_SIZE)
         self.declare_parameter('qr_size',       self.QR_SIZE)
         # Offset cámara→base_link en metros [x, y, z] (frame de cámara)
-        self.declare_parameter('cam_offset', [0.07, 0.08, 0.15])
+        self.declare_parameter('cam_offset', [0.07, 0.05, 0.13])
 
         camera_topic     = self.get_parameter('camera_topic').value
         self.marker_size = float(self.get_parameter('marker_size').value)
