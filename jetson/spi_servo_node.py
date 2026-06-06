@@ -379,21 +379,46 @@ if __name__ == '__main__':
             else:
                 tx(CMD_GO_DOWN)
                 wait_until({0}, timeout=4.0, label='[LOWERING]')
-
+        
         elif test == 'cycle':
-            print('Ciclo: IDLE → N1 → HOLD → DOWN  (polling MISO)\n')
+            pause = float(sys.argv[idx + 2]) if len(sys.argv) > idx + 2 else 1.0
+            print(f'Ciclo: N1 completo → N2 → HOLD → DOWN  (pausa={pause:.1f}s)\n')
+
             tx(CMD_STOP, 5); time.sleep(0.3)
-            print('[1/4] GO_N1')
+
+            # ── Sub-ciclo N1 ──────────────────────────────────────
+            print('[1/7] GO_N1')
             tx(CMD_GO_N1)
             wait_until({4}, timeout=3.0, label='[TO_N1]')
-            print('[2/4] GO_HOLD')
+            print(f'  En N1 — pausa {pause:.1f}s')
+            time.sleep(pause)
+
+            print('[2/7] HOLD desde N1')
             tx(CMD_GO_HOLD)
-            wait_until({8}, timeout=3.0, label='[LIFTING]')
-            print('[3/4] Simulando traslado...')
-            wait_until({8}, timeout=2.0, label='[HOLD]')  # espera en hold
-            print('[4/4] GO_DOWN')
+            wait_until({8}, timeout=3.0, label='[LIFTING N1]')
+
+            print('[3/7] DOWN')
             tx(CMD_GO_DOWN)
-            wait_until({0}, timeout=4.0, label='[LOWERING]')
+            wait_until({0}, timeout=5.0, label='[LOWERING]')
+            time.sleep(0.3)
+
+            # ── Sub-ciclo N2 ──────────────────────────────────────
+            print('[4/7] GO_N2')
+            tx(CMD_GO_N2)
+            wait_until({6}, timeout=4.0, label='[TO_N2]')
+            print(f'  En N2 — pausa {pause:.1f}s')
+            time.sleep(pause)
+
+            print('[5/7] HOLD desde N2')
+            tx(CMD_GO_HOLD)
+            wait_until({8}, timeout=3.0, label='[LIFTING N2]')
+            print(f'  En HOLD — pausa {pause:.1f}s')
+            time.sleep(pause)
+
+            print('[6/7] DOWN')
+            tx(CMD_GO_DOWN)
+            wait_until({0}, timeout=5.0, label='[LOWERING]')
+
             tx(CMD_STOP, 5)
             print('\nCiclo completado ✓')
 
