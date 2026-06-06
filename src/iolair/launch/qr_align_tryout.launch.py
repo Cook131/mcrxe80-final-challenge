@@ -25,24 +25,12 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
 
-    zone_arg = DeclareLaunchArgument(
-        'zone',
-        default_value='rack',
-        description="Zona de recolección: 'rack' (N1) o 'conveyor' (N2)",
-    )
-
     # ── ArUco Detector ────────────────────────────────────────────────────────
     # Suscribe /camera_raw/compressed directamente — sin remap necesario.
-    aruco_detector = Node(
-        package    = 'puzzlebot',
-        executable = 'aruco_detector_node',
-        name       = 'aruco_detector_node',
-        output     = 'screen',
-    )
 
     # ── QRCollectNode ─────────────────────────────────────────────────────────
     qr_collect = Node(
-        package    = 'puzzlebot',
+        package    = 'Vision',
         executable = 'qr_collect_node',
         name       = 'qr_collect_node',
         output     = 'screen',
@@ -68,6 +56,13 @@ def generate_launch_description():
         }],
     )
 
+    qr_zone_checker = Node(
+        package    = 'Vision',
+        executable = 'qr_zone_checker',
+        name       = 'qr_zone_checker',
+        output     = 'screen',
+    )
+
     log_ready = LogInfo(
         msg = [
             '\n',
@@ -89,8 +84,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        zone_arg,
         log_ready,
-        aruco_detector,
         qr_collect,
+        qr_zone_checker,
     ])

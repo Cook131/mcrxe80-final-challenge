@@ -29,6 +29,7 @@ setup(
             # The format is: 'executable_name = package_name.file_name:main'
             'aruco_detector = Vision.aruco_detector:main',
             'yolo_vision = Vision.yolo_vision:main',
+            'qr_zone_checker = Vision.qr_zone_checker:main',
         ],
     },
 )
