@@ -1,20 +1,11 @@
 """
-qr_align_tryout.launch.py
-=========================
-Tryout para QRCollectNode en pasillo.
-Asume que la cámara ya está corriendo en /camera_raw/compressed.
+qr_align_tryout.launch.py (Modificado)
+=====================================
+Tryout para QRCollectNode v2.
+Asume que manchester.launch ya está activo (Cámara, ArUco Detector y A* funcionando).
 
 Nodos levantados:
-  aruco_detector_node  — detección ArUco + QR  (suscribe /camera_raw/compressed)
-  qr_collect_node      — FSM alignment QR
-
-Uso:
-  ros2 launch puzzlebot qr_align_tryout.launch.py zone:=rack
-  ros2 launch puzzlebot qr_align_tryout.launch.py zone:=conveyor
-
-Trigger manual (otra terminal):
-  ros2 topic pub --once /collect/trigger std_msgs/String "data: rack"
-  ros2 topic pub --once /collect/trigger std_msgs/String "data: conveyor"
+  qr_collect_node      — FSM alignment QR + Integración A*
 """
 
 from launch import LaunchDescription
@@ -22,16 +13,19 @@ from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-
 def generate_launch_description():
 
-    # ── ArUco Detector ────────────────────────────────────────────────────────
-    # Suscribe /camera_raw/compressed directamente — sin remap necesario.
+    zone_arg = DeclareLaunchArgument(
+        'zone',
+        default_value='rack',
+        description="Zona de recolección: 'rack' (N1) o 'conveyor' (N2)",
+    )
 
-    # ── QRCollectNode ─────────────────────────────────────────────────────────
+    # ── QRCollectNode (v2 con integración A*/GoToGoal) ──────────────────────
+    # Este nodo ahora se comunica con /astar/goal y /odom
     qr_collect = Node(
-        package    = 'Vision',
-        executable = 'qr_collect_node',
+        package    = 'puzzlebot',
+        executable = 'qr_collect_node', # Asegúrate que el script v2 sea este ejecutable
         name       = 'qr_collect_node',
         output     = 'screen',
         parameters = [{
@@ -41,7 +35,7 @@ def generate_launch_description():
             'kd_dist'              : 0.08,
             'angle_tol_deg'        : 4.0,
             'approach_dist'        : 0.28,
-            'approach_handoff_dist': 0.80,
+            'approach_handoff_dist': 0.80, # Distancia donde A* entrega al PD
             'dist_tol'             : 0.03,
             'max_angular'          : 0.45,
             'max_linear'           : 0.18,
@@ -56,35 +50,24 @@ def generate_launch_description():
         }],
     )
 
-    qr_zone_checker = Node(
-        package    = 'Vision',
-        executable = 'qr_zone_checker',
-        name       = 'qr_zone_checker',
-        output     = 'screen',
-    )
-
     log_ready = LogInfo(
         msg = [
             '\n',
             '╔══════════════════════════════════════════════════════╗\n',
-            '║        QR ALIGNMENT TRYOUT — Iolair Puzzlebot        ║\n',
+            '║   QR ALIGN v2 (A* Ready) — Iolair Puzzlebot          ║\n',
             '╠══════════════════════════════════════════════════════╣\n',
+            '║  Asumiendo que manchester.launch está activo...      ║\n',
             '║  Zona       : ', LaunchConfiguration('zone'), '\n',
             '║                                                      ║\n',
             '║  Dispara (otra terminal):                            ║\n',
             '║    ros2 topic pub --once /collect/trigger \\          ║\n',
-            '║      std_msgs/String "data: rack"                    ║\n',
-            '║                                                      ║\n',
-            '║  Monitorea:                                          ║\n',
-            '║    ros2 topic echo /collect/done                     ║\n',
-            '║    ros2 topic echo /aruco/qr                         ║\n',
-            '║    ros2 topic echo /aruco/qr/angle                   ║\n',
+            '║      std_msgs/String "data: ', LaunchConfiguration('zone'), '"\n',
             '╚══════════════════════════════════════════════════════╝\n',
         ]
     )
 
     return LaunchDescription([
+        zone_arg,
         log_ready,
         qr_collect,
-        qr_zone_checker,
     ])
