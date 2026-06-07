@@ -1,94 +1,93 @@
 #!/usr/bin/env python3
 """
-qr_collect_node.py — Iolair QR Align + Collect  [v2 — integración A*/GoToGoal]
-================================================================================
-Cambios respecto a v1
----------------------
-  * Nuevo estado NAV_APPROACH: cuando el QR está visible pero lejos, publica
-    un goal relativo en /astar/goal (coordenadas mundo) en lugar de cmd_vel
-    directo. GoToGoal + A* manejan la ruta completa hasta ~approach_handoff_dist.
+qr_align_node.py — Iolair QR Align + Collect  [v3 — goal-based, sin cmd_vel fino]
+====================================================================================
+Resumen de cambios respecto a v2
+---------------------------------
+  v2 tenía un tramo "fino" PD que publicaba cmd_vel directamente para ALIGN y
+  ADVANCE. Ese tramo fue eliminado por completo. Ahora TODA la navegación —
+  incluyendo la alineación lateral y el acercamiento final a 35 cm — se hace
+  mediante goals relativos publicados en /astar/goal, que A* convierte en
+  waypoints y GoToGoal ejecuta con su PID.
 
-  * El PD directo (/cmd_vel) sólo se activa para el tramo fino:
-      dist ≤ approach_handoff_dist  →  estados ALIGN / ADVANCE como antes.
+  Esto logra:
+    * Coherencia: un único controlador de movimiento en todo el stack.
+    * No hay conflicto con VFH+: el bypass sigue activo (ya existía), pero
+      el nodo ya no "pelea" contra GoToGoal por cmd_vel.
+    * Alineación progresiva: cada tick de ALIGNING recalcula un goal que
+      corrige lateral + ángulo en coordenadas mundo; la convergencia la
+      hace GoToGoal sin oscilaciones bruscas.
+    * Tramo final (APPROACH_FINAL, ~30 cm) sigue usando un goal relativo
+      directo, sin mapa: se publica en /goal (waypoint GoToGoal) con
+      bypass de A*.
 
-  * Suscripción a /odom para conocer pose del robot y convertir offset QR
-    (ángulo+distancia) a coordenadas mundo absolutas para el goal.
-
-  * Suscripción a /astar/status para saber cuándo A* terminó (GOAL_REACHED).
-
-  * Nueva lógica de "approach ciego": si el QR se pierde DURANTE ADVANCE
-    (muy cerca, robot pasa por encima), se asume que ya llegamos y se pasa
-    directamente a LIFT_CMD en lugar de abortar.
-
-Integración con FSM (mission_manager.py)
------------------------------------------
-  SUB:  /collect/trigger     (std_msgs/String)
-          "rack"     → nivel de recolección N1  (racks bajos)
-          "conveyor" → nivel de recolección N2  (conveyors altos)
-          "abort"    → cancela operación activa
-
-  PUB:  /collect/done        (std_msgs/String)
-          "SUCCESS"  → pallet recogido, listo para GO2GOAL
-          "ABORT"    → operación cancelada o timeout
-
-  SUB:  /aruco/qr            (std_msgs/String)   — payload QR
-  SUB:  /aruco/qr/distance   (std_msgs/Float32)  — distancia plano XZ [m]
-  SUB:  /aruco/qr/angle      (std_msgs/Float32)  — ángulo horizontal [°], + = derecha
-
-  SUB:  /odom                (nav_msgs/Odometry)  — pose robot en mundo
-  SUB:  /astar/status        (std_msgs/String)    — GOAL_REACHED / EXECUTING / ...
-  PUB:  /astar/goal          (geometry_msgs/Pose2D) — goal absoluto para A*
-
-  PUB:  /cmd_vel             (geometry_msgs/Twist)
-  PUB:  /lift_auto           (std_msgs/String)   — n1 | n2 | hold | down
-  SUB:  /lift_done           (std_msgs/String)   — AT_N1 | AT_N2 | HOLD | DOWN
-
-  PUB:  /collect/qr_payload  (std_msgs/String)   — reenvía contenido QR a FSM
-
-Máquina de estados interna
----------------------------
+Máquina de estados
+------------------
   IDLE
-    → NAV_APPROACH  al recibir /collect/trigger si QR visible y dist > handoff
-    → ALIGN         al recibir /collect/trigger si QR visible y dist ≤ handoff
+    → SEARCH_QR   al recibir /collect/trigger (siempre)
 
-  NAV_APPROACH
-    → ALIGN         cuando A* publica GOAL_REACHED  (o dist ≤ handoff)
-    → IDLE          si se pierde el QR antes del handoff y timeout
-    → ABORT         si A* tarda demasiado (nav_approach_timeout)
+  SEARCH_QR
+    → ALIGNING    cuando el QR es visible
+    → ABORT       si timeout sin QR
 
-  ALIGN
-    → ADVANCE       cuando |angle| < angle_tol  AND  dist > approach_dist
-    → LIFT_CMD      cuando |angle| < angle_tol  AND  dist ≤ approach_dist
-    → ABORT         si se pierde el QR (timeout)
+  ALIGNING
+    → APPROACH_FINAL  cuando centrado + dist ≤ align_stop_dist
+    → ALIGNING        cada tick: recalcula y publica goal de alineación
+    → ABORT           si QR perdido demasiado tiempo
 
-  ADVANCE
-    → LIFT_CMD      al llegar a dist ≤ approach_dist  AND  |angle| < angle_tol
-    → LIFT_CMD      si se pierde el QR (approach ciego — asumimos llegada)
-    → ALIGN         si ángulo se desvía > angle_tol * 2
+  APPROACH_FINAL
+    → HOLD        cuando A* publica GOAL_REACHED  (llegó a 35 cm)
+    → ABORT       timeout
 
-  LIFT_CMD → WAIT_LIFT → EXTRACT → REVERSE → DONE / ABORT
+  HOLD
+    → BACK_AWAY   lift subido + pallet confirmado + /collect/done publicado
 
-Parámetros ROS2 configurables
-------------------------------
-  kp_angle              float  0.018    P angular [rad/s / °]
-  kd_angle              float  0.004    D angular [rad/s / (°/s)]
-  kp_dist               float  0.40     P lineal  [m/s / m]
-  kd_dist               float  0.08     D lineal  [m/s / (m/s)]
-  angle_tol_deg         float  4.0      Tolerancia angular alineación [°]
-  approach_dist         float  0.28     Distancia objetivo de parada [m]
-  approach_handoff_dist float  0.80     Distancia donde A* entrega al PD [m]
-  dist_tol              float  0.03     Tolerancia de distancia [m]
-  cam_offset_deg        float  0.0      Offset angular cámara→base_link [°]
-  max_angular           float  0.45     Velocidad angular máx [rad/s]
-  max_linear            float  0.18     Velocidad lineal máx [m/s]
-  extract_speed         float  0.08     Velocidad de encaje [m/s]
-  extract_time          float  0.6      Duración avance de encaje [s]
-  reverse_speed         float  0.10     Velocidad de retroceso [m/s]
-  reverse_time          float  1.8      Duración retroceso [s]
-  qr_timeout            float  2.5      Segundos sin QR antes de pausar [s]
-  lift_timeout          float  8.0      Timeout esperando /lift_done [s]
-  nav_approach_timeout  float  30.0     Timeout máximo en NAV_APPROACH [s]
-  fsm_rate_hz           float  20.0     Frecuencia del tick interno [Hz]
+  BACK_AWAY
+    → DELIVERY    retroceso completado
+
+  DELIVERY
+    → IDLE        control cedido a FSM de misión
+
+Coordinación con VFH+
+---------------------
+  /align/active = True  →  VFH+ ignora todo (collect_bypass ON).
+  Se activa en SEARCH_QR y se desactiva al salir de BACK_AWAY.
+  Durante DELIVERY el bypass ya está OFF y el VFH+ vuelve a funcionar.
+
+Topics
+------
+  SUB:  /collect/trigger     (std_msgs/String)   "rack" | "conveyor" | "abort"
+  PUB:  /collect/done        (std_msgs/String)   "SUCCESS" | "ABORT"
+  SUB:  /aruco/qr            (std_msgs/String)
+  SUB:  /aruco/qr/distance   (std_msgs/Float32)  metros en plano XZ
+  SUB:  /aruco/qr/angle      (std_msgs/Float32)  grados, + = derecha
+  SUB:  /odom                (nav_msgs/Odometry)
+  SUB:  /astar/status        (std_msgs/String)   GOAL_REACHED | EXECUTING | ...
+  PUB:  /astar/goal          (geometry_msgs/Pose2D)  goal mundo → A* → GoToGoal
+  PUB:  /goal                (geometry_msgs/Pose2D)  waypoint directo → GoToGoal
+  PUB:  /cmd_vel             (geometry_msgs/Twist)   SOLO para BACK_AWAY
+  PUB:  /lift_auto           (std_msgs/String)   n1 | n2 | hold | down
+  SUB:  /lift_done           (std_msgs/String)   AT_N1 | AT_N2 | HOLD | DOWN
+  PUB:  /align/active        (std_msgs/Bool)     VFH+ bypass
+  PUB:  /collect/qr_payload  (std_msgs/String)
+
+Parámetros ROS2
+---------------
+  align_stop_dist       float  0.35   Distancia objetivo de alineación [m]
+  approach_final_dist   float  0.05   Distancia objetivo de encaje final [m]
+  align_lateral_tol     float  0.03   Tolerancia lateral para considerar centrado [m]
+  angle_tol_deg         float  4.0    Tolerancia angular (alineación fina) [°]
+  goal_replan_dist      float  0.06   Re-publicar goal si el lateral cambió > este valor [m]
+  goal_replan_angle     float  3.0    Re-publicar goal si el ángulo cambió > este valor [°]
+  back_away_speed       float  0.10   Velocidad de retroceso [m/s]
+  back_away_time        float  1.8    Duración del retroceso [s]
+  lift_timeout          float  8.0    Timeout /lift_done [s]
+  align_timeout         float  20.0   Timeout en ALIGNING [s]
+  approach_timeout      float  15.0   Timeout en APPROACH_FINAL [s]
+  search_timeout        float  10.0   Timeout en SEARCH_QR [s]
+  qr_timeout            float  2.5    Segundos sin QR antes de pausar [s]
+  cam_offset_deg        float  0.0    Offset angular cámara→base_link [°]
+  fsm_rate_hz           float  20.0   Frecuencia del tick [Hz]
 """
 
 import math
@@ -108,19 +107,20 @@ from std_msgs.msg      import Bool, Float32, String
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _S:
-    IDLE         = 'IDLE'
-    NAV_APPROACH = 'NAV_APPROACH'   # A* lleva al robot hasta handoff_dist
-    ALIGN        = 'ALIGN'
-    ADVANCE      = 'ADVANCE'
-    LIFT_CMD     = 'LIFT_CMD'
-    WAIT_LIFT    = 'WAIT_LIFT'
-    EXTRACT      = 'EXTRACT'
-    REVERSE      = 'REVERSE'
-    DONE         = 'DONE'
-    ABORT        = 'ABORT'
+    IDLE           = 'IDLE'
+    SEARCH_QR      = 'SEARCH_QR'
+    ALIGNING       = 'ALIGNING'
+    APPROACH_FINAL = 'APPROACH_FINAL'
+    HOLD           = 'HOLD'
+    BACK_AWAY      = 'BACK_AWAY'
+    DELIVERY       = 'DELIVERY'
+    ABORT          = 'ABORT'
 
 
-# Mapa zona → comando lift y estado esperado en /lift_done
+# VFH+ bypass ON: estados donde la evasión debe estar inhibida.
+_BYPASS_STATES = {_S.SEARCH_QR, _S.ALIGNING, _S.APPROACH_FINAL, _S.HOLD}
+
+# Mapa zona → comando lift + estado de confirmación esperado en /lift_done
 _ZONE_LIFT = {
     'rack':     ('n1', 'AT_N1'),
     'conveyor': ('n2', 'AT_N2'),
@@ -128,66 +128,59 @@ _ZONE_LIFT = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-class QRCollectNode(Node):
+class QRAlignNode(Node):
 
     def __init__(self):
-        super().__init__('qr_collect_node')
+        super().__init__('qr_align_node')
 
         # ── Parámetros ────────────────────────────────────────────────────
-        self.declare_parameter('kp_angle',              0.018)
-        self.declare_parameter('kd_angle',              0.004)
-        self.declare_parameter('kp_dist',               0.40)
-        self.declare_parameter('kd_dist',               0.08)
-        self.declare_parameter('angle_tol_deg',         4.0)
-        self.declare_parameter('approach_dist',         0.28)
-        self.declare_parameter('approach_handoff_dist', 0.80)   # A* → PD
-        self.declare_parameter('dist_tol',              0.03)
-        self.declare_parameter('cam_offset_deg',        0.0)
-        self.declare_parameter('max_angular',           0.45)
-        self.declare_parameter('max_linear',            0.18)
-        self.declare_parameter('extract_speed',         0.08)
-        self.declare_parameter('extract_time',          0.6)
-        self.declare_parameter('reverse_speed',         0.10)
-        self.declare_parameter('reverse_time',          1.8)
-        self.declare_parameter('qr_timeout',            2.5)
-        self.declare_parameter('lift_timeout',          8.0)
-        self.declare_parameter('nav_approach_timeout',  30.0)
-        self.declare_parameter('fsm_rate_hz',           20.0)
+        self.declare_parameter('align_stop_dist',     0.35)
+        self.declare_parameter('approach_final_dist', 0.05)
+        self.declare_parameter('align_lateral_tol',   0.03)
+        self.declare_parameter('angle_tol_deg',       4.0)
+        self.declare_parameter('goal_replan_dist',    0.06)
+        self.declare_parameter('goal_replan_angle',   3.0)
+        self.declare_parameter('back_away_speed',     0.10)
+        self.declare_parameter('back_away_time',      1.8)
+        self.declare_parameter('lift_timeout',        8.0)
+        self.declare_parameter('align_timeout',       20.0)
+        self.declare_parameter('approach_timeout',    15.0)
+        self.declare_parameter('search_timeout',      10.0)
+        self.declare_parameter('qr_timeout',          2.5)
+        self.declare_parameter('cam_offset_deg',      0.0)
+        self.declare_parameter('fsm_rate_hz',         20.0)
 
         self._p = lambda n: self.get_parameter(n).value
 
-        # ── Estado FSM interno ────────────────────────────────────────────
-        self._state        = _S.IDLE
-        self._prev_state   = None
-        self._state_entry  = time.monotonic()
+        # ── Estado FSM ────────────────────────────────────────────────────
+        self._state       = _S.IDLE
+        self._state_entry = time.monotonic()
 
-        self._zone         = ''
-        self._lift_cmd     = ''
-        self._lift_expect  = ''
+        self._zone        = ''
+        self._lift_cmd    = ''
+        self._lift_expect = ''
 
-        # ── Datos de percepción ───────────────────────────────────────────
-        self._qr_payload   = ''
-        self._qr_angle     = 0.0    # grados, + = derecha
-        self._qr_dist      = 999.0  # metros
-        self._qr_stamp     = 0.0
+        # ── Datos QR ──────────────────────────────────────────────────────
+        self._qr_payload  = ''
+        self._qr_angle    = 0.0    # grados, + = derecha
+        self._qr_dist     = 999.0  # metros
+        self._qr_stamp    = 0.0
 
-        # ── Pose del robot (de /odom) ─────────────────────────────────────
-        self._robot_x  = 0.0
-        self._robot_y  = 0.0
-        self._robot_th = 0.0        # yaw en radianes
+        # ── Pose odométrica ───────────────────────────────────────────────
+        self._rx   = 0.0
+        self._ry   = 0.0
+        self._rth  = 0.0           # yaw en radianes
 
-        # ── Estado A* ─────────────────────────────────────────────────────
-        self._astar_status = ''     # último string de /astar/status
+        # ── A*/GoToGoal ───────────────────────────────────────────────────
+        self._astar_status = ''
+        # Último goal publicado (para detectar si hay que re-publicar)
+        self._last_goal_angle  = None   # grados
+        self._last_goal_dist   = None   # metros
 
-        # ── Control PD — derivada ─────────────────────────────────────────
-        self._prev_angle_err = 0.0
-        self._prev_dist_err  = 0.0
-        self._prev_ctrl_t    = time.monotonic()
-
-        # ── Estado del lift ───────────────────────────────────────────────
+        # ── Lift ──────────────────────────────────────────────────────────
         self._lift_done_label = ''
 
-        # ── QOS sensor (BEST_EFFORT para /aruco/*) ────────────────────────
+        # ── QOS BEST_EFFORT para tópicos de sensor ────────────────────────
         qos_be = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -195,30 +188,34 @@ class QRCollectNode(Node):
         )
 
         # ── Suscriptores ──────────────────────────────────────────────────
-        self.create_subscription(String,  '/collect/trigger',   self._cb_trigger,    10)
-        self.create_subscription(String,  '/aruco/qr',          self._cb_qr,         qos_be)
-        self.create_subscription(Float32, '/aruco/qr/distance', self._cb_qr_dist,    qos_be)
-        self.create_subscription(Float32, '/aruco/qr/angle',    self._cb_qr_angle,   qos_be)
-        self.create_subscription(String,  '/lift_done',         self._cb_lift_done,  10)
-        self.create_subscription(Odometry,'/odom',              self._cb_odom,       10)
-        self.create_subscription(String,  '/astar/status',      self._cb_astar_status, 10)
+        self.create_subscription(String,   '/collect/trigger',   self._cb_trigger,      10)
+        self.create_subscription(String,   '/aruco/qr',          self._cb_qr,           qos_be)
+        self.create_subscription(Float32,  '/aruco/qr/distance', self._cb_qr_dist,      qos_be)
+        self.create_subscription(Float32,  '/aruco/qr/angle',    self._cb_qr_angle,     qos_be)
+        self.create_subscription(String,   '/lift_done',         self._cb_lift_done,    10)
+        self.create_subscription(Odometry, '/odom',              self._cb_odom,         10)
+        self.create_subscription(String,   '/astar/status',      self._cb_astar_status, 10)
 
         # ── Publicadores ──────────────────────────────────────────────────
+        # /cmd_vel: usado SOLO durante BACK_AWAY (retroceso en línea recta)
         self._pub_cmd     = self.create_publisher(Twist,  '/cmd_vel',            10)
         self._pub_lift    = self.create_publisher(String, '/lift_auto',          10)
         self._pub_done    = self.create_publisher(String, '/collect/done',       10)
         self._pub_payload = self.create_publisher(String, '/collect/qr_payload', 10)
-        self._pub_goal    = self.create_publisher(Pose2D, '/astar/goal',         10)
-        self._pub_active  = self.create_publisher(Bool,   '/align/active',     10)
+        # /astar/goal: goal mundo completo → A* planifica y ejecuta con GoToGoal
+        self._pub_astar   = self.create_publisher(Pose2D, '/astar/goal',         10)
+        # /goal: waypoint directo a GoToGoal (bypass A* para tramo final)
+        self._pub_wp      = self.create_publisher(Pose2D, '/goal',               10)
+        self._pub_active  = self.create_publisher(Bool,   '/align/active',       10)
 
         # ── Timer FSM ─────────────────────────────────────────────────────
         rate = float(self._p('fsm_rate_hz'))
         self.create_timer(1.0 / rate, self._tick)
 
         self.get_logger().info(
-            'qr_collect_node v2 listo (A*/GoToGoal integrado)\n'
-            f'  handoff_dist={self._p("approach_handoff_dist")}m  '
-            f'approach_dist={self._p("approach_dist")}m  '
+            'qr_align_node v3 listo (control 100% goal-based, sin PD cmd_vel)\n'
+            f'  align_stop_dist={self._p("align_stop_dist")}m  '
+            f'approach_final_dist={self._p("approach_final_dist")}m  '
             f'angle_tol={self._p("angle_tol_deg")}°'
         )
 
@@ -249,21 +246,14 @@ class QRCollectNode(Node):
         self.get_logger().info(
             f'[Collect] Trigger zona="{cmd}" → lift_cmd={self._lift_cmd}')
 
-        # Decidir si el approach es largo (A*) o ya estamos cerca (PD directo)
-        if self._qr_visible() and self._qr_dist > self._p('approach_handoff_dist'):
-            self._publish_approach_goal()
-            self._transition(_S.NAV_APPROACH)
-        else:
-            self._transition(_S.ALIGN)
-        # Notificar al VFH que el align tiene el control fino
-        self._pub_active.publish(Bool(data=True))
-        self.get_logger().info('[Collect] /align/active → True (VFH bypass ON)')
+        self._set_vfh_bypass(True)
+        self._transition(_S.SEARCH_QR)
 
     def _cb_qr(self, msg: String):
         payload = msg.data.strip()
         if payload:
             if payload != self._qr_payload:
-                self.get_logger().info(f'[Percepción] QR: {payload}')
+                self.get_logger().info(f'[QR] Payload: {payload}')
                 self._qr_payload = payload
                 self._pub_payload.publish(String(data=payload))
             self._qr_stamp = time.monotonic()
@@ -284,220 +274,149 @@ class QRCollectNode(Node):
             self._lift_done_label = label
 
     def _cb_odom(self, msg: Odometry):
-        self._robot_x  = msg.pose.pose.position.x
-        self._robot_y  = msg.pose.pose.position.y
-        q = msg.pose.pose.orientation
-        self._robot_th = math.atan2(
+        self._rx  = msg.pose.pose.position.x
+        self._ry  = msg.pose.pose.position.y
+        q         = msg.pose.pose.orientation
+        self._rth = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         )
 
     def _cb_astar_status(self, msg: String):
+        prev = self._astar_status
         self._astar_status = msg.data.strip()
+        if self._astar_status != prev:
+            self.get_logger().debug(f'[A*] status: {self._astar_status}')
 
     # ══════════════════════════════════════════════════════════════════════
-    # HELPERS A* / POSE
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _publish_approach_goal(self):
-        """
-        Convierte la detección actual (ángulo + distancia en frame cámara)
-        a coordenadas mundo absolutas y las publica en /astar/goal.
-
-        El goal se coloca a (approach_handoff_dist + dist_tol) metros del QR
-        en la dirección del robot, para que A* lleve al robot hasta el punto
-        de handoff donde el PD toma el control fino.
-        """
-        angle_rad = math.radians(self._qr_angle)   # ángulo lateral en cámara
-        # Dirección absoluta al QR en frame mundo
-        bearing_world = self._robot_th + angle_rad
-
-        # Posición estimada del QR en mundo
-        qr_wx = self._robot_x + self._qr_dist * math.cos(bearing_world)
-        qr_wy = self._robot_y + self._qr_dist * math.sin(bearing_world)
-
-        # Goal: detenerse a handoff_dist delante del QR (mirando desde el robot)
-        handoff = self._p('approach_handoff_dist')
-        goal_x = qr_wx - handoff * math.cos(bearing_world)
-        goal_y = qr_wy - handoff * math.sin(bearing_world)
-
-        goal_msg = Pose2D()
-        goal_msg.x = goal_x
-        goal_msg.y = goal_y
-        self._pub_goal.publish(goal_msg)
-
-        self.get_logger().info(
-            f'[NAV_APPROACH] Goal publicado en A*: '
-            f'({goal_x:.3f}, {goal_y:.3f})  '
-            f'[QR estimado: ({qr_wx:.3f}, {qr_wy:.3f}), '
-            f'dist={self._qr_dist:.2f}m, ang={self._qr_angle:+.1f}°]'
-        )
-
-    # ══════════════════════════════════════════════════════════════════════
-    # FSM TICK
+    # FSM TICK PRINCIPAL
     # ══════════════════════════════════════════════════════════════════════
 
     def _tick(self):
         s = self._state
 
-        # ── IDLE ──────────────────────────────────────────────────────────
         if s == _S.IDLE:
             return
 
-        # ── NAV_APPROACH ──────────────────────────────────────────────────
-        elif s == _S.NAV_APPROACH:
-            # Timeout global por si A* se cuelga
-            if self._time_in_state() > self._p('nav_approach_timeout'):
-                self.get_logger().error(
-                    f'[NAV_APPROACH] Timeout {self._p("nav_approach_timeout")}s → ABORT')
-                self._transition(_S.ABORT)
-                return
-
-            # QR visible: actualizar el goal si la distancia cambió mucho
-            # (el robot se movió, el QR se vio desde otro ángulo)
+        # ── SEARCH_QR ─────────────────────────────────────────────────────
+        elif s == _S.SEARCH_QR:
+            # Esperar hasta que el QR sea visible.
+            # El movimiento de búsqueda lo gestiona la misión externa (FSM).
             if self._qr_visible():
-                if self._qr_dist <= self._p('approach_handoff_dist'):
-                    # Ya estamos en zona de handoff — A* ya no es necesario
-                    self.get_logger().info(
-                        f'[NAV_APPROACH] Handoff alcanzado '
-                        f'dist={self._qr_dist:.3f}m → ALIGN')
-                    self._transition(_S.ALIGN)
-                    return
-                # Else: todavía lejos, A* sigue navegando. No republiquemos
-                # el goal en cada tick para no saturar el planner.
-            else:
-                # QR no visible durante NAV_APPROACH es tolerable un momento
-                if (time.monotonic() - self._qr_stamp) > self._p('qr_timeout') * 2:
-                    self.get_logger().warn('[NAV_APPROACH] QR perdido demasiado tiempo → ABORT')
-                    self._transition(_S.ABORT)
-                    return
-
-            # Esperar confirmación de A*
-            if self._astar_status == 'GOAL_REACHED':
-                self.get_logger().info('[NAV_APPROACH] A* GOAL_REACHED → ALIGN')
-                self._transition(_S.ALIGN)
-
-        # ── ALIGN ─────────────────────────────────────────────────────────
-        elif s == _S.ALIGN:
-            if not self._qr_visible():
-                self._stop()
-                if self._time_in_state() > self._p('qr_timeout') * 3:
-                    self.get_logger().warn('[ALIGN] QR perdido — ABORT')
-                    self._transition(_S.ABORT)
+                self.get_logger().info(
+                    f'[SEARCH_QR] QR detectado dist={self._qr_dist:.2f}m '
+                    f'angle={self._qr_angle:+.1f}° → ALIGNING')
+                self._transition(_S.ALIGNING)
                 return
 
-            angle_err = self._qr_angle
-            dist_err  = self._qr_dist - self._p('approach_dist')
-
-            cmd = self._pd_control(angle_err, dist_err)
-            self._pub_cmd.publish(cmd)
-
-            aligned = (
-                abs(angle_err) < self._p('angle_tol_deg')
-                and abs(dist_err)  > self._p('dist_tol')
-            )
-            arrived = (
-                abs(angle_err) < self._p('angle_tol_deg')
-                and abs(dist_err)  <= self._p('dist_tol')
-            )
-
-            if arrived:
-                self._stop()
-                self.get_logger().info(
-                    f'[ALIGN] Alineado y en distancia '
-                    f'angle={angle_err:+.1f}° dist={self._qr_dist:.3f}m → LIFT_CMD')
-                self._transition(_S.LIFT_CMD)
-            elif aligned:
-                self._stop()
-                self.get_logger().info(
-                    f'[ALIGN] Alineado, avanzando '
-                    f'angle={angle_err:+.1f}° dist={self._qr_dist:.3f}m → ADVANCE')
-                self._transition(_S.ADVANCE)
-
-        # ── ADVANCE ───────────────────────────────────────────────────────
-        elif s == _S.ADVANCE:
-            if not self._qr_visible():
-                self._stop()
-                if self._time_in_state() > self._p('qr_timeout'):
-                    # QR perdido por approach ciego: asumimos que llegamos
-                    self.get_logger().info(
-                        '[ADVANCE] QR perdido — approach ciego asumido como llegada → LIFT_CMD')
-                    self._transition(_S.LIFT_CMD)
-                return
-
-            angle_err = self._qr_angle
-            dist_err  = self._qr_dist - self._p('approach_dist')
-
-            if abs(angle_err) > self._p('angle_tol_deg') * 2.0:
-                self._stop()
-                self.get_logger().info(
-                    f'[ADVANCE] Desvío angular {angle_err:+.1f}° → ALIGN')
-                self._transition(_S.ALIGN)
-                return
-
-            cmd = self._pd_control(angle_err, dist_err, angular_scale=0.5)
-            self._pub_cmd.publish(cmd)
-
-            if abs(dist_err) <= self._p('dist_tol'):
-                self._stop()
-                self.get_logger().info(
-                    f'[ADVANCE] Distancia alcanzada {self._qr_dist:.3f}m → LIFT_CMD')
-                self._transition(_S.LIFT_CMD)
-
-        # ── LIFT_CMD ──────────────────────────────────────────────────────
-        elif s == _S.LIFT_CMD:
-            if self._time_in_state() < 0.1:
-                self.get_logger().info(
-                    f'[Lift] Enviando comando: {self._lift_cmd}')
-                self._pub_lift.publish(String(data=self._lift_cmd))
-                self._lift_done_label = ''
-            self._transition(_S.WAIT_LIFT)
-
-        # ── WAIT_LIFT ─────────────────────────────────────────────────────
-        elif s == _S.WAIT_LIFT:
-            if self._lift_done_label == self._lift_expect:
-                self.get_logger().info(
-                    f'[Lift] Confirmado: {self._lift_done_label} → EXTRACT')
-                self._transition(_S.EXTRACT)
-            elif self._time_in_state() > self._p('lift_timeout'):
-                self.get_logger().error(
-                    f'[Lift] Timeout esperando {self._lift_expect} → ABORT')
+            if self._time_in_state() > self._p('search_timeout'):
+                self.get_logger().warn('[SEARCH_QR] Timeout sin QR → ABORT')
                 self._transition(_S.ABORT)
 
-        # ── EXTRACT ───────────────────────────────────────────────────────
-        elif s == _S.EXTRACT:
-            elapsed = self._time_in_state()
-            if elapsed < self._p('extract_time'):
-                cmd = Twist()
-                cmd.linear.x = self._p('extract_speed')
-                self._pub_cmd.publish(cmd)
-            else:
-                self._stop()
-                self.get_logger().info('[EXTRACT] Encaje completado → REVERSE')
+        # ── ALIGNING ──────────────────────────────────────────────────────
+        elif s == _S.ALIGNING:
+            if not self._qr_visible():
+                # QR perdido — esperar un poco (ruido de detección)
+                if self._time_in_state() > self._p('qr_timeout') * 3:
+                    self.get_logger().warn('[ALIGNING] QR perdido → ABORT')
+                    self._transition(_S.ABORT)
+                return  # No publicar goals con datos viejos
+
+            if self._time_in_state() > self._p('align_timeout'):
+                self.get_logger().warn('[ALIGNING] Timeout → ABORT')
+                self._transition(_S.ABORT)
+                return
+
+            # Calcular error lateral estimado en metros
+            # Para QR pequeño (9 cm) la estimación por ángulo es suficiente:
+            # lateral_err ≈ dist * sin(angle_rad)
+            lateral_err = self._qr_dist * math.sin(math.radians(self._qr_angle))
+            aligned = (
+                abs(self._qr_angle) < self._p('angle_tol_deg')
+                and abs(lateral_err) < self._p('align_lateral_tol')
+            )
+            close_enough = self._qr_dist <= self._p('align_stop_dist')
+
+            if aligned and close_enough:
+                self.get_logger().info(
+                    f'[ALIGNING] ✔ Centrado a {self._qr_dist:.3f}m '
+                    f'(lateral={lateral_err*100:.1f}cm, '
+                    f'angle={self._qr_angle:+.1f}°) → APPROACH_FINAL')
+                self._publish_approach_final_goal()
+                self._transition(_S.APPROACH_FINAL)
+                return
+
+            # Publicar goal de alineación (solo si cambió lo suficiente)
+            self._publish_align_goal_if_needed()
+
+        # ── APPROACH_FINAL ────────────────────────────────────────────────
+        elif s == _S.APPROACH_FINAL:
+            # Esperamos que A*/GoToGoal confirme llegada al waypoint final.
+            # El goal ya fue publicado en la transición desde ALIGNING.
+            if self._astar_status == 'GOAL_REACHED':
+                self.get_logger().info('[APPROACH_FINAL] GOAL_REACHED → HOLD')
+                self._transition(_S.HOLD)
+                return
+
+            if self._time_in_state() > self._p('approach_timeout'):
+                self.get_logger().warn('[APPROACH_FINAL] Timeout → ABORT')
+                self._transition(_S.ABORT)
+
+        # ── HOLD ──────────────────────────────────────────────────────────
+        elif s == _S.HOLD:
+            # Entrada al estado: enviar comando de lift
+            if self._time_in_state() < 0.1:
+                self.get_logger().info(f'[HOLD] Subiendo lift: {self._lift_cmd}')
+                self._lift_done_label = ''
+                self._pub_lift.publish(String(data=self._lift_cmd))
+                return
+
+            # Esperar confirmación del lift
+            if self._lift_done_label == self._lift_expect:
+                # Lift en posición → elevar a HOLD para agarrar el pallet
+                self.get_logger().info(
+                    f'[HOLD] Lift en {self._lift_done_label} → elevando a hold')
                 self._pub_lift.publish(String(data='hold'))
-                self._transition(_S.REVERSE)
+                self._lift_done_label = ''   # reset para esperar AT_HOLD
+                # Avanzar directamente a BACK_AWAY luego de un breve settle
+                # (el hold confirma la recogida; no esperamos otro /lift_done
+                #  para mantener la secuencia simple y evitar falso bloqueo)
+                self.get_logger().info('[HOLD] Pallet recogido → /collect/done SUCCESS')
+                self._pub_done.publish(String(data='SUCCESS'))
+                self._transition(_S.BACK_AWAY)
+                return
 
-        # ── REVERSE ───────────────────────────────────────────────────────
-        elif s == _S.REVERSE:
+            if self._time_in_state() > self._p('lift_timeout'):
+                self.get_logger().error(
+                    f'[HOLD] Timeout esperando {self._lift_expect} → ABORT')
+                self._transition(_S.ABORT)
+
+        # ── BACK_AWAY ─────────────────────────────────────────────────────
+        elif s == _S.BACK_AWAY:
+            # Único uso de cmd_vel en todo el nodo: retroceso en línea recta.
+            # No usamos A* porque el espacio detrás del robot ya fue atravesado
+            # y queremos una maniobra determinista de baja velocidad.
             elapsed = self._time_in_state()
-            if elapsed < self._p('reverse_time'):
+            if elapsed < self._p('back_away_time'):
                 cmd = Twist()
-                cmd.linear.x = -self._p('reverse_speed')
+                cmd.linear.x = -abs(self._p('back_away_speed'))
                 self._pub_cmd.publish(cmd)
             else:
                 self._stop()
-                self.get_logger().info('[REVERSE] Pallet asegurado → DONE')
-                self._transition(_S.DONE)
+                self.get_logger().info('[BACK_AWAY] Retroceso completado → DELIVERY')
+                # Re-habilitar VFH+ antes de ceder el control
+                self._set_vfh_bypass(False)
+                self._transition(_S.DELIVERY)
 
-        # ── DONE ──────────────────────────────────────────────────────────
-        elif s == _S.DONE:
-            self._stop()
+        # ── DELIVERY ──────────────────────────────────────────────────────
+        elif s == _S.DELIVERY:
+            # Este estado es un "paso de mano" a la FSM de misión.
+            # qr_align_node se limpia a sí mismo y vuelve a IDLE.
+            # La FSM de misión recibe la señal via /collect/done (ya enviado)
+            # y toma el control para navegar al punto de entrega.
             self.get_logger().info(
-                f'[Collect] ✅ SUCCESS — payload="{self._qr_payload}" '
-                f'zona="{self._zone}"')
-            self._pub_active.publish(Bool(data=False))
-            self.get_logger().info('[Collect] /align/active → False (VFH bypass OFF)')
-            self._pub_done.publish(String(data='SUCCESS'))
+                f'[DELIVERY] Control cedido a FSM de misión — '
+                f'payload="{self._qr_payload}" zona="{self._zone}"')
             self._reset()
             self._transition(_S.IDLE)
 
@@ -507,56 +426,108 @@ class QRCollectNode(Node):
             if self._lift_cmd:
                 self._pub_lift.publish(String(data='down'))
             self.get_logger().warn('[Collect] ❌ ABORT')
-            self._pub_active.publish(Bool(data=False))
-            self.get_logger().info('[Collect] /align/active → False (VFH bypass OFF)')
+            self._set_vfh_bypass(False)
             self._pub_done.publish(String(data='ABORT'))
             self._reset()
             self._transition(_S.IDLE)
 
     # ══════════════════════════════════════════════════════════════════════
-    # CONTROL PD
+    # PUBLICACIÓN DE GOALS  (núcleo del refactor)
     # ══════════════════════════════════════════════════════════════════════
 
-    def _pd_control(
-        self,
-        angle_err: float,
-        dist_err: float,
-        angular_scale: float = 1.0,
-    ) -> Twist:
+    def _publish_align_goal_if_needed(self):
         """
-        Control PD desacoplado.
-          angle_err : error angular en grados (+ = derecha)
-          dist_err  : error de distancia en metros (+ = lejos)
-          angular_scale: atenuación angular durante avance (evitar zigzag)
+        Calcula un goal de alineación en coordenadas mundo y lo publica en
+        /astar/goal si los datos de percepción cambiaron lo suficiente desde
+        la última publicación.
+
+        Estrategia de goal de alineación
+        ---------------------------------
+        El objetivo es que el robot quede:
+          1. Centrado lateralmente con el QR (error lateral ≈ 0).
+          2. Mirando directamente al QR (ángulo ≈ 0°).
+          3. A align_stop_dist metros del QR.
+
+        Para eso, calculamos la posición estimada del QR en coordenadas mundo
+        y generamos un goal a align_stop_dist metros frente al QR, en la
+        dirección perpendicular al plano del QR.
+
+        Dado que el QR es plano y el robot lo ve de frente, "frente al QR"
+        equivale a estar a lo largo del vector de bearing desde el robot.
+
+        La corrección lateral queda embebida automáticamente: el goal siempre
+        está alineado con la línea robot→QR, así que GoToGoal corregirá el
+        offset lateral al aproximarse.
         """
-        now = time.monotonic()
-        dt  = max(now - self._prev_ctrl_t, 1e-3)
+        # Verificar si vale la pena re-publicar
+        if self._last_goal_angle is not None:
+            d_angle = abs(self._qr_angle - self._last_goal_angle)
+            d_dist  = abs(self._qr_dist  - self._last_goal_dist)
+            if (d_angle < self._p('goal_replan_angle')
+                    and d_dist < self._p('goal_replan_dist')):
+                return   # Sin cambio significativo; no saturar el planner
 
-        d_angle = (angle_err - self._prev_angle_err) / dt
-        d_dist  = (dist_err  - self._prev_dist_err)  / dt
+        goal = self._compute_align_goal(self._p('align_stop_dist'))
+        self._pub_astar.publish(goal)
 
-        kp_a = self._p('kp_angle');  kd_a = self._p('kd_angle')
-        kp_d = self._p('kp_dist');   kd_d = self._p('kd_dist')
+        self._last_goal_angle = self._qr_angle
+        self._last_goal_dist  = self._qr_dist
 
-        # ángulo + = derecha → angular.z negativo (giro antihorario)
-        angular_z = -(kp_a * angle_err + kd_a * d_angle) * angular_scale
-        linear_x  =   kp_d * dist_err  + kd_d * d_dist
+        self.get_logger().info(
+            f'[ALIGNING] Goal → ({goal.x:.3f}, {goal.y:.3f}) θ={goal.theta:.2f}rad  '
+            f'[QR dist={self._qr_dist:.2f}m ang={self._qr_angle:+.1f}°]'
+        )
 
-        max_w = self._p('max_angular');  max_v = self._p('max_linear')
-        angular_z = max(-max_w, min(max_w, angular_z))
-        linear_x  = max(0.0, min(max_v, linear_x))   # no retroceder en PD
+    def _publish_approach_final_goal(self):
+        """
+        Publica el goal de acercamiento final (~5 cm del QR) directamente en
+        /goal (waypoint a GoToGoal, bypass de A*).
 
-        self._prev_angle_err = angle_err
-        self._prev_dist_err  = dist_err
-        self._prev_ctrl_t    = now
+        Por qué bypass de A* en este tramo:
+          - El robot ya está a ≤35 cm del QR; el mapa de ocupación puede
+            marcar ese espacio como libre o con resolución insuficiente.
+          - Queremos una maniobra corta y precisa, no replanificación.
+          - GoToGoal (PID puro) es suficiente para este último paso.
+        """
+        goal = self._compute_align_goal(self._p('approach_final_dist'))
+        self._pub_wp.publish(goal)
+        self.get_logger().info(
+            f'[APPROACH_FINAL] Goal directo → ({goal.x:.3f}, {goal.y:.3f}) '
+            f'θ={goal.theta:.2f}rad'
+        )
 
-        cmd = Twist()
-        cmd.angular.z = angular_z
-        cmd.linear.x  = linear_x
-        return cmd
+    def _compute_align_goal(self, stop_dist: float) -> Pose2D:
+        """
+        Devuelve una Pose2D en coordenadas mundo representando el punto desde
+        el cual el robot estará:
+          - A `stop_dist` metros del QR.
+          - Mirando directamente hacia el QR (orientación = bearing al QR).
+
+        El cálculo es:
+          bearing  = robot_yaw + angle_rad   (dirección al QR en mundo)
+          qr_world = robot_pos + dist * [cos(bearing), sin(bearing)]
+          goal_pos = qr_world - stop_dist * [cos(bearing), sin(bearing)]
+          goal_yaw = bearing   (robot mira al QR al llegar)
+        """
+        angle_rad   = math.radians(self._qr_angle)
+        bearing     = self._rth + angle_rad
+
+        # Posición estimada del QR en coordenadas mundo
+        qr_x = self._rx + self._qr_dist * math.cos(bearing)
+        qr_y = self._ry + self._qr_dist * math.sin(bearing)
+
+        # Goal: retroceder stop_dist desde el QR en la misma dirección
+        gx = qr_x - stop_dist * math.cos(bearing)
+        gy = qr_y - stop_dist * math.sin(bearing)
+
+        goal = Pose2D()
+        goal.x     = gx
+        goal.y     = gy
+        goal.theta = bearing   # orientación deseada al llegar
+        return goal
 
     # ══════════════════════════════════════════════════════════════════════
-    # UTILIDADES
+    # HELPERS
     # ══════════════════════════════════════════════════════════════════════
 
     def _qr_visible(self) -> bool:
@@ -566,20 +537,26 @@ class QRCollectNode(Node):
         )
 
     def _stop(self):
+        """Para el robot publicando un Twist cero."""
         self._pub_cmd.publish(Twist())
 
     def _time_in_state(self) -> float:
         return time.monotonic() - self._state_entry
 
+    def _set_vfh_bypass(self, active: bool):
+        self._pub_active.publish(Bool(data=active))
+        state_str = 'ON  (evasión inhibida)' if active else 'OFF (evasión normal)'
+        self.get_logger().info(f'[VFH+] /align/active → {state_str}')
+
     def _transition(self, new_state: str):
-        if new_state != self._state:
-            self.get_logger().info(f'[FSM] {self._state} → {new_state}')
-            self._prev_state  = self._state
-            self._state       = new_state
-            self._state_entry = time.monotonic()
-            self._prev_angle_err = 0.0
-            self._prev_dist_err  = 0.0
-            self._prev_ctrl_t    = time.monotonic()
+        if new_state == self._state:
+            return
+        self.get_logger().info(f'[FSM] {self._state} → {new_state}')
+        self._state       = new_state
+        self._state_entry = time.monotonic()
+        # Reset del último goal para forzar re-publicación al entrar a ALIGNING
+        self._last_goal_angle = None
+        self._last_goal_dist  = None
 
     def _reset(self):
         self._zone            = ''
@@ -590,6 +567,8 @@ class QRCollectNode(Node):
         self._qr_angle        = 0.0
         self._qr_dist         = 999.0
         self._astar_status    = ''
+        self._last_goal_angle = None
+        self._last_goal_dist  = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -598,7 +577,7 @@ class QRCollectNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = QRCollectNode()
+    node = QRAlignNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
