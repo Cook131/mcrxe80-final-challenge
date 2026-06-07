@@ -150,7 +150,7 @@ def _to_posestamped(rvec, tvec) -> PoseStamped:
 class ArucoDetectorNode(Node):
 
     MARKER_SIZE = 0.095   # metros — medir marcador físico con regla
-    QR_SIZE     = 0.089   # metros — medir el QR físico con regla
+    QR_SIZE     = 0.09  # metros — medir el QR físico con regla
 
     def __init__(self):
         super().__init__('aruco_detector')
@@ -167,7 +167,7 @@ class ArucoDetectorNode(Node):
         # FIX: solo compensamos tz (profundidad) para no introducir error
         # al mezclar frames. Si necesitas compensación completa, aplica
         # la rotación base_link→camera antes de restar.
-        self.declare_parameter('cam_offset', [0.0, 0.0, 0.13])
+        self.declare_parameter('cam_offset', [0.07, 0.08, 0.15])
 
         camera_topic     = self.get_parameter('camera_topic').value
         self.marker_size = float(self.get_parameter('marker_size').value)
@@ -338,11 +338,11 @@ class ArucoDetectorNode(Node):
         - tx/ty no se compensan porque cam_offset está en frame del robot,
           no en frame de cámara; mezclarlos introduce error adicional.
         - Si necesitas compensación completa, aplica la rotación
-          R_cam_to_base antes de restar el offset.
+          R_cam_to_base antes de restar el offset
         """
         offset = self.get_parameter('cam_offset').value
-        tx = float(tvec[0])
-        ty = float(tvec[1])
+        tx = float(tvec[0]) - float(offset[0])   # opcional, pero mezclar frames puede introducir error
+        ty = float(tvec[1]) - float(offset[1])   # opcional, pero mezclar frames puede introducir error
         tz = float(tvec[2]) - float(offset[2])   # solo profundidad
 
         dist_3d = math.sqrt(tx*tx + ty*ty + tz*tz)
