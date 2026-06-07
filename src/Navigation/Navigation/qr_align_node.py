@@ -162,6 +162,7 @@ class QRAlignNode(Node):
         self.declare_parameter('fsm_rate_hz',         20.0)
         self.declare_parameter('scan_range_deg',      30.0)
         self.declare_parameter('scan_speed_dps',      20.0)
+        self.declare_parameter('scan_max_attempts',   3)
 
         self._p = lambda n: self.get_parameter(n).value
 
@@ -197,6 +198,7 @@ class QRAlignNode(Node):
         self._scan_phase        = 'LEFT'
         # Yaw odométrico al inicio de la fase actual (referencia de giro).
         self._scan_phase_start_yaw = 0.0
+        self._scan_attempts        = 0
 
         # ── Lift ──────────────────────────────────────────────────────────
         self._lift_done_label = ''
