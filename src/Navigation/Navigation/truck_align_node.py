@@ -1,528 +1,880 @@
 #!/usr/bin/env python3
 """
-truck_align_node.py — Alineación visual con camión  [v2 — integración A*/GoToGoal]
-====================================================================================
-Cambios respecto a v1
----------------------
-  * El logo del camión está en el piso/frente bajo: la cámara lo pierde de vista
-    cuando el robot se acerca. Esta versión maneja explícitamente ese caso.
+truck_align_node.py — Iolair Truck Align + Pallet Delivery  [v1]
+=================================================================
+Nodo de entrega de pallet. Se activa después de que qr_align_node
+completa la recolección y el robot lleva el pallet levantado.
 
-  * Nuevo estado NAV_APPROACH: al confirmar alineación visual (logo centrado),
-    el nodo estima la distancia al logo por el tamaño del bbox en píxeles y publica
-    un goal relativo a /astar/goal para que GoToGoal + A* lleven al robot hasta
-    el punto de depósito, sin necesidad de ver el logo durante el trayecto.
+Secuencia completa
+------------------
+  1. IDLE
+       Espera trigger en /truck_align/cmd (String con nombre del camión).
+       El payload del QR recibido en /collect/qr_payload determina qué
+       clase de logo YOLO buscar (ver _PAYLOAD_TO_CLASS).
 
-  * Approach ciego garantizado: LOGO_LOST_APPROACH es la fase donde el logo ya
-    desapareció del frame (robot muy cerca / logo debajo del FOV). El nodo sigue
-    el goal hasta GOAL_REACHED de A* y luego declara ALIGNED.
+  2. GOTO_DETECTION_WP
+       Publica el waypoint con ID configurado (por defecto 15) del YAML de
+       waypoints hacia /astar/goal y espera confirmación de llegada
+       vía /astar/status == "GOAL_REACHED".
 
-  * Suscripción a /odom para convertir offset visual → coordenadas mundo.
-  * Suscripción a /astar/status para saber cuándo A* terminó.
+  3. SEARCH_TRUCK
+       Rota in-place (barrido ±scan_range_deg) mientras YOLO no detecta
+       la clase objetivo. Si no encuentra el logo tras scan_max_attempts
+       completos → ABORT.
 
-FSM interna:
-  IDLE → SCAN → ALIGN → NAV_APPROACH → LOGO_LOST_APPROACH → DONE → IDLE
+  4. ALIGNING
+       Con el logo visible, calcula el bearing al centro del logo
+       desde la posición del robot en el frame mundo y publica un goal
+       lateral a /astar/goal. El goal se posiciona a:
+         - stop_dist metros en profundidad frente al logo
+         - lateral_offset_m (24 cm) a la DERECHA del logo
+       "Derecha" = vector perpendicular derecho al bearing robot→logo.
+
+  5. APPROACH_FINAL
+       Avanza con /goal (GoToGoal directo, bypassa A*) hasta que la
+       cámara reporta que el logo está dentro de final_dist_m.
+       _stop() explícito al llegar.
+
+  6. ADVANCING
+       El robot avanza en línea recta a velocidad lenta (advance_speed)
+       durante advance_dist_m metros (cronometrado), con el pallet
+       todavía levantado, para meter las horquillas dentro del camión.
+       Cálculo geométrico:
+         advance_dist = stop_dist_m - forklift_len_m + insert_depth_m
+                      = 0.30 - 0.15 + 0.07 = 0.22 m  (default)
+       Al terminar el avance el robot se detiene.
+
+  7. LOWERING
+       Publica "down" en /lift_auto y espera /lift_done == "DOWN"
+       con timeout lift_timeout_s.
+
+  8. BACK_AWAY
+       Retrocede back_away_time segundos a back_away_speed m/s.
+
+  9. DONE
+       Publica /truck_align/done "SUCCESS", reactiva VFH+,
+       vuelve a IDLE.
+
+  ABORT en cualquier estado:
+       Publica /truck_align/done "ABORT", reactiva VFH+,
+       vuelve a IDLE. Si el lift estaba en HOLD, intenta bajar antes.
+
+Parámetros configurables (ros2 param)
+--------------------------------------
+  waypoints_file     str    ruta al YAML con waypoints
+                            (ej. ~/iolair_ws/src/iolair/config/waypoints.yaml)
+  detection_wp_id    int    ID del waypoint en el YAML (por defecto 15)
+  lateral_offset_m   float  offset lateral a la derecha del logo (0.24 m)
+  stop_dist_m        float  distancia al logo al detenerse (0.30 m)
+  final_dist_m       float  umbral de llegada en APPROACH_FINAL (0.20 m)
+  forklift_len_m     float  largo físico de la horquilla, frente robot → punta (0.15 m)
+  insert_depth_m     float  cuánto debe penetrar la punta en el camión (0.07 m)
+  advance_speed      float  velocidad de avance de inserción (0.08 m/s)
+  advance_timeout_s  float  timeout de seguridad para ADVANCING (8.0 s)
+  align_timeout_s    float  timeout de ALIGNING (20.0 s)
+  approach_timeout_s float  timeout de APPROACH_FINAL (15.0 s)
+  lift_timeout_s     float  timeout de LOWERING (8.0 s)
+  goto_timeout_s     float  timeout de GOTO_DETECTION_WP (30.0 s)
+  search_timeout_s   float  timeout de un barrido completo sin logo (12.0 s)
+  scan_range_deg     float  semiángulo del barrido de búsqueda (40.0 °)
+  scan_speed_dps     float  velocidad angular del barrido (20.0 °/s)
+  scan_max_attempts  int    intentos antes de ABORT (3)
+  back_away_speed    float  velocidad de retroceso (0.10 m/s)
+  back_away_time     float  duración del retroceso (2.0 s)
+  fsm_rate_hz        float  frecuencia del tick de la FSM (20.0 Hz)
+  goal_replan_dist   float  mínimo desplazamiento del goal para replanificar (0.06 m)
+  logo_timeout_s     float  tiempo sin detección antes de considerar logo perdido (1.5 s)
+  cam_fov_h_deg      float  FOV horizontal de la cámara (62.0 °) — para calcular ángulo
+                            del logo desde píxeles del bbox
 
 Topics
 ------
-  SUB  /truck_align/cmd      (String)   "align:<client_name>"
-       /yolo/detecciones     (String)   JSON [{class, conf, bbox, bbox_cx}]
-       /mission/mode         (String)   "stop" / "estop" aborta
-       /odom                 (Odometry) pose del robot en mundo
-       /astar/status         (String)   GOAL_REACHED / EXECUTING / ...
+  SUB  /truck_align/cmd       std_msgs/String  — nombre del camión objetivo
+                                                 (mapeo a clase YOLO vía _PAYLOAD_TO_CLASS)
+  SUB  /collect/qr_payload    std_msgs/String  — payload del QR (ya procesado por qr_align)
+  SUB  /yolo/detecciones      std_msgs/String  — JSON de detecciones YOLO
+  SUB  /odom                  nav_msgs/Odometry
+  SUB  /astar/status          std_msgs/String
+  SUB  /lift_done             std_msgs/String
+  PUB  /astar/goal            geometry_msgs/Pose2D
+  PUB  /goal                  geometry_msgs/Pose2D
+  PUB  /cmd_vel               geometry_msgs/Twist
+  PUB  /lift_auto             std_msgs/String
+  PUB  /align/active          std_msgs/Bool
+  PUB  /truck_align/done      std_msgs/String  — "SUCCESS" | "ABORT"
 
-  PUB  /truck_align/result   (String)   "ALIGNED" | "FAILED" | "TIMEOUT"
-       /truck_align/status   (String)   heartbeat estado FSM
-       /cmd_vel              (Twist)    velocidades durante SCAN / ALIGN
-       /astar/goal           (Pose2D)   goal absoluto para A* durante approach
+Mapeo payload QR → clase YOLO
+-------------------------------
+  "wolmar"  / "nalmart"  → "nalmart"
+  "emezon"  / "nemezon"  → "nemezon"
+  "popsi"   / "nepsi"    → "nepsi"
 
-Parámetros
-----------
-  frame_width_px      int    320      ancho del frame de cámara
-  logo_real_width_m   float  0.35     ancho físico conocido del logo [m]
-                                       → usado para estimar distancia por bbox
-  focal_length_px     float  186.0    focal horizontal en píxeles (fx de calib)
-                                       → dist_est = (logo_w_m * fx) / bbox_w_px
-  approach_stop_dist  float  0.40     distancia final al logo tras approach [m]
-                                       (goal = pos_logo - approach_stop_dist)
-  yolo_kp             float  0.005    ganancia proporcional px→rad/s
-  max_w               float  0.35     velocidad angular máxima rad/s
-  err_ok_px           int    22       umbral de alineación en píxeles
-  confirm_ticks       int    3        frames consecutivos para confirmar
-  min_conf            float  0.60     confianza mínima YOLO
-  scan_speed          float  0.22     rad/s durante búsqueda
-  scan_timeout_s      float  18.0     tiempo total de scan antes de FAILED
-  align_timeout_s     float  10.0     tiempo máximo en fase ALIGN
-  nav_approach_timeout_s float 30.0   timeout A* approach
-  fsm_rate_hz         float  20.0     frecuencia del timer interno
+  El mapeo acepta tanto el nombre amigable del camión (del QR) como
+  la clase interna de YOLO directamente, para flexibilidad.
 """
-
-from __future__ import annotations
 
 import json
 import math
+import os
 import time
-from enum import Enum, auto
-from typing import Optional
 
 import rclpy
+import yaml
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos  import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-from geometry_msgs.msg import Twist, Pose2D
-from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, String
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FSM INTERNA
-# ══════════════════════════════════════════════════════════════════════════════
-
-class AlignState(Enum):
-    IDLE                = auto()  # esperando /truck_align/cmd
-    SCAN                = auto()  # girando para encontrar el logo
-    ALIGN               = auto()  # centrando el logo en frame con P-ctrl angular
-    NAV_APPROACH        = auto()  # A* llevando al robot hasta el logo (blind ok)
-    LOGO_LOST_APPROACH  = auto()  # logo fuera de FOV (robot muy cerca) — esperando GOAL_REACHED
-    DONE                = auto()  # publicar resultado y volver a IDLE
+from geometry_msgs.msg import Pose2D, Twist
+from nav_msgs.msg      import Odometry
+from std_msgs.msg      import Bool, String
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODO
+# Mapeo nombre-camión → clase YOLO
+# Acepta nombre amigable (del QR) O nombre interno de YOLO
 # ══════════════════════════════════════════════════════════════════════════════
+_PAYLOAD_TO_CLASS = {
+    # nombre amigable → clase YOLO
+    'wolmar':  'nalmart',
+    'emezon':  'nemezon',
+    'popsi':   'nepsi',
+    # clase YOLO directa (pass-through, por si el QR ya tiene el nombre interno)
+    'nalmart': 'nalmart',
+    'nemezon': 'nemezon',
+    'nepsi':   'nepsi',
+}
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Estados FSM
+# ══════════════════════════════════════════════════════════════════════════════
+class _S:
+    IDLE               = 'IDLE'
+    GOTO_DETECTION_WP  = 'GOTO_DETECTION_WP'
+    SEARCH_TRUCK       = 'SEARCH_TRUCK'
+    ALIGNING           = 'ALIGNING'
+    APPROACH_FINAL     = 'APPROACH_FINAL'
+    ADVANCING          = 'ADVANCING'
+    LOWERING           = 'LOWERING'
+    BACK_AWAY          = 'BACK_AWAY'
+    DONE               = 'DONE'
+    ABORT              = 'ABORT'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 class TruckAlignNode(Node):
 
     def __init__(self):
         super().__init__('truck_align_node')
 
-        # ── Parámetros ────────────────────────────────────────────────────────
-        self.declare_parameter('frame_width_px',          320)
-        self.declare_parameter('logo_real_width_m',       0.35)   # ancho físico del logo
-        self.declare_parameter('focal_length_px',         186.0)  # fx de calibración
-        self.declare_parameter('approach_stop_dist',      0.40)   # distancia objetivo final
-        self.declare_parameter('yolo_kp',                 0.005)
-        self.declare_parameter('max_w',                   0.35)
-        self.declare_parameter('err_ok_px',               22)
-        self.declare_parameter('confirm_ticks',           3)
-        self.declare_parameter('min_conf',                0.60)
-        self.declare_parameter('scan_speed',              0.22)
-        self.declare_parameter('scan_timeout_s',          18.0)
-        self.declare_parameter('align_timeout_s',         10.0)
-        self.declare_parameter('nav_approach_timeout_s',  30.0)
-        self.declare_parameter('fsm_rate_hz',             20.0)
+        # ── Parámetros ────────────────────────────────────────────────────
+        self.declare_parameter('waypoints_file',     '')
+        self.declare_parameter('detection_wp_id',    15)     # <--- ID modificado
+        self.declare_parameter('lateral_offset_m',   0.24)
+        self.declare_parameter('stop_dist_m',        0.30)
+        self.declare_parameter('final_dist_m',       0.20)
+        self.declare_parameter('forklift_len_m',     0.15)   # largo físico de la horquilla
+        self.declare_parameter('insert_depth_m',     0.07)   # cuánto entra la punta al camión
+        self.declare_parameter('advance_speed',      0.08)   # m/s — lento para no perder el pallet
+        self.declare_parameter('advance_timeout_s',  8.0)    # timeout de seguridad
+        self.declare_parameter('align_timeout_s',    20.0)
+        self.declare_parameter('approach_timeout_s', 15.0)
+        self.declare_parameter('lift_timeout_s',     8.0)
+        self.declare_parameter('goto_timeout_s',     30.0)
+        self.declare_parameter('search_timeout_s',   12.0)
+        self.declare_parameter('scan_range_deg',     40.0)
+        self.declare_parameter('scan_speed_dps',     20.0)
+        self.declare_parameter('scan_max_attempts',  3)
+        self.declare_parameter('back_away_speed',    0.10)
+        self.declare_parameter('back_away_time',     2.0)
+        self.declare_parameter('fsm_rate_hz',        20.0)
+        self.declare_parameter('goal_replan_dist',   0.06)
+        self.declare_parameter('logo_timeout_s',     1.5)
+        self.declare_parameter('cam_fov_h_deg',      62.0)
 
-        self._frame_cx    = self.get_parameter('frame_width_px').value // 2
-        self._kp          = self.get_parameter('yolo_kp').value
-        self._max_w       = self.get_parameter('max_w').value
-        self._err_ok      = self.get_parameter('err_ok_px').value
-        self._confirm_ticks = self.get_parameter('confirm_ticks').value
-        self._min_conf    = self.get_parameter('min_conf').value
-        self._scan_speed  = self.get_parameter('scan_speed').value
-        self._scan_timeout  = self.get_parameter('scan_timeout_s').value
-        self._align_timeout = self.get_parameter('align_timeout_s').value
-        self._nav_timeout   = self.get_parameter('nav_approach_timeout_s').value
-        fsm_rate            = self.get_parameter('fsm_rate_hz').value
+        self._p = lambda n: self.get_parameter(n).value
 
-        # ── Estado interno ────────────────────────────────────────────────────
-        self._state:           AlignState = AlignState.IDLE
-        self._state_entry_t:   float      = time.monotonic()
-        self._just_entered:    bool       = True
+        # ── Estado FSM ────────────────────────────────────────────────────
+        self._state       = _S.IDLE
+        self._state_entry = time.monotonic()
 
-        self._target_class:    str   = ''
-        self._detections:      list  = []
-        self._mission_mode:    str   = ''
+        # ── Target ────────────────────────────────────────────────────────
+        self._target_class   = ''   # clase YOLO a buscar
+        self._lift_was_held  = False  # saber si hay pallet arriba al hacer ABORT
 
-        self._ok_ticks:        int   = 0
-        self._result:          str   = ''
+        # ── Detección YOLO ────────────────────────────────────────────────
+        # Ángulo horizontal del logo (grados, relativo al heading del robot)
+        # positivo = logo a la derecha
+        self._logo_angle  = 0.0
+        self._logo_stamp  = 0.0     # time.monotonic() del último frame con logo
+        self._logo_seen   = False   # hay detección válida en la ventana de tiempo
 
-        # Pose del robot (de /odom)
-        self._robot_x:         float = 0.0
-        self._robot_y:         float = 0.0
-        self._robot_th:        float = 0.0
+        # ── Pose odométrica ───────────────────────────────────────────────
+        self._rx  = 0.0
+        self._ry  = 0.0
+        self._rth = 0.0
 
-        # Estado A*
-        self._astar_status:    str   = ''
+        # ── A* / GoToGoal ─────────────────────────────────────────────────
+        self._astar_status = ''
+        self._last_goal_x  = None
+        self._last_goal_y  = None
 
-        # ── QOS ───────────────────────────────────────────────────────────────
-        best_effort = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=5)
+        # ── Lift ──────────────────────────────────────────────────────────
+        self._lift_done_label = ''
 
-        # ── Suscriptores ──────────────────────────────────────────────────────
-        self.create_subscription(String,   '/truck_align/cmd',  self._cb_cmd,    10)
-        self.create_subscription(String,   '/yolo/detecciones', self._cb_yolo,   best_effort)
-        self.create_subscription(String,   '/mission/mode',     self._cb_mode,   10)
-        self.create_subscription(Odometry, '/odom',             self._cb_odom,   10)
-        self.create_subscription(String,   '/astar/status',     self._cb_astar,  10)
+        # ── ADVANCING ─────────────────────────────────────────────────────
+        self._advance_dist_m     = 0.0    # metros a recorrer calculados en APPROACH_FINAL
+        self._advance_start_odom = (0.0, 0.0)  # pose de inicio del avance
 
-        # ── Publicadores ──────────────────────────────────────────────────────
-        self._pub_result = self.create_publisher(String, '/truck_align/result', 10)
-        self._pub_status = self.create_publisher(String, '/truck_align/status', 10)
-        self._pub_cmd    = self.create_publisher(Twist,  '/cmd_vel',            10)
-        self._pub_goal   = self.create_publisher(Pose2D, '/astar/goal',         10)
-        self._pub_active = self.create_publisher(Bool,   '/align/active',     10)
+        # ── SEARCH_TRUCK ──────────────────────────────────────────────────
+        self._scan_phase           = 'LEFT'
+        self._scan_phase_start_yaw = 0.0
+        self._scan_attempts        = 0
 
-        # ── Timer ─────────────────────────────────────────────────────────────
-        self.create_timer(1.0 / fsm_rate, self._tick)
-
-        self.get_logger().info(
-            f'TruckAlignNode v2 listo | '
-            f'frame_cx={self._frame_cx}px | err_ok={self._err_ok}px | '
-            f'confirm={self._confirm_ticks} ticks | '
-            f'logo_w={self.get_parameter("logo_real_width_m").value}m | '
-            f'approach_stop={self.get_parameter("approach_stop_dist").value}m'
+        # ── QoS ───────────────────────────────────────────────────────────
+        qos_be = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
         )
 
-    # ══════════════════════════════════════════════════════════════════════════
+        # ── Suscriptores ──────────────────────────────────────────────────
+        self.create_subscription(String,   '/truck_align/cmd',    self._cb_cmd,          10)
+        self.create_subscription(String,   '/collect/qr_payload', self._cb_qr_payload,   10)
+        self.create_subscription(String,   '/yolo/detecciones',   self._cb_yolo,         qos_be)
+        self.create_subscription(Odometry, '/odom',               self._cb_odom,         10)
+        self.create_subscription(String,   '/astar/status',       self._cb_astar_status, 10)
+        self.create_subscription(String,   '/lift_done',          self._cb_lift_done,    10)
+
+        # ── Publicadores ──────────────────────────────────────────────────
+        self._pub_astar  = self.create_publisher(Pose2D, '/astar/goal',        10)
+        self._pub_wp     = self.create_publisher(Pose2D, '/goal',              10)
+        self._pub_cmd    = self.create_publisher(Twist,  '/cmd_vel',           10)
+        self._pub_lift   = self.create_publisher(String, '/lift_auto',         10)
+        self._pub_active = self.create_publisher(Bool,   '/align/active',      10)
+        self._pub_done   = self.create_publisher(String, '/truck_align/done',  10)
+
+        # ── Timer FSM ─────────────────────────────────────────────────────
+        self.create_timer(1.0 / float(self._p('fsm_rate_hz')), self._tick)
+
+        # ── Cargar waypoints ──────────────────────────────────────────────
+        self._detection_wp = self._load_detection_wp()
+
+        self.get_logger().info(
+            'truck_align_node v2 listo\n'
+            f'  detection_wp (ID {self._p("detection_wp_id")})=({self._detection_wp[0]:.3f}, {self._detection_wp[1]:.3f})\n'
+            f'  lateral_offset={self._p("lateral_offset_m")}m  '
+            f'stop_dist={self._p("stop_dist_m")}m  '
+            f'final_dist={self._p("final_dist_m")}m\n'
+            f'  forklift_len={self._p("forklift_len_m")}m  '
+            f'insert_depth={self._p("insert_depth_m")}m  '
+            f'→ advance={self._p("stop_dist_m")-self._p("forklift_len_m")+self._p("insert_depth_m"):.3f}m '
+            f'@ {self._p("advance_speed")}m/s\n'
+            f'  Mapeo QR→YOLO: wolmar→nalmart | emezon→nemezon | popsi→nepsi'
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CARGA DE WAYPOINTS
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _load_detection_wp(self):
+        """
+        Carga la posición (x, y) del waypoint utilizando el ID desde
+        el YAML de waypoints. Si no se encuentra, devuelve (0.0, 0.0)
+        con una advertencia y el operador puede corregir con ros2 param.
+
+        Formato YAML soportado (dos variantes):
+          # Variante A — lista de dicts con campos 'id', 'x', 'y'
+          waypoints:
+            - id: 15
+              x: 1.234
+              y: 5.678
+
+          # Variante B — dict nombrado (id como key)
+          waypoints:
+            15:
+              x: 1.234
+              y: 5.678
+        """
+        wp_file = self._p('waypoints_file')
+        wp_id   = self._p('detection_wp_id')
+
+        if not wp_file:
+            self.get_logger().warn(
+                f'waypoints_file no configurado. '
+                f'Usando (0.0, 0.0) para ID {wp_id}. '
+                f'Pasa el parámetro: '
+                f'--ros-args -p waypoints_file:=/ruta/waypoints.yaml')
+            return (0.0, 0.0)
+
+        expanded = os.path.expanduser(wp_file)
+        if not os.path.exists(expanded):
+            self.get_logger().error(
+                f'Archivo de waypoints no encontrado: {expanded}')
+            return (0.0, 0.0)
+
+        try:
+            with open(expanded, 'r') as f:
+                data = yaml.safe_load(f)
+        except Exception as e:
+            self.get_logger().error(f'Error leyendo YAML: {e}')
+            return (0.0, 0.0)
+
+        wps = data.get('waypoints', {})
+
+        # Variante A: lista
+        if isinstance(wps, list):
+            for wp in wps:
+                if isinstance(wp, dict) and wp.get('id') == wp_id:
+                    x = float(wp.get('x', 0.0))
+                    y = float(wp.get('y', 0.0))
+                    self.get_logger().info(
+                        f'[WP] ID {wp_id} cargado: ({x:.3f}, {y:.3f})')
+                    return (x, y)
+            self.get_logger().error(
+                f'Waypoint ID {wp_id} no encontrado en lista. '
+                f'IDs disponibles: '
+                f'{[w.get("id","?") for w in wps if isinstance(w, dict)]}')
+            return (0.0, 0.0)
+
+        # Variante B: dict
+        if isinstance(wps, dict):
+            # Probar el key tanto como entero (15) o como string ("15")
+            entry = wps.get(wp_id) or wps.get(str(wp_id))
+            if entry:
+                x = float(entry.get('x', 0.0))
+                y = float(entry.get('y', 0.0))
+                self.get_logger().info(
+                    f'[WP] ID {wp_id} cargado: ({x:.3f}, {y:.3f})')
+                return (x, y)
+            self.get_logger().error(
+                f'Waypoint ID {wp_id} no encontrado en dict. '
+                f'Claves: {list(wps.keys())}')
+            return (0.0, 0.0)
+
+        self.get_logger().error(f'Formato YAML de waypoints no reconocido.')
+        return (0.0, 0.0)
+
+    # ══════════════════════════════════════════════════════════════════════
     # CALLBACKS
-    # ══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════
 
     def _cb_cmd(self, msg: String):
-        raw = msg.data.strip()
-        if not raw.startswith('align:'):
-            self.get_logger().warning(f'[TruckAlign] Comando no reconocido: "{raw}"')
+        """
+        Trigger principal. Acepta el nombre del camión objetivo.
+        El nombre puede ser el nombre amigable (wolmar, emezon, popsi)
+        o directamente la clase YOLO (nalmart, nemezon, nepsi).
+        También acepta 'abort' para cancelar en cualquier momento.
+        """
+        cmd = msg.data.strip().lower()
+
+        if cmd == 'abort':
+            if self._state != _S.IDLE:
+                self.get_logger().warn('[TruckAlign] ABORT recibido')
+                self._transition(_S.ABORT)
             return
 
-        client = raw[len('align:'):].strip().lower()
-        if not client:
-            self.get_logger().warning('[TruckAlign] Nombre de cliente vacío')
+        if self._state != _S.IDLE:
+            self.get_logger().warn(
+                f'[TruckAlign] Trigger ignorado — estado: {self._state}')
             return
 
-        if self._state != AlignState.IDLE:
-            self.get_logger().warning(
-                f'[TruckAlign] Recibido "{raw}" pero estado={self._state.name} — ignorando')
+        yolo_class = _PAYLOAD_TO_CLASS.get(cmd)
+        if yolo_class is None:
+            self.get_logger().error(
+                f'[TruckAlign] Nombre desconocido: "{cmd}". '
+                f'Válidos: {list(_PAYLOAD_TO_CLASS.keys())}')
             return
 
-        self.get_logger().info(f'[TruckAlign] Iniciando alineación para "{client}"')
-        self._target_class = client
-        self._ok_ticks     = 0
-        self._result       = ''
-        self._transition(AlignState.SCAN)
-        # Notificar al VFH que truck_align tiene el control
-        self._pub_active.publish(Bool(data=True))
-        self.get_logger().info('[TruckAlign] /align/active → True (VFH bypass ON)')
+        self._target_class  = yolo_class
+        self._lift_was_held = True   # asumimos que llegamos con pallet arriba
+        self.get_logger().info(
+            f'[TruckAlign] Trigger: "{cmd}" → clase YOLO: "{yolo_class}"')
+        self._set_vfh_bypass(True)
+        self._transition(_S.GOTO_DETECTION_WP)
+
+    def _cb_qr_payload(self, msg: String):
+        """
+        Escucha el payload del QR publicado por qr_align_node.
+        Si llega durante IDLE y es un nombre conocido, pre-carga
+        la clase objetivo para que cuando llegue el trigger ya esté listo.
+        Este callback NO activa la FSM por sí solo.
+        """
+        if self._state != _S.IDLE:
+            return
+        payload = msg.data.strip().lower()
+        yolo_class = _PAYLOAD_TO_CLASS.get(payload)
+        if yolo_class and yolo_class != self._target_class:
+            self.get_logger().info(
+                f'[TruckAlign] QR payload pre-cargado: '
+                f'"{payload}" → clase: "{yolo_class}"')
+            self._target_class = yolo_class
 
     def _cb_yolo(self, msg: String):
-        try:
-            raw = json.loads(msg.data)
-            for d in raw:
-                if 'bbox_cx' not in d and 'bbox' in d:
-                    x1, _, x2, _ = d['bbox']
-                    d['bbox_cx'] = (x1 + x2) // 2
-            self._detections = raw
-        except Exception:
-            self._detections = []
+        """
+        Procesa detecciones YOLO (JSON). Extrae el ángulo horizontal
+        del logo objetivo (si está presente) respecto al centro de imagen.
+        El ángulo se usa para estimar la dirección mundo al logo.
 
-    def _cb_mode(self, msg: String):
-        self._mission_mode = msg.data.strip().lower()
+        Ángulo positivo = logo a la DERECHA del centro de imagen.
+        """
+        if self._state not in (_S.SEARCH_TRUCK, _S.ALIGNING, _S.APPROACH_FINAL, _S.ADVANCING):
+            return
+        if not self._target_class:
+            return
+
+        try:
+            detections = json.loads(msg.data)
+        except Exception:
+            return
+
+        # Filtrar detecciones de la clase objetivo; quedarse con la de mayor confianza
+        candidates = [
+            d for d in detections
+            if d.get('class') == self._target_class
+        ]
+        if not candidates:
+            return
+
+        best = max(candidates, key=lambda d: d.get('conf', 0.0))
+        x1, y1, x2, y2 = best['bbox']
+
+        # Ancho de la imagen: estimado desde el bbox más externo.
+        # Para el ángulo horizontal necesitamos el ancho total de imagen.
+        # Lo inferimos asumiendo que las detecciones anteriores cubrieron
+        # el rango completo, o usamos cam_fov_h_deg con anchura fija.
+        # La forma más robusta: calcular ángulo desde el offset normalizado
+        # del centro del bbox respecto al centro de imagen.
+        #
+        # Nota: yolo_detector_node no publica el tamaño de imagen junto con
+        # las detecciones. Asumimos IMGSZ=320 como referencia (configurable
+        # vía cam_fov_h_deg sin necesitar el tamaño exacto).
+        # El ángulo en rad: tan(α) = (px_offset / px_half_width) * tan(fov/2)
+        # Con IMGSZ=320: px_half_width = 160
+
+        # Centro del bbox en píxeles
+        box_cx = (x1 + x2) / 2.0
+
+        # Offset normalizado respecto al centro de imagen (asumimos IMGSZ=320)
+        # Si IMGSZ cambia, ajustar img_half_width o usar parámetro
+        img_half_width = 160.0   # IMGSZ=320 / 2
+
+        fov_half_rad = math.radians(self._p('cam_fov_h_deg') / 2.0)
+        angle_rad = math.atan(
+            (box_cx - img_half_width) / img_half_width * math.tan(fov_half_rad)
+        )
+        self._logo_angle = math.degrees(angle_rad)
+        self._logo_stamp = time.monotonic()
+        self._logo_seen  = True
 
     def _cb_odom(self, msg: Odometry):
-        self._robot_x = msg.pose.pose.position.x
-        self._robot_y = msg.pose.pose.position.y
-        q = msg.pose.pose.orientation
-        self._robot_th = math.atan2(
+        self._rx  = msg.pose.pose.position.x
+        self._ry  = msg.pose.pose.position.y
+        q         = msg.pose.pose.orientation
+        self._rth = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
 
-    def _cb_astar(self, msg: String):
+    def _cb_astar_status(self, msg: String):
+        prev = self._astar_status
         self._astar_status = msg.data.strip()
+        if self._astar_status != prev:
+            self.get_logger().debug(f'[A*] {self._astar_status}')
 
-    # ══════════════════════════════════════════════════════════════════════════
+    def _cb_lift_done(self, msg: String):
+        # Solo procesar durante LOWERING para evitar contaminación
+        if self._state != _S.LOWERING:
+            return
+        label = msg.data.strip()
+        if label:
+            self.get_logger().info(f'[Lift] /lift_done: {label}')
+            self._lift_done_label = label
+
+    # ══════════════════════════════════════════════════════════════════════
     # FSM TICK
-    # ══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════
 
     def _tick(self):
-        self._pub_status.publish(String(data=self._state.name))
+        s = self._state
 
-        # Abort por E_STOP o stop manual
-        if self._mission_mode in ('estop', 'stop') and self._state != AlignState.IDLE:
-            self.get_logger().warning(
-                f'[TruckAlign] Abort por mode="{self._mission_mode}"')
-            self._stop()
-            self._publish_result('FAILED')
-            self._pub_active.publish(Bool(data=False))
-            self.get_logger().info('[TruckAlign] /align/active → False (VFH bypass OFF)')
-            self._transition(AlignState.IDLE)
+        if s == _S.IDLE:
             return
 
-        if self._state == AlignState.IDLE:
-            pass
+        # ── GOTO_DETECTION_WP ─────────────────────────────────────────────
+        elif s == _S.GOTO_DETECTION_WP:
+            # Publicar goal de A* al waypoint truck_detection en la primera entrada
+            if self._time_in_state() < 0.1:
+                self._publish_detection_wp_goal()
+                return
 
-        elif self._state == AlignState.SCAN:
-            self._do_scan()
+            if self._astar_status == 'GOAL_REACHED':
+                self.get_logger().info(
+                    f'[GOTO_DETECTION_WP] Llegada a waypoint ID {self._p("detection_wp_id")} → SEARCH_TRUCK')
+                self._scan_phase           = 'LEFT'
+                self._scan_phase_start_yaw = self._rth
+                self._scan_attempts        = 0
+                self._transition(_S.SEARCH_TRUCK)
+                return
 
-        elif self._state == AlignState.ALIGN:
-            self._do_align()
+            if self._time_in_state() > self._p('goto_timeout_s'):
+                self.get_logger().warn('[GOTO_DETECTION_WP] Timeout → ABORT')
+                self._transition(_S.ABORT)
 
-        elif self._state == AlignState.NAV_APPROACH:
-            self._do_nav_approach()
+        # ── SEARCH_TRUCK ──────────────────────────────────────────────────
+        elif s == _S.SEARCH_TRUCK:
+            if self._logo_fresh():
+                self._stop()
+                self.get_logger().info(
+                    f'[SEARCH_TRUCK] Logo "{self._target_class}" encontrado '
+                    f'angle={self._logo_angle:+.1f}° → ALIGNING')
+                self._transition(_S.ALIGNING)
+                return
 
-        elif self._state == AlignState.LOGO_LOST_APPROACH:
-            self._do_logo_lost_approach()
+            self._tick_scan()
 
-        elif self._state == AlignState.DONE:
-            self._do_done()
+        # ── ALIGNING ──────────────────────────────────────────────────────
+        elif s == _S.ALIGNING:
+            if not self._logo_fresh():
+                self.get_logger().warn('[ALIGNING] Logo perdido → SEARCH_TRUCK')
+                self._scan_phase           = 'LEFT'
+                self._scan_phase_start_yaw = self._rth
+                self._scan_attempts        = 0
+                self._transition(_S.SEARCH_TRUCK)
+                return
 
-        self._just_entered = False
+            if self._time_in_state() > self._p('align_timeout_s'):
+                self.get_logger().warn('[ALIGNING] Timeout → ABORT')
+                self._transition(_S.ABORT)
+                return
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # FASES
-    # ══════════════════════════════════════════════════════════════════════════
+            goal = self._compute_delivery_goal(self._p('stop_dist_m'))
 
-    def _do_scan(self):
-        """
-        Gira buscando el logo target.
-        Dirección: izquierda primera mitad, derecha segunda.
-        Si detecta → ALIGN. Si timeout → FAILED.
-        """
-        t = self._time_in_state()
+            # Verificar si ya estamos cerca: distancia del robot al goal
+            dist_to_goal = math.hypot(goal.x - self._rx, goal.y - self._ry)
 
-        if t > self._scan_timeout:
-            self.get_logger().warning(
-                f'[SCAN] Timeout {self._scan_timeout}s sin encontrar "{self._target_class}"')
-            self._stop()
-            self._publish_result('TIMEOUT')
-            self._pub_active.publish(Bool(data=False))
-            self._transition(AlignState.IDLE)
-            return
+            if dist_to_goal <= self._p('final_dist_m'):
+                self.get_logger().info(
+                    f'[ALIGNING] En posición dist_to_goal={dist_to_goal:.3f}m '
+                    f'→ APPROACH_FINAL')
+                self._publish_final_goal()
+                self._transition(_S.APPROACH_FINAL)
+                return
 
-        det = self._find_target()
-        if det is not None:
-            self.get_logger().info(
-                f'[SCAN] "{self._target_class}" encontrado (conf={det["conf"]:.2f}) → ALIGN')
-            self._stop()
-            self._ok_ticks = 0
-            self._transition(AlignState.ALIGN)
-            return
+            self._publish_align_goal_if_needed(goal)
 
-        direction = 1.0 if t < self._scan_timeout / 2 else -1.0
-        cmd = Twist()
-        cmd.angular.z = direction * self._scan_speed
-        self._pub_cmd.publish(cmd)
+        # ── APPROACH_FINAL ────────────────────────────────────────────────
+        elif s == _S.APPROACH_FINAL:
+            if self._logo_fresh():
+                goal   = self._compute_delivery_goal(self._p('stop_dist_m'))
+                dist   = math.hypot(goal.x - self._rx, goal.y - self._ry)
 
-    def _do_align(self):
-        """
-        Centra el logo con P-controller angular puro.
-        Cuando confirma alineación → estima distancia y lanza NAV_APPROACH.
-        Si el logo desaparece antes de confirmar → vuelve a SCAN.
-        """
-        t = self._time_in_state()
+                if dist <= self._p('final_dist_m'):
+                    # Calcular distancia de avance antes de detener el GoToGoal
+                    adv = (self._p('stop_dist_m')
+                           - self._p('forklift_len_m')
+                           + self._p('insert_depth_m'))
+                    self.get_logger().info(
+                        f'[APPROACH_FINAL] Alineado dist={dist:.3f}m → '
+                        f'ADVANCING {adv:.3f}m a {self._p("advance_speed")}m/s')
+                    self._stop()
+                    self._advance_dist_m    = adv
+                    self._advance_start_odom = (self._rx, self._ry)
+                    self._transition(_S.ADVANCING)
+                    return
 
-        if t > self._align_timeout:
-            self.get_logger().warning(f'[ALIGN] Timeout {self._align_timeout}s')
-            self._stop()
-            self._publish_result('TIMEOUT')
-            self._pub_active.publish(Bool(data=False))
-            self._transition(AlignState.IDLE)
-            return
+            if self._time_in_state() > self._p('approach_timeout_s'):
+                self.get_logger().warn('[APPROACH_FINAL] Timeout → ABORT')
+                self._transition(_S.ABORT)
 
-        det = self._find_target()
+        # ── ADVANCING ─────────────────────────────────────────────────────
+        elif s == _S.ADVANCING:
+            # Avance en línea recta con el pallet levantado para insertar
+            # las horquillas dentro del camión.
+            # Usamos odometría integrada (distancia euclidiana desde el
+            # punto de inicio) para medir el recorrido, no solo tiempo,
+            # lo que es más robusto a variaciones de velocidad.
+            traveled = math.hypot(
+                self._rx - self._advance_start_odom[0],
+                self._ry - self._advance_start_odom[1],
+            )
 
-        if det is None:
-            self.get_logger().warning(f'[ALIGN] "{self._target_class}" perdido → SCAN')
-            self._ok_ticks = 0
-            self._transition(AlignState.SCAN)
-            return
-
-        bbox_cx = det.get('bbox_cx', self._frame_cx)
-        err_x   = bbox_cx - self._frame_cx
-
-        w = max(-self._max_w, min(self._max_w, -self._kp * err_x))
-        cmd = Twist()
-        cmd.angular.z = w
-        self._pub_cmd.publish(cmd)
-
-        if abs(err_x) < self._err_ok:
-            self._ok_ticks += 1
-            self.get_logger().debug(
-                f'[ALIGN] err_x={err_x}px | ok_ticks={self._ok_ticks}/{self._confirm_ticks}')
-        else:
-            self._ok_ticks = 0
-
-        if self._ok_ticks >= self._confirm_ticks:
-            self.get_logger().info(
-                f'[ALIGN] Alineado ✓ | err_x={err_x}px | conf={det["conf"]:.2f} '
-                f'→ calculando distancia y lanzando NAV_APPROACH')
-            self._stop()
-            # Lanzar approach navigado
-            if self._publish_logo_approach_goal(det):
-                self._transition(AlignState.NAV_APPROACH)
+            if traveled < self._advance_dist_m:
+                cmd = Twist()
+                cmd.linear.x = float(self._p('advance_speed'))
+                self._pub_cmd.publish(cmd)
             else:
-                # No se pudo estimar distancia (bbox demasiado pequeño) → FAILED
-                self.get_logger().error('[ALIGN] No se pudo estimar distancia al logo → FAILED')
-                self._publish_result('FAILED')
-                self._pub_active.publish(Bool(data=False))
-                self._transition(AlignState.IDLE)
+                self._stop()
+                self.get_logger().info(
+                    f'[ADVANCING] {traveled:.3f}m recorridos ✔ → LOWERING')
+                self._transition(_S.LOWERING)
+                return
 
-    def _do_nav_approach(self):
-        """
-        Espera que A* lleve el robot hasta el goal publicado.
-        Si el logo desaparece del frame durante este trayecto, es NORMAL
-        (lo perdemos porque está en el piso / ángulo bajo) → pasamos a
-        LOGO_LOST_APPROACH que solo espera GOAL_REACHED.
-        """
-        if self._time_in_state() > self._nav_timeout:
-            self.get_logger().error(
-                f'[NAV_APPROACH] Timeout {self._nav_timeout}s → FAILED')
-            self._publish_result('TIMEOUT')
-            self._pub_active.publish(Bool(data=False))
-            self._transition(AlignState.IDLE)
-            return
+            if self._time_in_state() > self._p('advance_timeout_s'):
+                self.get_logger().error('[ADVANCING] Timeout → ABORT')
+                self._transition(_S.ABORT)
 
-        det = self._find_target()
+        # ── LOWERING ──────────────────────────────────────────────────────
+        elif s == _S.LOWERING:
+            # Primera entrada: inicializar y enviar comando
+            if self._time_in_state() < 0.05:
+                self._lift_done_label = ''
+                self.get_logger().info('[LOWERING] Enviando "down" al lift')
+                self._pub_lift.publish(String(data='down'))
+                return
 
-        if det is None:
-            # Logo perdido — esperado al acercarse al piso
+            if self._lift_done_label == 'DOWN':
+                self._lift_was_held = False
+                self.get_logger().info('[LOWERING] Pallet bajado ✔ → BACK_AWAY')
+                self._transition(_S.BACK_AWAY)
+                return
+
+            if self._time_in_state() > self._p('lift_timeout_s'):
+                self.get_logger().error('[LOWERING] Timeout → ABORT')
+                self._transition(_S.ABORT)
+
+        # ── BACK_AWAY ─────────────────────────────────────────────────────
+        elif s == _S.BACK_AWAY:
+            elapsed = self._time_in_state()
+            if elapsed < self._p('back_away_time'):
+                cmd = Twist()
+                cmd.linear.x = -abs(self._p('back_away_speed'))
+                self._pub_cmd.publish(cmd)
+            else:
+                self._stop()
+                self.get_logger().info('[BACK_AWAY] Completado → DONE')
+                self._transition(_S.DONE)
+
+        # ── DONE ──────────────────────────────────────────────────────────
+        elif s == _S.DONE:
             self.get_logger().info(
-                '[NAV_APPROACH] Logo fuera de FOV (approach ciego normal) → LOGO_LOST_APPROACH')
-            self._transition(AlignState.LOGO_LOST_APPROACH)
+                f'[TruckAlign] ✔ Entrega completada para "{self._target_class}"')
+            self._set_vfh_bypass(False)
+            self._pub_done.publish(String(data='SUCCESS'))
+            self._reset()
+            self._transition(_S.IDLE)
+
+        # ── ABORT ─────────────────────────────────────────────────────────
+        elif s == _S.ABORT:
+            self._stop()
+            # Si el lift tiene el pallet arriba, intentar bajar antes de abortar
+            if self._lift_was_held:
+                self.get_logger().warn(
+                    '[ABORT] Pallet posiblemente arriba — enviando "down"')
+                self._pub_lift.publish(String(data='down'))
+            self.get_logger().warn('[TruckAlign] ❌ ABORT')
+            self._set_vfh_bypass(False)
+            self._pub_done.publish(String(data='ABORT'))
+            self._reset()
+            self._transition(_S.IDLE)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SEARCH_TRUCK — barrido in-place
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _tick_scan(self):
+        """Barrido izquierda-derecha-centro buscando el logo del camión."""
+        if self._time_in_state() > self._p('search_timeout_s'):
+            self._stop()
+            self._scan_attempts += 1
+            max_att = int(self._p('scan_max_attempts'))
+            self.get_logger().warn(
+                f'[SEARCH_TRUCK] Timeout de barrido '
+                f'(intento {self._scan_attempts}/{max_att})')
+            if self._scan_attempts >= max_att:
+                self.get_logger().error(
+                    '[SEARCH_TRUCK] Sin logo tras todos los intentos → ABORT')
+                self._transition(_S.ABORT)
+            else:
+                # Reiniciar barrido desde posición actual
+                self._scan_phase           = 'LEFT'
+                self._scan_phase_start_yaw = self._rth
+                self._state_entry          = time.monotonic()
             return
 
-        # Logo todavía visible: verificar si se está descentrando mucho
-        # (el robot se movió lateralmente). Si sí, corregir publicando nuevo goal.
-        bbox_cx = det.get('bbox_cx', self._frame_cx)
-        err_x   = bbox_cx - self._frame_cx
-        if abs(err_x) > self._err_ok * 3:
-            self.get_logger().info(
-                f'[NAV_APPROACH] Desvío lateral err_x={err_x}px — recalculando goal')
-            self._publish_logo_approach_goal(det)
+        scan_range = self._p('scan_range_deg')
+        scan_speed = math.radians(self._p('scan_speed_dps'))
+        delta_deg  = math.degrees(
+            self._angle_diff(self._rth, self._scan_phase_start_yaw))
 
-        if self._astar_status == 'GOAL_REACHED':
-            self.get_logger().info('[NAV_APPROACH] GOAL_REACHED → DONE')
-            self._result = 'ALIGNED'
-            self._transition(AlignState.DONE)
+        if self._scan_phase == 'LEFT':
+            if delta_deg < scan_range:
+                self._pub_cmd.publish(self._spin_cmd(+scan_speed))
+            else:
+                self._stop()
+                self._scan_phase           = 'RIGHT'
+                self._scan_phase_start_yaw = self._rth
+                self.get_logger().info(
+                    f'[SEARCH_TRUCK] LEFT ({delta_deg:+.1f}°) → RIGHT')
 
-    def _do_logo_lost_approach(self):
-        """
-        Logo fuera de FOV por proximidad. Solo esperamos GOAL_REACHED de A*.
-        No se intenta recuperar el logo — ya perdemos de vista el logo cuando
-        el robot se acerca al piso, esto es el comportamiento esperado.
-        """
-        if self._time_in_state() > self._nav_timeout:
-            self.get_logger().error(
-                f'[LOGO_LOST_APPROACH] Timeout {self._nav_timeout}s → FAILED')
-            self._publish_result('TIMEOUT')
-            self._pub_active.publish(Bool(data=False))
-            self._transition(AlignState.IDLE)
-            return
+        elif self._scan_phase == 'RIGHT':
+            if delta_deg > -2.0 * scan_range:
+                self._pub_cmd.publish(self._spin_cmd(-scan_speed))
+            else:
+                self._stop()
+                self._scan_phase           = 'CENTER'
+                self._scan_phase_start_yaw = self._rth
+                self.get_logger().info(
+                    f'[SEARCH_TRUCK] RIGHT ({delta_deg:+.1f}°) → CENTER')
 
-        if self._astar_status == 'GOAL_REACHED':
-            self.get_logger().info('[LOGO_LOST_APPROACH] GOAL_REACHED → DONE (approach ciego exitoso)')
-            self._result = 'ALIGNED'
-            self._transition(AlignState.DONE)
-        else:
-            self.get_logger().debug(
-                f'[LOGO_LOST_APPROACH] Esperando A*... status={self._astar_status}')
+        elif self._scan_phase == 'CENTER':
+            if delta_deg < scan_range:
+                self._pub_cmd.publish(self._spin_cmd(+scan_speed))
+            else:
+                self._stop()
+                # Barrido completo sin resultado — se manejará en el próximo tick
+                # vía timeout de search_timeout_s
 
-    def _do_done(self):
-        if self._just_entered:
-            self._publish_result(self._result)
-            self._pub_active.publish(Bool(data=False))
-            self.get_logger().info('[TruckAlign] /align/active → False (VFH bypass OFF)')
-        if self._time_in_state() > 0.1:
-            self._target_class = ''
-            self._result       = ''
-            self._transition(AlignState.IDLE)
+    # ══════════════════════════════════════════════════════════════════════
+    # GOALS
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ESTIMACIÓN DE DISTANCIA Y GOAL A*
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _estimate_logo_distance(self, det: dict) -> Optional[float]:
-        """
-        Estima la distancia al logo usando la fórmula del modelo pin-hole:
-            dist = (logo_w_real * focal_px) / bbox_width_px
-
-        Asume que el logo es aproximadamente frontal (no muy girado lateralmente).
-        Retorna None si el bbox es inválido o demasiado pequeño.
-        """
-        bbox = det.get('bbox')
-        if not bbox or len(bbox) < 4:
-            return None
-
-        x1, _, x2, _ = bbox
-        bbox_w = abs(x2 - x1)
-        if bbox_w < 5:  # píxeles mínimos para una estimación fiable
-            return None
-
-        logo_real_w = self.get_parameter('logo_real_width_m').value
-        focal_px    = self.get_parameter('focal_length_px').value
-        dist = (logo_real_w * focal_px) / bbox_w
-        return dist
-
-    def _publish_logo_approach_goal(self, det: dict) -> bool:
-        """
-        Calcula y publica el goal en /astar/goal para que A* lleve el robot
-        hasta approach_stop_dist delante del logo.
-
-        El robot está mirando al logo: el bearing en mundo es self._robot_th
-        más el error angular normalizado del centro del bbox.
-
-        Retorna True si el goal se publicó, False si no se pudo estimar distancia.
-        """
-        dist = self._estimate_logo_distance(det)
-        if dist is None:
-            return False
-
-        # Ángulo lateral del logo respecto al frente del robot
-        bbox_cx = det.get('bbox_cx', self._frame_cx)
-        err_x   = bbox_cx - self._frame_cx
-        # Conversión px → rad: aprox err_x / focal_px (ángulo pequeño)
-        focal_px   = self.get_parameter('focal_length_px').value
-        angle_rad  = math.atan2(err_x, focal_px)   # + = logo a la derecha
-        bearing    = self._robot_th + angle_rad     # dirección al logo en mundo
-
-        # Posición estimada del logo en mundo
-        logo_wx = self._robot_x + dist * math.cos(bearing)
-        logo_wy = self._robot_y + dist * math.sin(bearing)
-
-        # Goal: detenerse a approach_stop_dist delante del logo
-        stop_dist = self.get_parameter('approach_stop_dist').value
-        goal_x = logo_wx - stop_dist * math.cos(bearing)
-        goal_y = logo_wy - stop_dist * math.sin(bearing)
-
-        goal_msg = Pose2D()
-        goal_msg.x = goal_x
-        goal_msg.y = goal_y
-        self._pub_goal.publish(goal_msg)
-
+    def _publish_detection_wp_goal(self):
+        """Publica el waypoint truck_detection hacia A*."""
+        goal       = Pose2D()
+        goal.x     = self._detection_wp[0]
+        goal.y     = self._detection_wp[1]
+        # El robot debe llegar mirando hacia donde están los camiones.
+        # Se usa 0.0 como theta (heading indiferente); A* lo ajustará.
+        goal.theta = 0.0
+        self._pub_astar.publish(goal)
         self.get_logger().info(
-            f'[TruckAlign] Goal A* publicado: ({goal_x:.3f}, {goal_y:.3f}) | '
-            f'logo estimado: ({logo_wx:.3f}, {logo_wy:.3f}) | '
-            f'dist={dist:.2f}m | bearing={math.degrees(bearing):.1f}°'
-        )
-        return True
+            f'[GOTO_DETECTION_WP] A* goal → '
+            f'({goal.x:.3f}, {goal.y:.3f})')
 
-    # ══════════════════════════════════════════════════════════════════════════
+    def _publish_align_goal_if_needed(self, goal: Pose2D):
+        """Publica goal a A* si se movió suficiente del anterior."""
+        if self._last_goal_x is not None:
+            dx = abs(goal.x - self._last_goal_x)
+            dy = abs(goal.y - self._last_goal_y)
+            if dx < self._p('goal_replan_dist') and dy < self._p('goal_replan_dist'):
+                return
+        self._pub_astar.publish(goal)
+        self._last_goal_x = goal.x
+        self._last_goal_y = goal.y
+        self.get_logger().info(
+            f'[ALIGNING] A* goal → ({goal.x:.3f}, {goal.y:.3f}) '
+            f'θ={math.degrees(goal.theta):.1f}°  '
+            f'[logo_angle={self._logo_angle:+.1f}°]')
+
+    def _publish_final_goal(self):
+        """Publica goal final a GoToGoal directo (bypassa A*)."""
+        goal = self._compute_delivery_goal(self._p('stop_dist_m'))
+        self._pub_wp.publish(goal)
+        self.get_logger().info(
+            f'[APPROACH_FINAL] GoToGoal directo → '
+            f'({goal.x:.3f}, {goal.y:.3f}) '
+            f'θ={math.degrees(goal.theta):.1f}°')
+
+    def _compute_delivery_goal(self, stop_dist: float) -> Pose2D:
+        """
+        Calcula el goal de entrega con offset lateral.
+
+        Geometría:
+          - El logo del camión se estima en el frame mundo a partir del
+            ángulo horizontal reportado por YOLO y la pose del robot.
+          - bearing_to_logo = heading del robot + logo_angle_rad
+            (ángulo positivo = logo a la derecha)
+          - El robot debe quedar a stop_dist del logo en profundidad
+            Y a lateral_offset_m a la DERECHA del logo.
+          - "Derecha" del robot = perpendicular derecha al bearing robot→logo.
+
+        Como YOLO no da distancia métrica al logo, estimamos la posición
+        del logo proyectando a una distancia heurística desde el robot.
+        La distancia heurística se toma como stop_dist + un margen
+        (_LOGO_PROJ_DIST) para tener un vector de dirección estable.
+        Lo que importa es la DIRECCIÓN, no la posición absoluta del logo.
+        """
+        _LOGO_PROJ_DIST = 2.0   # distancia de proyección heurística [m]
+
+        # Bearing mundo al logo
+        bearing = self._rth + math.radians(self._logo_angle)
+
+        # Posición estimada del logo en el frame mundo
+        # (proyección a distancia heurística desde el robot)
+        logo_x = self._rx + _LOGO_PROJ_DIST * math.cos(bearing)
+        logo_y = self._ry + _LOGO_PROJ_DIST * math.sin(bearing)
+
+        # Vector forward (robot→logo)
+        fwd_x = math.cos(bearing)
+        fwd_y = math.sin(bearing)
+
+        # Vector right: perpendicular derecha al forward
+        # right = rotate(forward, -90°) = (sin(bearing), -cos(bearing))
+        right_x =  math.sin(bearing)
+        right_y = -math.cos(bearing)
+
+        # Goal: retroceder stop_dist desde el logo + desplazar lateral a la derecha
+        lateral = float(self._p('lateral_offset_m'))
+        gx = logo_x - stop_dist * fwd_x + lateral * right_x
+        gy = logo_y - stop_dist * fwd_y + lateral * right_y
+
+        goal       = Pose2D()
+        goal.x     = gx
+        goal.y     = gy
+        goal.theta = bearing   # el robot debe mirar hacia el camión al llegar
+        return goal
+
+    # ══════════════════════════════════════════════════════════════════════
     # HELPERS
-    # ══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════
 
-    def _find_target(self) -> Optional[dict]:
-        best = None
-        for d in self._detections:
-            if (d.get('class', '').lower() == self._target_class
-                    and d.get('conf', 0) >= self._min_conf):
-                if best is None or d['conf'] > best['conf']:
-                    best = d
-        return best
-
-    def _publish_result(self, result: str):
-        self.get_logger().info(f'[TruckAlign] → result="{result}"')
-        self._pub_result.publish(String(data=result))
+    def _logo_fresh(self) -> bool:
+        """True si hay detección del logo objetivo reciente."""
+        return (
+            self._logo_seen
+            and self._target_class != ''
+            and (time.monotonic() - self._logo_stamp) < self._p('logo_timeout_s')
+        )
 
     def _stop(self):
         self._pub_cmd.publish(Twist())
 
-    def _transition(self, new_state: AlignState):
+    def _time_in_state(self) -> float:
+        return time.monotonic() - self._state_entry
+
+    def _set_vfh_bypass(self, active: bool):
+        self._pub_active.publish(Bool(data=active))
+        label = 'ON  (evasión inhibida)' if active else 'OFF (evasión normal)'
+        self.get_logger().info(f'[VFH+] /align/active → {label}')
+
+    def _transition(self, new_state: str):
         if new_state == self._state:
             return
-        self.get_logger().info(
-            f'[TruckAlign FSM] {self._state.name} → {new_state.name}')
-        self._state         = new_state
-        self._state_entry_t = time.monotonic()
-        self._just_entered  = True
+        self.get_logger().info(f'[FSM] {self._state} → {new_state}')
+        self._state       = new_state
+        self._state_entry = time.monotonic()
+        self._last_goal_x = None
+        self._last_goal_y = None
 
-    def _time_in_state(self) -> float:
-        return time.monotonic() - self._state_entry_t
+    def _reset(self):
+        self._target_class         = ''
+        self._lift_was_held        = False
+        self._logo_angle           = 0.0
+        self._logo_stamp           = 0.0
+        self._logo_seen            = False
+        self._lift_done_label      = ''
+        self._astar_status         = ''
+        self._last_goal_x          = None
+        self._last_goal_y          = None
+        self._advance_dist_m       = 0.0
+        self._advance_start_odom   = (0.0, 0.0)
+        self._scan_phase           = 'LEFT'
+        self._scan_phase_start_yaw = 0.0
+        self._scan_attempts        = 0
+
+    @staticmethod
+    def _angle_diff(a: float, b: float) -> float:
+        """Diferencia angular con signo en [-π, π]: a − b."""
+        d = a - b
+        while d >  math.pi: d -= 2.0 * math.pi
+        while d < -math.pi: d += 2.0 * math.pi
+        return d
+
+    @staticmethod
+    def _spin_cmd(angular_z: float) -> Twist:
+        cmd = Twist()
+        cmd.angular.z = angular_z
+        return cmd
 
 
 # ══════════════════════════════════════════════════════════════════════════════

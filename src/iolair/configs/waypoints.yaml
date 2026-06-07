@@ -54,3 +54,7 @@ waypoints:
   - id: 14
     x: 0
     y: 0
+
+  - id: 15
+    x: 1.20  # ← reemplazar con coords reales del mapa
+    y: 0.80    # ← reemplazar con coords reales del mapa
