@@ -662,7 +662,7 @@ class QRAlignNode(Node):
             f'θ={goal.theta:.2f}rad'
         )
 
-   def _compute_align_goal(self, stop_dist: float) -> Pose2D:
+    def _compute_align_goal(self, stop_dist: float) -> Pose2D:
         angle_rad = math.radians(self._qr_angle)
 
         CAM_FWD  = float(self._p('cam_fwd_m'))
