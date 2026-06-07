@@ -41,11 +41,34 @@
 //  el bit previo en condiciones de skew adverso.
 //  Solución: mosi_r = mosi_s[2] (misma etapa que sck).
 //
-//  ── Protocolo SPI (sin cambios) ────────────────────────────
-//  TX [0xAC][cmd][0x00]  RX [sm_state_prev][0x00][0x00]
+//  ── Fix F4: just_arrived flag en MISO bit 4 ────────────────
+//  Problema: el nodo Python no tenía forma de distinguir entre
+//  "siempre estuvo en HOLD" y "acaba de llegar a HOLD". Esto
+//  hacía que el polling de confirmación dependiera únicamente
+//  de STABLE_CONFIRM_COUNT lecturas consecutivas, lo cual puede
+//  pasar por alto la transición si el timer expira entre polls.
+//
+//  Solución: registro just_arrived de 1 bit.
+//    - Se setea en el mismo ciclo en que timer_fired transiciona
+//      la SM a un estado estable (AT_N1, AT_N2, HOLD, IDLE post-lower).
+//    - Se incluye en el byte MISO como bit 4:
+//        MISO byte 0 = {2'b00, just_arrived, sm_state[3:0]}
+//    - Se limpia al siguiente cs_fall (ya fue leído por la Jetson).
+//    - Retrocompatible: los 4 bits bajos siguen siendo sm_state.
+//      El nodo Python solo necesita enmascarar el bit 4 para
+//      detectar la llegada; si no lo soporta, simplemente ignora
+//      el nibble alto (el estado sigue siendo correcto).
+//
+//  ── Protocolo SPI (actualizado) ────────────────────────────
+//  TX [0xAC][cmd][0x00]  RX [flags_state][0x00][0x00]
 //  CMD_PING 0xFF = solo leer estado, sin cambiar nada
 //
-//  sm_state en MISO (byte 0 devuelto = estado ANTES del cmd):
+//  MISO byte 0 (estado ANTES del cmd):
+//    bits [3:0] = sm_state  (igual que antes)
+//    bit  [4]   = just_arrived  (1 = acaba de llegar al estado estable)
+//    bits [7:5] = 0
+//
+//  sm_state valores:
 //    0=IDLE  1=MAN_UP  2=MAN_DOWN
 //    3=TO_N1  4=AT_N1  5=TO_N2  6=AT_N2
 //    7=LIFTING  8=HOLD  9=LOWERING
@@ -163,6 +186,11 @@ wire sm_moving = (sm_state == SM_MAN_UP)  || (sm_state == SM_MAN_DOWN) ||
 // Esto elimina la race condition spi_new vs timer_done.
 reg timer_fired = 1'b0;
 
+// Fix F4: just_arrived flag — se setea cuando timer_fired transiciona
+// la SM a un estado estable. Se incluye en MISO bit 4.
+// Se limpia en el siguiente cs_fall (ya fue leído por la Jetson).
+reg just_arrived = 1'b0;
+
 // ============================================================
 // 6.  SM + decodificador SPI
 // ============================================================
@@ -189,6 +217,7 @@ always @(posedge clk) begin
                 sm_state    <= SM_IDLE;
                 dur_cnt     <= 26'd0;
                 timer_fired <= 1'b0;   // abortar timer pendiente
+                just_arrived <= 1'b0;  // Fix F4: cancelar arrived al abortar
             end
 
             8'hAC: begin
@@ -200,6 +229,7 @@ always @(posedge clk) begin
                         servo1_reg  <= BYTE_STOP;
                         dur_cnt     <= 26'd0;
                         timer_fired <= 1'b0;   // abortar timer pendiente
+                        just_arrived <= 1'b0;  // Fix F4
                     end
                     CMD_MAN_UP: begin
                         sm_state    <= SM_MAN_UP;
@@ -257,24 +287,24 @@ always @(posedge clk) begin
     // siempre transiciona incluso si spi_new coincidió con la
     // última cuenta del timer.
     end else if (timer_fired) begin
-        timer_fired <= 1'b0;
-        servo1_reg  <= BYTE_STOP;
-        dur_cnt     <= 26'd0;
+        timer_fired  <= 1'b0;
+        servo1_reg   <= BYTE_STOP;
+        dur_cnt      <= 26'd0;
         case (sm_state)
             SM_MAN_UP,
-            SM_MAN_DOWN: sm_state <= SM_IDLE;
-            SM_TO_N1:    sm_state <= SM_AT_N1;
-            SM_TO_N2:    sm_state <= SM_AT_N2;
-            SM_LIFTING:  sm_state <= SM_HOLD;
-            SM_LOWERING: sm_state <= SM_IDLE;
-            default:     sm_state <= SM_IDLE;
+            SM_MAN_DOWN: begin sm_state <= SM_IDLE;   just_arrived <= 1'b1; end  // Fix F4
+            SM_TO_N1:    begin sm_state <= SM_AT_N1;  just_arrived <= 1'b1; end  // Fix F4
+            SM_TO_N2:    begin sm_state <= SM_AT_N2;  just_arrived <= 1'b1; end  // Fix F4
+            SM_LIFTING:  begin sm_state <= SM_HOLD;   just_arrived <= 1'b1; end  // Fix F4 ← HOLD aquí
+            SM_LOWERING: begin sm_state <= SM_IDLE;   just_arrived <= 1'b1; end  // Fix F4
+            default:     begin sm_state <= SM_IDLE;   just_arrived <= 1'b1; end
         endcase
     end
 
 end
 
 // ============================================================
-// 7.  MISO — devuelve sm_state durante la transacción SPI
+// 7.  MISO — devuelve sm_state + just_arrived durante la transacción SPI
 //
 //  MODE 0: MISO cambia en flanco de bajada de SCK,
 //          Jetson muestrea en flanco de subida.
@@ -284,13 +314,19 @@ end
 //  NOTA: el estado devuelto es el de ANTES de procesar el
 //  comando del frame actual (cs_fall ocurre antes que cs_rise).
 //  Esto es intencional y documentado en el protocolo.
+//
+//  Fix F4: bit 4 = just_arrived. Se captura en cs_fall (mismo
+//  ciclo que sm_state). Se limpia justo después de cargarlo para
+//  que la siguiente transacción no vea el flag stale.
+//  Layout MISO byte: {2'b00, just_arrived, sm_state[3:0]}
 // ============================================================
 reg [7:0] miso_sr;
 
 always @(posedge clk) begin
-    if (cs_fall)
-        miso_sr <= {3'd0, sm_state};      // carga estado actual
-    else if (!cs_r && sck_fall)
+    if (cs_fall) begin
+        miso_sr      <= {2'd0, just_arrived, sm_state};  // Fix F4: bit4=arrived
+        just_arrived <= 1'b0;  // Fix F4: limpiar tras captura — el flag es one-shot
+    end else if (!cs_r && sck_fall)
         miso_sr <= {miso_sr[6:0], 1'b0};  // desplaza MSB first
 end
 
