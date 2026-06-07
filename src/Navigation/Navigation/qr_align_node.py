@@ -662,32 +662,34 @@ class QRAlignNode(Node):
             f'θ={goal.theta:.2f}rad'
         )
 
-    def _compute_align_goal(self, stop_dist: float) -> Pose2D:
+   def _compute_align_goal(self, stop_dist: float) -> Pose2D:
         angle_rad = math.radians(self._qr_angle)
-        bearing   = self._rth + angle_rad
 
-        # Posición de la cámara en coordenadas mundo.
-        # La cámara está desplazada respecto a base_link (origen de /odom):
-        #   cam_offset_x = +0.15 m  (adelante, a lo largo del eje del robot)
-        #   cam_offset_y = +0.07 m  (izquierda en frame robot → +Y en frame mundo rotado)
-        # Se rota el offset al frame mundo según el yaw actual del robot.
         CAM_FWD  = float(self._p('cam_fwd_m'))
         CAM_LEFT = float(self._p('cam_left_m'))
+
+        # Posición de la cámara en mundo
         cam_x = self._rx + CAM_FWD  * math.cos(self._rth) - CAM_LEFT * math.sin(self._rth)
         cam_y = self._ry + CAM_FWD  * math.sin(self._rth) + CAM_LEFT * math.cos(self._rth)
 
-        # Posición estimada del QR en coordenadas mundo (desde la cámara, no desde base_link)
-        qr_x = cam_x + self._qr_dist * math.cos(bearing)
-        qr_y = cam_y + self._qr_dist * math.sin(bearing)
+        # Bearing cámara→QR (en mundo)
+        bearing_cam = self._rth + angle_rad
 
-        # Goal: base_link a stop_dist metros del QR, mirando al QR
-        gx = qr_x - stop_dist * math.cos(bearing)
-        gy = qr_y - stop_dist * math.sin(bearing)
+        # Posición estimada del QR en mundo (medida desde la cámara)
+        qr_x = cam_x + self._qr_dist * math.cos(bearing_cam)
+        qr_y = cam_y + self._qr_dist * math.sin(bearing_cam)
+
+        # Bearing base_link→QR (el robot debe quedar mirando esto, no el bearing de cámara)
+        bearing_robot = math.atan2(qr_y - self._ry, qr_x - self._rx)
+
+        # Goal: base_link a stop_dist metros del QR, a lo largo del eje base_link→QR
+        gx = qr_x - stop_dist * math.cos(bearing_robot)
+        gy = qr_y - stop_dist * math.sin(bearing_robot)
 
         goal = Pose2D()
         goal.x     = gx
         goal.y     = gy
-        goal.theta = bearing
+        goal.theta = bearing_robot   # orientación correcta: base_link mira al QR
         return goal
 
     # ══════════════════════════════════════════════════════════════════════
