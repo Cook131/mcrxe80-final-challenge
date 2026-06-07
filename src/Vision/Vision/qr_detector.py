@@ -4,25 +4,31 @@ QR Detector Node para Puzzlebot - Manchester Robotics
 
 Detecta QR codes en la imagen de la cámara y publica:
   - El contenido del QR decodificado
-  - Distancia al QR en metros (plano XZ)
+  - Distancia al QR en metros (plano XZ, frame cámara)
   - Ángulo horizontal al QR en grados (+ = derecha)
 
 Tópicos:
   Suscribe:  /camera_raw/compressed     (sensor_msgs/CompressedImage)
 
   Publica:
-             /qr/data                   (std_msgs/msg/String)   contenido del QR
-             /qr/distance               (std_msgs/msg/Float32)  metros en plano XZ
-             /qr/angle                  (std_msgs/msg/Float32)  grados, + = derecha
-             /qr/imagen                 (sensor_msgs/msg/Image)  imagen anotada
+             /qr/data                   (std_msgs/String)   contenido del QR
+             /qr/distance               (std_msgs/Float32)  metros plano XZ
+             /qr/angle                  (std_msgs/Float32)  grados, + = derecha
+             /qr/imagen                 (sensor_msgs/Image) imagen anotada
 
 Calibración FISHEYE:
   Busca automáticamente fisheye_params.npz o fisheye_params.json
   en la misma carpeta que este script.
   Usa el modelo fisheye de OpenCV (cv2.fisheye.*) con 4 coeficientes (k1,k2,k3,k4).
+
   Flujo correcto:
-    1. cv2.fisheye.undistortPoints()  → puntos corregidos
-    2. cv2.solvePnP(..., distCoeffs=zeros)  → pose sin distorsión
+    1. cv2.fisheye.undistortPoints()  → puntos corregidos (frame cámara rectificado)
+    2. cv2.solvePnP(..., distCoeffs=zeros) → pose sin distorsión
+    3. tvec está en frame cámara → se publica directo sin compensar offsets
+
+  NOTA: el offset cámara→base_link (cam_fwd_m, cam_left_m) lo aplica
+  qr_align_node en _estimate_qr_world_pos(). NO se aplica aquí para
+  evitar doble compensación.
 """
 
 import json
@@ -45,11 +51,13 @@ from std_msgs.msg import Float32, String
 _KEY_K = ["camera_matrix", "K", "mtx", "cameraMatrix", "intrinsic"]
 _KEY_D = ["dist_coeffs",   "D", "dist", "distCoeffs",  "distortion"]
 
+
 def _find_key(data, aliases):
     for k in aliases:
         if k in data:
             return data[k]
     return None
+
 
 def _load_calibration(path: str):
     ext = os.path.splitext(path)[-1].lower()
@@ -60,10 +68,12 @@ def _load_calibration(path: str):
             data = json.load(f)
     else:
         raise ValueError(f"Formato no soportado: '{ext}'")
+
     K = _find_key(data, _KEY_K)
     D = _find_key(data, _KEY_D)
     if K is None or D is None:
         raise KeyError(f"Claves de calibración no encontradas en '{path}'")
+
     K_arr = np.array(K, dtype=np.float64).reshape(3, 3)
     D_arr = np.array(D, dtype=np.float64).flatten()
     if D_arr.size < 4:
@@ -72,6 +82,7 @@ def _load_calibration(path: str):
             f"se encontraron {D_arr.size} en '{path}'"
         )
     return K_arr, D_arr[:4].reshape(1, 4)
+
 
 def _auto_find_calib(script_dir: str):
     search = [script_dir, os.path.join(script_dir, '..', 'puzzlebot')]
@@ -82,6 +93,7 @@ def _auto_find_calib(script_dir: str):
             if os.path.isfile(p):
                 return p
     return None
+
 
 # ─────────────────────────────────────────────────────────────────────
 class QRDetectorNode(Node):
@@ -96,10 +108,9 @@ class QRDetectorNode(Node):
         self.declare_parameter('publish_image', True)
         self.declare_parameter('calib_file',    '')
         self.declare_parameter('qr_size',       self.QR_SIZE)
-        self.declare_parameter('cam_offset',    [0.07, 0.08, 0.15])
 
-        camera_topic  = self.get_parameter('camera_topic').value
-        self.qr_size  = float(self.get_parameter('qr_size').value)
+        camera_topic = self.get_parameter('camera_topic').value
+        self.qr_size = float(self.get_parameter('qr_size').value)
 
         # ── Calibración ───────────────────────────────────────────────
         self.camera_matrix = None
@@ -108,7 +119,8 @@ class QRDetectorNode(Node):
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.get_logger().info(f"Buscando calibración en: {script_dir}")
-        calib_file = self.get_parameter('calib_file').value or _auto_find_calib(script_dir)
+        calib_file = (self.get_parameter('calib_file').value
+                      or _auto_find_calib(script_dir))
 
         if calib_file:
             try:
@@ -117,14 +129,15 @@ class QRDetectorNode(Node):
                 K = self.camera_matrix
                 self.get_logger().info(
                     f"Calibración FISHEYE OK: '{calib_file}' | qr_size={self.qr_size}m\n"
-                    f"  fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
-                    f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}\n"
+                    f"  fx={K[0,0]:.1f}  fy={K[1,1]:.1f} "
+                    f"cx={K[0,2]:.1f}  cy={K[1,2]:.1f}\n"
                     f"  dist(k1..k4)={self.dist_coeffs.flatten()}"
                 )
             except Exception as e:
                 self.get_logger().warn(f"Calibración fallida: {e} → Pose DESACTIVADA")
         else:
-            self.get_logger().warn("Sin calibración → Pose DESACTIVADA (solo contenido QR)")
+            self.get_logger().warn(
+                "Sin calibración → Pose DESACTIVADA (solo contenido QR)")
 
         # ── Detector QR ───────────────────────────────────────────────
         self.bridge      = CvBridge()
@@ -133,9 +146,9 @@ class QRDetectorNode(Node):
         # ── Suscriptor ────────────────────────────────────────────────
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
         qos_cam = QoSProfile(
-            reliability = QoSReliabilityPolicy.BEST_EFFORT,
-            history     = QoSHistoryPolicy.KEEP_LAST,
-            depth       = 1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
         )
         self.create_subscription(
             CompressedImage, camera_topic, self.image_callback, qos_cam)
@@ -150,11 +163,15 @@ class QRDetectorNode(Node):
 
         self.get_logger().info(
             f"QR Detector listo [MODO FISHEYE] | topic: {camera_topic}\n"
-            f"  Publica: /qr/data | /qr/distance | /qr/angle | /qr/imagen"
+            f"  Publica: /qr/data | /qr/distance | /qr/angle | /qr/imagen\n"
+            f"  Offset cam→base_link manejado por qr_align_node (no aquí)"
         )
 
     # ─────────────────────────────────────────────────────────────────
+    # Fisheye
+    # ─────────────────────────────────────────────────────────────────
     def _undistort_points(self, pts_2d: np.ndarray) -> np.ndarray:
+        """Corrige distorsión fisheye. Devuelve puntos en frame rectificado."""
         pts = pts_2d.reshape(-1, 1, 2).astype(np.float32)
         undist = cv2.fisheye.undistortPoints(
             pts,
@@ -165,18 +182,30 @@ class QRDetectorNode(Node):
         )
         return undist.reshape(-1, 2).astype(np.float32)
 
-    def _angle_distance(self, tvec):
-        offset = self.get_parameter('cam_offset').value
-        tx = float(tvec[0]) - float(offset[0])
-        ty = float(tvec[1]) - float(offset[1])
-        tz = float(tvec[2]) - float(offset[2])
+    def _angle_distance(self, tvec: np.ndarray):
+        """
+        Calcula distancia y ángulo horizontal desde el tvec de solvePnP.
 
-        dist_3d = math.sqrt(tx*tx + ty*ty + tz*tz)
-        dist_xz = math.sqrt(tx*tx + tz*tz)
-        angle_h = math.degrees(math.atan2(tx,  tz))
-        angle_v = math.degrees(math.atan2(-ty, tz))
+        tvec está en frame cámara:
+          tx — desplazamiento lateral  (+ = derecha)
+          ty — desplazamiento vertical (+ = abajo)
+          tz — profundidad             (+ = lejos)
 
-        return dist_3d, dist_xz, angle_h, angle_v
+        NO se aplica el offset cámara→base_link aquí.
+        Ese offset lo maneja qr_align_node con cam_fwd_m / cam_left_m
+        en _estimate_qr_world_pos() para evitar doble compensación.
+
+        Returns:
+          dist_xz  — distancia en plano horizontal (m)
+          angle_h  — ángulo horizontal en grados   (+ = derecha)
+        """
+        tx = float(tvec[0])
+        tz = float(tvec[2])
+
+        dist_xz = math.sqrt(tx * tx + tz * tz)
+        angle_h = math.degrees(math.atan2(tx, tz))   # + = derecha
+
+        return dist_xz, angle_h
 
     # ─────────────────────────────────────────────────────────────────
     # Anotación visual
@@ -193,19 +222,23 @@ class QRDetectorNode(Node):
         info_lines = [f"QR: {qr_data[:30]}"]
         if dist_xz is not None:
             info_lines.append(f"dist  {dist_xz:.3f} m")
-            info_lines.append(f"az  {angle_h:+.1f} deg")
+            info_lines.append(f"az    {angle_h:+.1f} deg")
 
         font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
         line_h = 20
-        box_w  = max(cv2.getTextSize(l, font, scale, thick)[0][0] for l in info_lines) + 10
+        box_w  = max(cv2.getTextSize(l, font, scale, thick)[0][0]
+                     for l in info_lines) + 10
         box_h  = line_h * len(info_lines) + 6
-        cv2.rectangle(out, (cx - 5, cy - box_h), (cx + box_w, cy + 4), (0, 0, 0), -1)
+        cv2.rectangle(out,
+                      (cx - 5, cy - box_h), (cx + box_w, cy + 4),
+                      (0, 0, 0), -1)
         for i, line in enumerate(info_lines):
-            cv2.putText(out, line, (cx, cy - box_h + line_h * (i + 1)),
+            cv2.putText(out, line,
+                        (cx, cy - box_h + line_h * (i + 1)),
                         font, scale, (255, 0, 255), thick, cv2.LINE_AA)
 
     def _draw_crosshair(self, out):
-        h, w = out.shape[:2]
+        h, w  = out.shape[:2]
         cx, cy = w // 2, h // 2
         color  = (0, 255, 255)
         arm, gap = 12, 5
@@ -220,9 +253,10 @@ class QRDetectorNode(Node):
     # ─────────────────────────────────────────────────────────────────
     def image_callback(self, msg: CompressedImage):
         try:
-            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            frame = self.bridge.compressed_imgmsg_to_cv2(
+                msg, desired_encoding='bgr8')
         except Exception as e:
-            self.get_logger().error(f"Error decodificando imagen comprimida: {e}")
+            self.get_logger().error(f"Error decodificando imagen: {e}")
             return
 
         qr_data, qr_points, _ = self.qr_detector.detectAndDecode(frame)
@@ -236,7 +270,7 @@ class QRDetectorNode(Node):
             # Publicar contenido solo si cambió
             if qr_data != self._prev_qr:
                 self.pub_qr.publish(String(data=qr_data))
-                self.get_logger().info(f"  [QR] {qr_data}")
+                self.get_logger().info(f"[QR] Contenido: '{qr_data}'")
                 self._prev_qr = qr_data
 
             # Estimar pose si hay calibración
@@ -249,9 +283,11 @@ class QRDetectorNode(Node):
                     [-half_qr, -half_qr, 0],
                 ], dtype=np.float32)
 
+                # Paso 1: corregir distorsión fisheye
                 qr_pts_undist = self._undistort_points(
-                    qr_points[0].astype(np.float32)
-                )
+                    qr_points[0].astype(np.float32))
+
+                # Paso 2: solvePnP con distCoeffs=zeros (puntos ya rectificados)
                 ok_qr, _, qr_tvec = cv2.solvePnP(
                     qr_obj_pts,
                     qr_pts_undist,
@@ -259,11 +295,17 @@ class QRDetectorNode(Node):
                     np.zeros((1, 4), dtype=np.float64),
                     flags=cv2.SOLVEPNP_IPPE_SQUARE,
                 )
+
                 if ok_qr:
-                    _, dist_xz_qr, angle_h_qr, _ = self._angle_distance(
+                    # Paso 3: distancia y ángulo en frame cámara (sin offset)
+                    dist_xz_qr, angle_h_qr = self._angle_distance(
                         qr_tvec.flatten())
+
                     self.pub_distance.publish(Float32(data=float(dist_xz_qr)))
                     self.pub_angle.publish(Float32(data=float(angle_h_qr)))
+
+                    self.get_logger().debug(
+                        f"[QR] dist={dist_xz_qr:.3f}m  angle={angle_h_qr:+.1f}°")
 
         elif not qr_data:
             self._prev_qr = ""

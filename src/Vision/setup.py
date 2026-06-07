@@ -30,8 +30,7 @@ setup(
             'aruco_detector = Vision.aruco_detector:main',
             'yolo_vision = Vision.yolo_vision:main',
             'qr_zone_checker = Vision.qr_zone_checker:main',
-            'qr_detector.py = Vision.qr_detector:main',
-            'truck_align.py = Vision.truck_align:main',
+            'qr_detector = Vision.qr_detector:main',
         ],
     },
 )

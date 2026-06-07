@@ -1,65 +1,47 @@
 #!/usr/bin/env python3
 """
-qr_align_node.py — Iolair QR Align + Collect  [v6]
+qr_align_node.py — Iolair QR Align + Collect  [v7]
 ====================================================
-Cambios respecto a v5
+Cambios respecto a v6
 ---------------------
 
-  Fix G1 — _compute_align_goal() ahora calcula el bearing y el goal
-            directamente desde el centro del robot (rx, ry), sin involucrar
-            la posición de la cámara en el cálculo del punto de parada.
-            La posición estimada del QR en el mundo sigue computándose
-            desde cam_pos (correcto), pero la dirección de aproximación y
-            el punto de detención se calculan referenciados al centro del
-            robot para que sea ESE centro el que quede alineado frente al
-            QR/pallet.
+  Fix H1 — Control directo en ALIGNING y APPROACH_FINAL.
+            El nodo ya NO usa A* / go_to_goal / VFH+ para moverse.
+            Desde el momento en que se detecta el QR (SEARCH_QR → ALIGNING),
+            qr_align_node toma control total de /cmd_vel con un controlador
+            PD propio. El bypass de VFH+ se activa al arrancar el trigger
+            y se mantiene hasta BACK_AWAY.
 
-  Fix G2 — _stop() explícito antes de transicionar a HOLD desde
-            APPROACH_FINAL. Evita que el robot llegue con velocidad
-            residual al momento de ejecutar el lift.
+  Fix H2 — Se eliminan _pub_astar, _pub_wp y toda la lógica de
+            replanificación A* (_publish_align_goal_if_needed,
+            _publish_approach_final_goal, _last_goal_x/y,
+            goal_replan_dist). Ya no son necesarios.
 
-  Fix G3 — Nuevo parámetro `forklift_reach_m` (default 0.20 m).
-            Representa la distancia desde el centro del robot hasta el
-            punto de inserción de las horquillas del montacargas.
-            El goal de APPROACH_FINAL se calcula como:
-              stop_dist = forklift_reach_m  →  el frente de las horquillas
-              llega exactamente bajo el pallet cuando el centro del robot
-              se detiene a esa distancia del QR.
-            ANTES: approach_final_dist=0.05 ponía el centro a 5 cm del QR,
-            lo que en la práctica significaba que el frente del robot ya
-            había pasado el pallet. AHORA la distancia refleja la geometría
-            real del robot.
+  Fix H3 — Nuevos parámetros de control directo:
+              kp_angle    — ganancia proporcional angular
+              kd_angle    — ganancia derivativa angular
+              kp_dist     — ganancia proporcional de distancia
+              kd_dist     — ganancia derivativa de distancia
+              max_angular — límite de velocidad angular (rad/s)
+              max_linear  — límite de velocidad lineal (m/s)
+            El controlador angular usa PD sobre el error de bearing.
+            El controlador lineal avanza solo si |angle_err| < 2× tol,
+            usando PD sobre (dist - align_stop_dist).
 
-  Fix G4 — _qr_world_pos() y _compute_align_goal() ahora comparten
-            explícitamente la misma estimación de qr_pos para que no haya
-            divergencia numérica entre el cálculo de "qué tan lejos estoy"
-            y "hacia dónde voy". Se extrajo _estimate_qr_world_pos() como
-            método base usado por ambos sitios.
+  Fix H4 — APPROACH_FINAL también usa control directo PD sobre
+            (dist - forklift_reach_m). Antes publicaba a /goal
+            (go_to_goal) lo que seguía dependiendo del pipeline A*.
 
-  (v5 Fixes S1-S3 del lift conservados sin cambios)
+  (Fixes G1-G4 y S1-S3 de v5/v6 conservados sin cambios)
 
-Secuencia completa tras los fixes
-----------------------------------
-  1. SEARCH_QR  → detecta QR
-  2. ALIGNING   → A* lleva el centro del robot a align_stop_dist del QR
-                  (bearing robot→QR)
-  3. APPROACH_FINAL → waypoint directo: horquillas a forklift_reach_m del
-                      pallet; _stop() antes de HOLD
-  4. HOLD       → n1/n2 → AT_N1/AT_N2 → hold → HOLD
-  5. BACK_AWAY  → retroceso lineal
-  6. DELIVERY   → cede control a FSM global
-
-Parámetros nuevos/modificados
--------------------------------
-  forklift_reach_m   (float, default 0.20)
-      Distancia centro-robot → punto de inserción de horquillas.
-      Reemplaza approach_final_dist como distancia de parada final.
-      Ajustar con cinta métrica en el robot real.
-
-  approach_final_dist (float, default 0.20)
-      Se mantiene por compatibilidad de lanzamiento pero ahora su valor
-      efectivo se ignora internamente en favor de forklift_reach_m.
-      Ver nota en _publish_approach_final_goal().
+Secuencia completa
+------------------
+  1. SEARCH_QR      → detecta QR; activa bypass VFH+
+  2. ALIGNING       → PD directo /cmd_vel hasta aligned + close_enough
+  3. APPROACH_FINAL → PD directo /cmd_vel hasta dist ≤ forklift_reach_m
+  4. HOLD           → lift n1/n2 → AT_N1/AT_N2 → hold → HOLD
+  5. BACK_AWAY      → retroceso lineal directo
+  6. DELIVERY       → cede control; desactiva bypass
 
 Topics QR (estandarizados):
   Suscribe: /qr/data      (std_msgs/String)   — contenido del QR
@@ -74,7 +56,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos  import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-from geometry_msgs.msg import Twist, Pose2D
+from geometry_msgs.msg import Twist
 from nav_msgs.msg      import Odometry
 from std_msgs.msg      import Bool, Float32, String
 
@@ -108,30 +90,46 @@ class QRAlignNode(Node):
         super().__init__('qr_align_node')
 
         # ── Parámetros ────────────────────────────────────────────────────
-        self.declare_parameter('align_stop_dist',     0.35)
-        # Fix G3: forklift_reach_m reemplaza approach_final_dist como
-        # distancia real de parada. Medir en el robot físico.
-        self.declare_parameter('forklift_reach_m',    0.20)
-        # approach_final_dist se conserva para no romper launch files;
-        # su valor ya no controla la geometría interna (ver Fix G3).
-        self.declare_parameter('approach_final_dist', 0.20)
-        self.declare_parameter('align_lateral_tol',   0.03)
-        self.declare_parameter('angle_tol_deg',       4.0)
-        self.declare_parameter('goal_replan_dist',    0.06)
-        self.declare_parameter('back_away_speed',     0.10)
-        self.declare_parameter('back_away_time',      1.8)
-        self.declare_parameter('lift_timeout',        8.0)
-        self.declare_parameter('align_timeout',       20.0)
-        self.declare_parameter('approach_timeout',    15.0)
-        self.declare_parameter('search_timeout',      10.0)
-        self.declare_parameter('qr_timeout',          2.5)
-        self.declare_parameter('cam_offset_deg',      0.0)
-        self.declare_parameter('cam_fwd_m',           0.15)
-        self.declare_parameter('cam_left_m',          0.07)
-        self.declare_parameter('fsm_rate_hz',         20.0)
-        self.declare_parameter('scan_range_deg',      30.0)
-        self.declare_parameter('scan_speed_dps',      20.0)
-        self.declare_parameter('scan_max_attempts',   3)
+
+        # Geometría de alineación
+        self.declare_parameter('align_stop_dist',   0.2)   # m — centro robot → QR en ALIGNING
+        self.declare_parameter('forklift_reach_m',  0.20)   # m — stop en APPROACH_FINAL
+        self.declare_parameter('align_lateral_tol', 0.03)   # m — tolerancia lateral
+        self.declare_parameter('angle_tol_deg',     4.0)    # ° — tolerancia angular
+
+        # Control directo PD (Fix H3)
+        self.declare_parameter('kp_angle',    0.018)   # rad/s por grado de error
+        self.declare_parameter('kd_angle',    0.004)   # amortiguación angular
+        self.declare_parameter('kp_dist',     0.40)    # m/s por metro de error
+        self.declare_parameter('kd_dist',     0.08)    # amortiguación lineal
+        self.declare_parameter('max_angular', 0.45)    # rad/s
+        self.declare_parameter('max_linear',  0.18)    # m/s
+
+        # Offset de cámara respecto a base_link
+        self.declare_parameter('cam_fwd_m',     0.15)
+        self.declare_parameter('cam_left_m',    0.07)
+        self.declare_parameter('cam_offset_deg', 0.0)
+
+        # Lift
+        self.declare_parameter('lift_timeout', 8.0)
+
+        # Timeouts
+        self.declare_parameter('align_timeout',    20.0)
+        self.declare_parameter('approach_timeout', 15.0)
+        self.declare_parameter('search_timeout',   10.0)
+        self.declare_parameter('qr_timeout',        2.5)
+
+        # Retroceso post-recolección
+        self.declare_parameter('back_away_speed', 0.10)
+        self.declare_parameter('back_away_time',  1.8)
+
+        # Barrido RECOVER_SCAN
+        self.declare_parameter('scan_range_deg',    30.0)
+        self.declare_parameter('scan_speed_dps',    20.0)
+        self.declare_parameter('scan_max_attempts',  3)
+
+        # General
+        self.declare_parameter('fsm_rate_hz', 20.0)
 
         self._p = lambda n: self.get_parameter(n).value
 
@@ -146,8 +144,8 @@ class QRAlignNode(Node):
         # ── Datos QR ──────────────────────────────────────────────────────
         self._qr_payload     = ''
         self._target_payload = ''
-        self._qr_angle       = 0.0   # grados, relativo a heading del robot
-        self._qr_dist        = 999.0 # metros, desde la cámara al QR
+        self._qr_angle       = 0.0    # grados, relativo al heading del robot
+        self._qr_dist        = 999.0  # metros, desde la cámara al QR
         self._qr_stamp       = 0.0
 
         # ── Pose odométrica ───────────────────────────────────────────────
@@ -155,10 +153,10 @@ class QRAlignNode(Node):
         self._ry  = 0.0
         self._rth = 0.0
 
-        # ── A*/GoToGoal ───────────────────────────────────────────────────
-        self._astar_status = ''
-        self._last_goal_x  = None
-        self._last_goal_y  = None
+        # ── Derivadas para control PD ──────────────────────────────────────
+        self._prev_angle_err = 0.0
+        self._prev_dist_err  = 0.0
+        self._prev_tick_t    = time.monotonic()
 
         # ── RECOVER_SCAN ──────────────────────────────────────────────────
         self._scan_return_state    = _S.SEARCH_QR
@@ -179,30 +177,32 @@ class QRAlignNode(Node):
         )
 
         # ── Suscriptores ──────────────────────────────────────────────────
-        self.create_subscription(String,   '/collect/trigger',   self._cb_trigger,      10)
-        self.create_subscription(String,   '/qr/data',           self._cb_qr,           qos_be)
-        self.create_subscription(Float32,  '/qr/distance',       self._cb_qr_dist,      qos_be)
-        self.create_subscription(Float32,  '/qr/angle',          self._cb_qr_angle,     qos_be)
-        self.create_subscription(String,   '/lift_done',         self._cb_lift_done,    10)
-        self.create_subscription(Odometry, '/odom',              self._cb_odom,         10)
-        self.create_subscription(String,   '/astar/status',      self._cb_astar_status, 10)
+        self.create_subscription(String,   '/collect/trigger', self._cb_trigger,      10)
+        self.create_subscription(String,   '/qr/data',         self._cb_qr,           qos_be)
+        self.create_subscription(Float32,  '/qr/distance',     self._cb_qr_dist,      qos_be)
+        self.create_subscription(Float32,  '/qr/angle',        self._cb_qr_angle,     qos_be)
+        self.create_subscription(String,   '/lift_done',       self._cb_lift_done,    10)
+        self.create_subscription(Odometry, '/odom',            self._cb_odom,         10)
 
         # ── Publicadores ──────────────────────────────────────────────────
-        self._pub_cmd     = self.create_publisher(Twist,  '/cmd_vel',            10)
-        self._pub_lift    = self.create_publisher(String, '/lift_auto',          10)
-        self._pub_done    = self.create_publisher(String, '/collect/done',       10)
-        self._pub_payload = self.create_publisher(String, '/collect/qr_payload', 10)
-        self._pub_astar   = self.create_publisher(Pose2D, '/astar/goal',         10)
-        self._pub_wp      = self.create_publisher(Pose2D, '/goal',               10)
-        self._pub_active  = self.create_publisher(Bool,   '/align/active',       10)
+        self._pub_cmd       = self.create_publisher(Twist,  '/cmd_vel',            10)
+        self._pub_lift      = self.create_publisher(String, '/lift_auto',          10)
+        self._pub_done      = self.create_publisher(String, '/collect/done',       10)
+        self._pub_payload   = self.create_publisher(String, '/collect/qr_payload', 10)
+        self._pub_active    = self.create_publisher(Bool,   '/align/active',       10)
+        self._pub_nav_pause = self.create_publisher(Bool,   '/nav_pause',          10)
 
         # ── Timer FSM ─────────────────────────────────────────────────────
         self.create_timer(1.0 / float(self._p('fsm_rate_hz')), self._tick)
 
         self.get_logger().info(
-            'qr_align_node v6 listo\n'
+            'qr_align_node v7 listo (control directo — sin A*)\n'
             f'  align_stop_dist={self._p("align_stop_dist")}m  '
             f'forklift_reach_m={self._p("forklift_reach_m")}m\n'
+            f'  kp_angle={self._p("kp_angle")}  kd_angle={self._p("kd_angle")}  '
+            f'max_angular={self._p("max_angular")} rad/s\n'
+            f'  kp_dist={self._p("kp_dist")}  kd_dist={self._p("kd_dist")}  '
+            f'max_linear={self._p("max_linear")} m/s\n'
             f'  cam=[fwd={self._p("cam_fwd_m")}m, left={self._p("cam_left_m")}m]\n'
             f'  QR topics: /qr/data | /qr/distance | /qr/angle'
         )
@@ -229,13 +229,16 @@ class QRAlignNode(Node):
                 f'[Collect] Trigger ignorado — estado: {self._state}')
             return
 
-        self._zone       = cmd
+        self._zone        = cmd
         self._lift_cmd, self._lift_expect = _ZONE_LIFT[cmd]
         self._target_payload = ''
+
+        # Fix H1: bypass activo desde el trigger — qr_align es dueño de
+        # /cmd_vel durante toda la operación de recolección.
+        self._set_vfh_bypass(True)
+
         self.get_logger().info(
             f'[Collect] Trigger zona="{cmd}" → lift_cmd={self._lift_cmd}')
-
-        self._set_vfh_bypass(True)
         self._transition(_S.SEARCH_QR)
 
     def _cb_qr(self, msg: String):
@@ -257,15 +260,11 @@ class QRAlignNode(Node):
         self._qr_stamp = time.monotonic()
 
     def _cb_qr_angle(self, msg: Float32):
-        # _qr_angle en grados, relativo al heading del robot.
-        # cam_offset_deg compensa desalineación mecánica de la cámara.
         self._qr_angle = float(msg.data) + float(self._p('cam_offset_deg'))
         self._qr_stamp = time.monotonic()
 
     def _cb_lift_done(self, msg: String):
-        # Fix S1 (v5): solo procesar /lift_done cuando estamos en HOLD.
-        # El servo publica "DOWN" al arrancar y ese mensaje no debe
-        # contaminar _lift_done_label en otros estados.
+        # Solo procesar /lift_done cuando estamos en HOLD (Fix S1 v5)
         if self._state != _S.HOLD:
             return
         label = msg.data.strip()
@@ -281,12 +280,6 @@ class QRAlignNode(Node):
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         )
-
-    def _cb_astar_status(self, msg: String):
-        prev = self._astar_status
-        self._astar_status = msg.data.strip()
-        if self._astar_status != prev:
-            self.get_logger().debug(f'[A*] status: {self._astar_status}')
 
     # ══════════════════════════════════════════════════════════════════════
     # FSM TICK
@@ -304,6 +297,7 @@ class QRAlignNode(Node):
                 self.get_logger().info(
                     f'[SEARCH_QR] QR detectado dist={self._qr_dist:.2f}m '
                     f'angle={self._qr_angle:+.1f}° → ALIGNING')
+                self._reset_pd()
                 self._transition(_S.ALIGNING)
                 return
             if self._time_in_state() > self._p('search_timeout'):
@@ -315,6 +309,7 @@ class QRAlignNode(Node):
             if not self._qr_visible():
                 if (time.monotonic() - self._qr_stamp) > self._p('qr_timeout'):
                     self.get_logger().warn('[ALIGNING] QR perdido → RECOVER_SCAN')
+                    self._stop()
                     self._start_recover_scan(return_to=_S.ALIGNING)
                 return
 
@@ -323,40 +318,31 @@ class QRAlignNode(Node):
                 self._transition(_S.ABORT)
                 return
 
-            # Fix G1/G4: toda la geometría de alineación referenciada al
-            # centro del robot (rx, ry), no al origen de la cámara.
             qr_x, qr_y = self._estimate_qr_world_pos()
 
-            # Bearing del CENTRO DEL ROBOT hacia el QR
-            bearing_robot = math.atan2(qr_y - self._ry, qr_x - self._rx)
-
-            # Error angular: diferencia entre el heading del robot y la
-            # dirección en la que debe mirar para encarar el QR
-            angle_err_robot = math.degrees(
-                self._angle_diff(bearing_robot, self._rth))
-
-            # Distancia euclidiana desde el centro del robot al QR
+            # Bearing del centro del robot hacia el QR (Fix G1)
+            bearing    = math.atan2(qr_y - self._ry, qr_x - self._rx)
+            angle_err  = math.degrees(self._angle_diff(bearing, self._rth))
             dist_robot = math.hypot(qr_x - self._rx, qr_y - self._ry)
+            lateral_err = dist_robot * math.sin(math.radians(angle_err))
 
-            # Error lateral del centro del robot respecto al eje robot→QR
-            lateral_err = dist_robot * math.sin(math.radians(angle_err_robot))
-
-            aligned = (
-                abs(angle_err_robot) < self._p('angle_tol_deg')
-                and abs(lateral_err) < self._p('align_lateral_tol')
-            )
+            aligned     = (abs(angle_err) < self._p('angle_tol_deg')
+                           and abs(lateral_err) < self._p('align_lateral_tol'))
             close_enough = dist_robot <= self._p('align_stop_dist')
 
             if aligned and close_enough:
                 self.get_logger().info(
-                    f'[ALIGNING] ✔ dist_robot={dist_robot:.3f}m  '
+                    f'[ALIGNING] ✔ dist={dist_robot:.3f}m  '
                     f'lateral={lateral_err*100:.1f}cm  '
-                    f'angle={angle_err_robot:+.1f}° → APPROACH_FINAL')
-                self._publish_approach_final_goal()
+                    f'angle={angle_err:+.1f}° → APPROACH_FINAL')
+                self._stop()
+                self._reset_pd()
                 self._transition(_S.APPROACH_FINAL)
                 return
 
-            self._publish_align_goal_if_needed()
+            # Fix H1/H3: control PD directo — sin A*, sin go_to_goal
+            self._pub_cmd.publish(
+                self._pd_cmd(angle_err, dist_robot, self._p('align_stop_dist')))
 
         # ── RECOVER_SCAN ──────────────────────────────────────────────────
         elif s == _S.RECOVER_SCAN:
@@ -366,18 +352,24 @@ class QRAlignNode(Node):
         elif s == _S.APPROACH_FINAL:
             if self._qr_visible():
                 qr_x, qr_y = self._estimate_qr_world_pos()
-                # Fix G1/G4: distancia medida desde el CENTRO del robot
-                dist_robot = math.hypot(qr_x - self._rx, qr_y - self._ry)
+                dist_robot  = math.hypot(qr_x - self._rx, qr_y - self._ry)
 
                 if dist_robot <= self._p('forklift_reach_m'):
                     self.get_logger().info(
                         f'[APPROACH_FINAL] Llegada confirmada '
-                        f'dist_robot={dist_robot:.3f}m '
-                        f'(forklift_reach={self._p("forklift_reach_m")}m) → HOLD')
-                    # Fix G2: detener el robot ANTES de subir el lift
-                    self._stop()
+                        f'dist={dist_robot:.3f}m → HOLD')
+                    self._stop()   # Fix G2
                     self._transition(_S.HOLD)
                     return
+
+                # Fix H4: control PD directo hacia el QR
+                bearing   = math.atan2(qr_y - self._ry, qr_x - self._rx)
+                angle_err = math.degrees(self._angle_diff(bearing, self._rth))
+                self._pub_cmd.publish(
+                    self._pd_cmd(angle_err, dist_robot, self._p('forklift_reach_m')))
+            else:
+                # QR no visible en approach: frenar y esperar
+                self._stop()
 
             if self._time_in_state() > self._p('approach_timeout'):
                 self.get_logger().warn('[APPROACH_FINAL] Timeout → ABORT')
@@ -385,7 +377,6 @@ class QRAlignNode(Node):
 
         # ── HOLD ──────────────────────────────────────────────────────────
         elif s == _S.HOLD:
-
             if self._time_in_state() < 0.05:
                 self._lift_done_label   = ''
                 self._lift_phase        = 'WAIT_LEVEL'
@@ -402,7 +393,6 @@ class QRAlignNode(Node):
                 return
 
             if self._lift_phase == 'WAIT_LEVEL':
-                # Fix S2 (v5): esperar AT_N1/AT_N2 antes de enviar "hold"
                 if self._lift_done_label == self._lift_expect:
                     self.get_logger().info(
                         f'[HOLD] {self._lift_done_label} confirmado → '
@@ -444,7 +434,6 @@ class QRAlignNode(Node):
         # ── ABORT ─────────────────────────────────────────────────────────
         elif s == _S.ABORT:
             self._stop()
-            # Fix S3 (v5): "down" solo si el lift llegó a HOLD
             if self._lift_reached_hold:
                 self.get_logger().info('[ABORT] Lift en HOLD — enviando down')
                 self._pub_lift.publish(String(data='down'))
@@ -478,6 +467,7 @@ class QRAlignNode(Node):
                 f'[RECOVER_SCAN] QR recuperado en fase {self._scan_phase} '
                 f'dist={self._qr_dist:.2f}m angle={self._qr_angle:+.1f}° '
                 f'→ {self._scan_return_state}')
+            self._reset_pd()
             self._transition(self._scan_return_state)
             return
 
@@ -525,71 +515,56 @@ class QRAlignNode(Node):
                     self._scan_phase_start_yaw = self._rth
 
     # ══════════════════════════════════════════════════════════════════════
-    # GOALS
+    # CONTROL PD DIRECTO
     # ══════════════════════════════════════════════════════════════════════
 
-    def _publish_align_goal_if_needed(self):
-        goal = self._compute_align_goal(self._p('align_stop_dist'))
-
-        if self._last_goal_x is not None:
-            dx = abs(goal.x - self._last_goal_x)
-            dy = abs(goal.y - self._last_goal_y)
-            if dx < self._p('goal_replan_dist') and dy < self._p('goal_replan_dist'):
-                return
-
-        self._pub_astar.publish(goal)
-        self._last_goal_x = goal.x
-        self._last_goal_y = goal.y
-
-        self.get_logger().info(
-            f'[ALIGNING] Goal → ({goal.x:.3f}, {goal.y:.3f}) '
-            f'θ={math.degrees(goal.theta):.1f}°  '
-            f'[QR dist_cam={self._qr_dist:.2f}m ang={self._qr_angle:+.1f}°]'
-        )
-
-    def _publish_approach_final_goal(self):
-        # Fix G3: el punto de parada final usa forklift_reach_m para que
-        # las horquillas queden bajo el pallet cuando el CENTRO del robot
-        # se detenga a esa distancia del QR.
-        goal = self._compute_align_goal(self._p('forklift_reach_m'))
-        self._pub_wp.publish(goal)
-        self.get_logger().info(
-            f'[APPROACH_FINAL] Goal directo → ({goal.x:.3f}, {goal.y:.3f}) '
-            f'θ={math.degrees(goal.theta):.1f}°  '
-            f'(forklift_reach={self._p("forklift_reach_m")}m)'
-        )
-
-    def _compute_align_goal(self, stop_dist: float) -> Pose2D:
+    def _pd_cmd(self, angle_err_deg: float, dist: float, target_dist: float) -> Twist:
         """
-        Calcula el goal de alineación.
+        Controlador PD directo sobre error angular y error de distancia.
 
-        Fix G1: la dirección de aproximación (bearing) y la posición del
-        goal se calculan desde el CENTRO DEL ROBOT (rx, ry), no desde
-        cam_pos. Esto garantiza que sea el centro del robot el que quede
-        encarado y a stop_dist del QR/pallet.
+        angle_err_deg — error angular en grados (bearing − heading del robot)
+        dist          — distancia actual centro robot → QR (m)
+        target_dist   — distancia objetivo (m)
 
-        El QR sigue estimándose en coordenadas mundo desde la posición de
-        la cámara (correcto: es donde está el sensor), pero el vector de
-        aproximación y parada toma como origen el centro del robot.
+        El término D usa la diferencia respecto al tick anterior;
+        si el dt es cero o muy pequeño se ignora la derivada.
         """
-        # Posición estimada del QR en coordenadas mundo
-        # (calculada desde cam_pos para máxima precisión de estimación)
-        qr_x, qr_y = self._estimate_qr_world_pos()
+        now = time.monotonic()
+        dt  = now - self._prev_tick_t
+        self._prev_tick_t = now
 
-        # Fix G1: bearing calculado desde el CENTRO DEL ROBOT al QR
-        bearing = math.atan2(qr_y - self._ry, qr_x - self._rx)
+        # ── Angular PD ────────────────────────────────────────────────────
+        d_angle = ((angle_err_deg - self._prev_angle_err) / dt
+                   if dt > 1e-4 else 0.0)
+        self._prev_angle_err = angle_err_deg
 
-        # El robot debe detenerse a stop_dist del QR en esa dirección.
-        # Al retroceder stop_dist desde el QR en la dirección del bearing
-        # obtenemos el punto donde debe estar el CENTRO del robot.
-        gx = qr_x - stop_dist * math.cos(bearing)
-        gy = qr_y - stop_dist * math.sin(bearing)
+        w = (float(self._p('kp_angle')) * angle_err_deg
+             + float(self._p('kd_angle')) * d_angle)
+        w = max(-float(self._p('max_angular')),
+                min( float(self._p('max_angular')), w))
 
-        goal       = Pose2D()
-        goal.x     = gx
-        goal.y     = gy
-        goal.theta = bearing   # el robot debe mirar hacia el QR al llegar
-        return goal
+        # ── Lineal PD — solo si el ángulo ya está razonablemente alineado ─
+        dist_err = dist - target_dist
+        d_dist   = ((dist_err - self._prev_dist_err) / dt
+                    if dt > 1e-4 else 0.0)
+        self._prev_dist_err = dist_err
+
+        v = 0.0
+        if abs(angle_err_deg) < self._p('angle_tol_deg') * 2.0 and dist_err > 0:
+            v = (float(self._p('kp_dist')) * dist_err
+                 + float(self._p('kd_dist')) * d_dist)
+            v = max(0.0, min(float(self._p('max_linear')), v))
+
+        cmd = Twist()
+        cmd.linear.x  = v
+        cmd.angular.z = w
+        return cmd
+
+    def _reset_pd(self):
+        """Reinicia las derivadas del controlador PD."""
+        self._prev_angle_err = 0.0
+        self._prev_dist_err  = 0.0
+        self._prev_tick_t    = time.monotonic()
 
     # ══════════════════════════════════════════════════════════════════════
     # GEOMETRÍA
@@ -597,26 +572,19 @@ class QRAlignNode(Node):
 
     def _estimate_qr_world_pos(self):
         """
-        Fix G4: punto de entrada único para la estimación de la posición
-        del QR en coordenadas mundo.  Tanto _compute_align_goal() como
-        la verificación de llegada en APPROACH_FINAL usan este método
-        para evitar divergencia numérica.
+        Estima la posición del QR en coordenadas mundo proyectando desde
+        la posición de la cámara (Fix G4).
 
-        La estimación proyecta desde el origen de la cámara (cam_pos)
-        en la dirección indicada por _qr_angle (grados) a una distancia
-        _qr_dist (metros) medida por el sensor.
+        Offset cámara respecto a base_link:
+          cam_x = rx + cam_fwd·cos(rth) − cam_left·sin(rth)
+          cam_y = ry + cam_fwd·sin(rth) + cam_left·cos(rth)
 
-        El offset de la cámara respecto al centro del robot:
-          cam_x = rx + cam_fwd * cos(rth) - cam_left * sin(rth)
-          cam_y = ry + cam_fwd * sin(rth) + cam_left * cos(rth)
-
-        La dirección al QR en el frame mundo:
+        Bearing de la cámara al QR:
           bearing_cam = rth + qr_angle_rad   (qr_angle ya incluye cam_offset_deg)
         """
         CAM_FWD  = float(self._p('cam_fwd_m'))
         CAM_LEFT = float(self._p('cam_left_m'))
 
-        # Posición de la cámara en coordenadas mundo
         cam_x = (self._rx
                  + CAM_FWD  * math.cos(self._rth)
                  - CAM_LEFT * math.sin(self._rth))
@@ -624,17 +592,10 @@ class QRAlignNode(Node):
                  + CAM_FWD  * math.sin(self._rth)
                  + CAM_LEFT * math.cos(self._rth))
 
-        # Bearing de la cámara al QR en el frame mundo
-        # _qr_angle está en grados y ya incluye cam_offset_deg
         bearing_cam = self._rth + math.radians(self._qr_angle)
-
         qr_x = cam_x + self._qr_dist * math.cos(bearing_cam)
         qr_y = cam_y + self._qr_dist * math.sin(bearing_cam)
         return qr_x, qr_y
-
-    # Alias para compatibilidad con el resto del nodo
-    def _qr_world_pos(self):
-        return self._estimate_qr_world_pos()
 
     # ══════════════════════════════════════════════════════════════════════
     # HELPERS
@@ -659,8 +620,9 @@ class QRAlignNode(Node):
 
     def _set_vfh_bypass(self, active: bool):
         self._pub_active.publish(Bool(data=active))
-        label = 'ON  (evasión inhibida)' if active else 'OFF (evasión normal)'
-        self.get_logger().info(f'[VFH+] /align/active → {label}')
+        self._pub_nav_pause.publish(Bool(data=active))  # pausa go_to_goal + A*
+        label = 'ON  (nav pausada, evasión inhibida)' if active else 'OFF (nav reanudada)'
+        self.get_logger().info(f'[VFH+] /align/active + /nav_pause → {label}')
 
     def _transition(self, new_state: str):
         if new_state == self._state:
@@ -668,8 +630,6 @@ class QRAlignNode(Node):
         self.get_logger().info(f'[FSM] {self._state} → {new_state}')
         self._state       = new_state
         self._state_entry = time.monotonic()
-        self._last_goal_x = None
-        self._last_goal_y = None
 
     def _reset(self):
         self._zone              = ''
@@ -682,17 +642,16 @@ class QRAlignNode(Node):
         self._target_payload    = ''
         self._qr_angle          = 0.0
         self._qr_dist           = 999.0
-        self._astar_status      = ''
-        self._last_goal_x       = None
-        self._last_goal_y       = None
+        self._qr_stamp          = 0.0
         self._scan_return_state    = _S.SEARCH_QR
         self._scan_phase           = 'LEFT'
         self._scan_phase_start_yaw = 0.0
         self._scan_attempts        = 0
+        self._reset_pd()
 
     @staticmethod
     def _angle_diff(a: float, b: float) -> float:
-        """Diferencia angular con signo en [-π, π]: a − b."""
+        """Diferencia angular con signo en [−π, π]: a − b."""
         d = a - b
         while d >  math.pi: d -= 2.0 * math.pi
         while d < -math.pi: d += 2.0 * math.pi

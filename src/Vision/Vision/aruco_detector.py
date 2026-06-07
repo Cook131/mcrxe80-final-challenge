@@ -14,16 +14,25 @@ Tópicos:
   Suscribe:  /camera_raw/compressed   (sensor_msgs/CompressedImage)
 
   Publica:
-             /aruco/id                (std_msgs/msg/Int32)
-             /aruco/label             (std_msgs/msg/String)
-             /aruco/imagen            (sensor_msgs/msg/Image)
-             /aruco/waypoint          (geometry_msgs/msg/PoseStamped)
-             /aruco/distance          (std_msgs/msg/Float32)  metros en plano XZ
-             /aruco/angle             (std_msgs/msg/Float32)  grados, + = derecha
+             /aruco/id                (std_msgs/Int32)
+             /aruco/label             (std_msgs/String)
+             /aruco/imagen            (sensor_msgs/Image)
+             /aruco/waypoint          (geometry_msgs/PoseStamped)
+             /aruco/distance          (std_msgs/Float32)  metros en plano XZ
+             /aruco/angle             (std_msgs/Float32)  grados, + = derecha
 
 Calibración FISHEYE:
   Busca automáticamente fisheye_params.npz o fisheye_params.json
   en la misma carpeta que este script.
+  Usa el modelo fisheye de OpenCV (cv2.fisheye.*) con 4 coeficientes (k1,k2,k3,k4).
+
+  Flujo correcto:
+    1. cv2.fisheye.undistortPoints()  → puntos corregidos
+    2. cv2.solvePnP(..., distCoeffs=zeros) → pose sin distorsión
+    3. tvec está en frame cámara → se publica directo sin compensar offsets
+
+  NOTA: el offset cámara→base_link lo maneja aruco_localizer_node.
+  NO se aplica aquí para evitar doble compensación.
 """
 
 import json
@@ -145,7 +154,6 @@ class ArucoDetectorNode(Node):
         self.declare_parameter('unknown_id',    -1)
         self.declare_parameter('calib_file',    '')
         self.declare_parameter('marker_size',   self.MARKER_SIZE)
-        self.declare_parameter('cam_offset',    [0.07, 0.08, 0.15])
 
         camera_topic     = self.get_parameter('camera_topic').value
         self.marker_size = float(self.get_parameter('marker_size').value)
@@ -157,7 +165,8 @@ class ArucoDetectorNode(Node):
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.get_logger().info(f"Buscando calibración en: {script_dir}")
-        calib_file = self.get_parameter('calib_file').value or _auto_find_calib(script_dir)
+        calib_file = (self.get_parameter('calib_file').value
+                      or _auto_find_calib(script_dir))
 
         if calib_file:
             try:
@@ -166,8 +175,8 @@ class ArucoDetectorNode(Node):
                 K = self.camera_matrix
                 self.get_logger().info(
                     f"Calibración FISHEYE OK: '{calib_file}' | marker={self.marker_size}m\n"
-                    f"  fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
-                    f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}\n"
+                    f"  fx={K[0,0]:.1f}  fy={K[1,1]:.1f} "
+                    f"cx={K[0,2]:.1f}  cy={K[1,2]:.1f}\n"
                     f"  dist(k1..k4)={self.dist_coeffs.flatten()}"
                 )
             except Exception as e:
@@ -182,9 +191,9 @@ class ArucoDetectorNode(Node):
         # ── Suscriptor ────────────────────────────────────────────────
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
         qos_cam = QoSProfile(
-            reliability = QoSReliabilityPolicy.BEST_EFFORT,
-            history     = QoSHistoryPolicy.KEEP_LAST,
-            depth       = 1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
         )
         self.create_subscription(
             CompressedImage, camera_topic, self.image_callback, qos_cam)
@@ -203,7 +212,8 @@ class ArucoDetectorNode(Node):
             f"ArUco Detector listo [MODO FISHEYE] | topic: {camera_topic}\n"
             f"  4X4_50 IDs 0-4   → External WPs (pub 20-24)\n"
             f"  4X4_50 IDs 5-10  → Internal WPs (pub 10-15)\n"
-            f"  Publica: /aruco/id | /aruco/label | /aruco/distance | /aruco/angle"
+            f"  Publica: /aruco/id | /aruco/label | /aruco/distance | /aruco/angle\n"
+            f"  Offset cam→base_link manejado por aruco_localizer (no aquí)"
         )
 
     # ─────────────────────────────────────────────────────────────────
@@ -212,6 +222,7 @@ class ArucoDetectorNode(Node):
         return cv2.aruco.ArucoDetector(d, cv2.aruco.DetectorParameters())
 
     def _undistort_points(self, pts_2d: np.ndarray) -> np.ndarray:
+        """Corrige distorsión fisheye. Devuelve puntos en frame rectificado."""
         pts = pts_2d.reshape(-1, 1, 2).astype(np.float32)
         undist = cv2.fisheye.undistortPoints(
             pts,
@@ -253,22 +264,34 @@ class ArucoDetectorNode(Node):
             img_pts_undist,
             self.camera_matrix,
             np.zeros((1, 4), dtype=np.float64),
-            flags=cv2.SOLVEPNP_IPPE_SQUARE
+            flags=cv2.SOLVEPNP_IPPE_SQUARE,
         )
         return (rvec.flatten(), tvec.flatten()) if ok else (None, None)
 
     def _angle_distance(self, tvec):
-        offset = self.get_parameter('cam_offset').value
-        tx = float(tvec[0]) - float(offset[0])
-        ty = float(tvec[1]) - float(offset[1])
-        tz = float(tvec[2]) - float(offset[2])
+        """
+        Calcula distancia y ángulo horizontal desde el tvec de solvePnP.
 
-        dist_3d = math.sqrt(tx*tx + ty*ty + tz*tz)
-        dist_xz = math.sqrt(tx*tx + tz*tz)
-        angle_h = math.degrees(math.atan2(tx,  tz))
-        angle_v = math.degrees(math.atan2(-ty, tz))
+        tvec está en frame cámara:
+          tx — desplazamiento lateral  (+ = derecha)
+          ty — desplazamiento vertical (+ = abajo)
+          tz — profundidad             (+ = lejos)
 
-        return dist_3d, dist_xz, angle_h, angle_v
+        NO se aplica el offset cámara→base_link aquí.
+        Ese offset lo maneja aruco_localizer con camera_to_base_x/y/z
+        para evitar doble compensación.
+
+        Returns:
+          dist_xz  — distancia en plano horizontal (m)
+          angle_h  — ángulo horizontal en grados   (+ = derecha)
+        """
+        tx = float(tvec[0])
+        tz = float(tvec[2])
+
+        dist_xz = math.sqrt(tx * tx + tz * tz)
+        angle_h = math.degrees(math.atan2(tx, tz))   # + = derecha
+
+        return dist_xz, angle_h
 
     # ─────────────────────────────────────────────────────────────────
     # Anotación visual
@@ -283,29 +306,32 @@ class ArucoDetectorNode(Node):
             cv2.drawFrameAxes(out, self.camera_matrix,
                               np.zeros((1, 4), dtype=np.float64),
                               rvec, tvec, self.marker_size * 0.5)
-            _, dist_xz, angle_h, angle_v = self._angle_distance(tvec)
+            dist_xz, angle_h = self._angle_distance(tvec)
             h, w = out.shape[:2]
             cv2.line(out, (w // 2, h // 2), (cx, cy), color, 1, cv2.LINE_AA)
             info_lines = [
                 label,
                 f"dist  {dist_xz:.3f} m",
-                f"az  {angle_h:+.1f} deg",
-                f"el  {angle_v:+.1f} deg",
+                f"az    {angle_h:+.1f} deg",
             ]
         else:
             info_lines = [label]
 
         font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1
         line_h = 18
-        box_w  = max(cv2.getTextSize(l, font, scale, thick)[0][0] for l in info_lines) + 10
+        box_w  = max(cv2.getTextSize(l, font, scale, thick)[0][0]
+                     for l in info_lines) + 10
         box_h  = line_h * len(info_lines) + 6
-        cv2.rectangle(out, (cx - 5, cy - box_h), (cx + box_w, cy + 4), (0, 0, 0), -1)
+        cv2.rectangle(out,
+                      (cx - 5, cy - box_h), (cx + box_w, cy + 4),
+                      (0, 0, 0), -1)
         for i, line in enumerate(info_lines):
-            cv2.putText(out, line, (cx, cy - box_h + line_h * (i + 1)),
+            cv2.putText(out, line,
+                        (cx, cy - box_h + line_h * (i + 1)),
                         font, scale, color, thick, cv2.LINE_AA)
 
     def _draw_crosshair(self, out):
-        h, w = out.shape[:2]
+        h, w   = out.shape[:2]
         cx, cy = w // 2, h // 2
         color  = (0, 255, 255)
         arm, gap = 12, 5
@@ -331,9 +357,10 @@ class ArucoDetectorNode(Node):
     # ─────────────────────────────────────────────────────────────────
     def image_callback(self, msg: CompressedImage):
         try:
-            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            frame = self.bridge.compressed_imgmsg_to_cv2(
+                msg, desired_encoding='bgr8')
         except Exception as e:
-            self.get_logger().error(f"Error decodificando imagen comprimida: {e}")
+            self.get_logger().error(f"Error decodificando imagen: {e}")
             return
 
         external_hits, internal_hits = self._detect_aruco(frame)
@@ -346,6 +373,7 @@ class ArucoDetectorNode(Node):
         any_aruco = external_hits or internal_hits
 
         if any_aruco:
+            # Prioridad: internal > external
             if internal_hits:
                 mid    = internal_hits[0][0]
                 pub_id = internal_pub_id(mid)
@@ -358,6 +386,7 @@ class ArucoDetectorNode(Node):
             self.pub_id.publish(Int32(data=pub_id))
             self.pub_label.publish(String(data=label))
 
+            # PoseStamped para todos los marcadores detectados
             for poses, hits in [
                 (poses_ext, external_hits),
                 (poses_int, internal_hits),
@@ -370,6 +399,7 @@ class ArucoDetectorNode(Node):
                         pm.header.frame_id = 'camera_optical_frame'
                         self.pub_waypoint.publish(pm)
 
+            # Log solo cuando cambian los marcadores visibles
             curr_key = (
                 tuple(sorted(h[0] for h in external_hits)),
                 tuple(sorted(h[0] for h in internal_hits)),
@@ -384,7 +414,7 @@ class ArucoDetectorNode(Node):
                     for i, (mid, _) in enumerate(hits):
                         rv, tv = poses[i]
                         if tv is not None:
-                            _, dist_xz, angle_h, _ = self._angle_distance(tv)
+                            dist_xz, angle_h = self._angle_distance(tv)
                             d = f" | dist_xz={dist_xz:.3f}m  az={angle_h:+.1f}°"
                         else:
                             d = ""
@@ -393,6 +423,7 @@ class ArucoDetectorNode(Node):
                         )
                 self._prev_key = curr_key
 
+            # Publicar distancia/ángulo del marcador con mayor prioridad
             priority_tv = None
             if   internal_hits and poses_int[0][1] is not None:
                 priority_tv = poses_int[0][1]
@@ -400,7 +431,7 @@ class ArucoDetectorNode(Node):
                 priority_tv = poses_ext[0][1]
 
             if priority_tv is not None:
-                _, dist_xz, angle_h, _ = self._angle_distance(priority_tv)
+                dist_xz, angle_h = self._angle_distance(priority_tv)
                 self.pub_distance.publish(Float32(data=float(dist_xz)))
                 self.pub_angle.publish(Float32(data=float(angle_h)))
 
@@ -414,8 +445,7 @@ class ArucoDetectorNode(Node):
         # ── Imagen anotada ────────────────────────────────────────────
         if self.get_parameter('publish_image').value:
             annotated = self._annotate(
-                frame, external_hits, internal_hits, poses_ext, poses_int
-            )
+                frame, external_hits, internal_hits, poses_ext, poses_int)
             ann_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
             ann_msg.header = msg.header
             self.pub_image.publish(ann_msg)

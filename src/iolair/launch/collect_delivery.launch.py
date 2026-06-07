@@ -120,10 +120,17 @@ def generate_launch_description():
     # Suscribe /camera_raw/compressed directamente (sin remap).
     # Publica /qr/data, /qr/distance, /qr/angle  → qr_align_node
     # Publica /aruco/distance, /aruco/angle, /aruco/id → aruco_localizer
-    aruco_detector_node = Node(
+    qr_detector_node = Node(
         package='Vision',
         executable='qr_detector',
         name='qr_detector',
+        output='screen',
+    )
+
+    aruco_detector_node = Node(
+        package='Vision',
+        executable='aruco_detector',
+        name='aruco_detector',
         output='screen',
     )
 
@@ -447,6 +454,7 @@ def generate_launch_description():
         lifecycle_manager_node,
 
         # ── Percepción ────────────────────────────────────────────────────
+        qr_detector_node,
         aruco_detector_node,
         yolo_detector_node,
 
