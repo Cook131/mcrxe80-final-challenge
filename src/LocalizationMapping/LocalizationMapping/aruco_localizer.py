@@ -59,12 +59,9 @@ Formato del YAML
     1:
       x: 1.50
       y: 0.00
-      yaw: 0.00   # opcional: orientación del marcador en el mapa [rad]
-                  # si se omite, el yaw del robot no se corrige con ese landmark
     2:
       x: 3.00
       y: 1.50
-      yaw: 1.5708
 """
 
 import math
@@ -139,11 +136,7 @@ def camera_tvec_to_robot_frame(tvec: np.ndarray, robot_yaw: float,
       2. Frame robot → frame global (rotar por robot_yaw)
            dx_global = dx_robot·cos(yaw) - dy_robot·sin(yaw)
            dy_global = dx_robot·sin(yaw) + dy_robot·cos(yaw)
-      3. Restar offset de cámara a base_link (ya rotado a frame global)
-         Nota: se resta porque cam_x/cam_y son la posición de la CÁMARA
-         respecto al base_link. El tvec mide desde la cámara, no desde
-         el base_link, así que hay que restar ese offset para obtener el
-         desplazamiento al marcador medido desde el base_link.
+      3. Añadir offset de cámara a base_link
     """
     dx_robot = float(tvec[2])
     dy_robot = -float(tvec[0])
@@ -154,73 +147,10 @@ def camera_tvec_to_robot_frame(tvec: np.ndarray, robot_yaw: float,
     dx_g = dx_robot * cos_y - dy_robot * sin_y
     dy_g = dx_robot * sin_y + dy_robot * cos_y
 
-    # Offset cámara→base_link en frame global
     off_x = cam_x * cos_y - cam_y * sin_y
     off_y = cam_x * sin_y + cam_y * cos_y
 
     return dx_g - off_x, dy_g - off_y
-
-
-def yaw_from_marker_rotation(R_marker_cam: np.ndarray,
-                              robot_yaw: float,
-                              marker_yaw_map: float) -> float:
-    """
-    Estima el yaw del robot a partir de la rotación del marcador.
-
-    La rotación R_marker_cam (3×3) expresa la orientación del marcador
-    en frame cámara, publicada por aruco_detector como PoseStamped.
-
-    El frame óptico de OpenCV tiene:
-      X = derecha, Y = abajo, Z = frente (lejos del lente)
-
-    El eje Z del marcador apunta hacia la cámara (normal al plano del marcador
-    apuntando hacia fuera). En el frame óptico, ese eje es la 3ª columna de
-    R_marker_cam con signo negado (la cámara ve el frente del marcador).
-
-    Pasos:
-      1. Extraer el eje Z del marcador en frame óptico: nz = -R_marker_cam[:,2]
-         (signo negativo porque solvePnP define el eje Z del objeto apuntando
-         hacia la cámara, pero queremos la normal hacia afuera del marcador)
-      2. Proyectar al plano horizontal: ignorar la componente Y (vertical)
-      3. Convertir de frame óptico a frame global:
-           nz_x_robot =  nz[2]   (Z óptico → adelante robot)
-           nz_y_robot = -nz[0]   (X óptico → izquierda robot, negado)
-         Rotar por robot_yaw para obtener la normal en frame global.
-      4. El marcador tiene una orientación conocida en el mapa (marker_yaw_map).
-         La normal del marcador en el mapa apunta en la dirección marker_yaw_map.
-         La diferencia entre esa dirección esperada y la medida da el error de yaw.
-      5. yaw_robot = robot_yaw + (marker_yaw_map - marker_yaw_measured)
-
-    Returns
-    -------
-    yaw_corr : float
-        Yaw corregido del robot en radianes.
-    """
-    # Normal del marcador en frame óptico (apunta hacia la cámara)
-    # R_marker_cam[:,2] es el eje Z del marcador en frame cámara.
-    # Como el marcador "mira" a la cámara, su normal hacia fuera es -Z_cam.
-    nz_cam = -R_marker_cam[:, 2]   # [nx, ny, nz] en frame óptico
-
-    # Proyectar al plano horizontal del robot:
-    # Frame óptico → frame robot:  X_robot = Z_cam,  Y_robot = -X_cam
-    nz_robot_x =  nz_cam[2]   # componente adelante
-    nz_robot_y = -nz_cam[0]   # componente izquierda
-
-    # Rotar al frame global
-    cos_y = math.cos(robot_yaw)
-    sin_y = math.sin(robot_yaw)
-    nz_global_x = nz_robot_x * cos_y - nz_robot_y * sin_y
-    nz_global_y = nz_robot_x * sin_y + nz_robot_y * cos_y
-
-    # Dirección medida de la normal del marcador en frame global
-    marker_yaw_measured = math.atan2(nz_global_y, nz_global_x)
-
-    # Corrección: el yaw del robot debe rotar marker_yaw_measured
-    # hasta coincidir con marker_yaw_map
-    yaw_error = normalize_angle(marker_yaw_map - marker_yaw_measured)
-    yaw_corr  = normalize_angle(robot_yaw + yaw_error)
-
-    return yaw_corr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,22 +167,16 @@ class Landmark:
                 promedio móvil (se confía 100 % en el mapa).
         False → posición estimada dinámicamente; se refina con cada
                 observación.
-    yaw_map : float | None
-        Orientación del marcador en el mapa [rad].
-        None si no está definida (landmarks dinámicos o YAML sin campo yaw).
-        Cuando está definida, se usa para corregir también el yaw del robot.
     """
 
     def __init__(self, pub_id: int, gx: float, gy: float,
                  robot_x: float, robot_y: float,
-                 fixed: bool = False,
-                 yaw_map: float | None = None):
+                 fixed: bool = False):
         self.pub_id    = pub_id
         self.gx        = gx
         self.gy        = gy
         self.n_obs     = 1
         self.fixed     = fixed
-        self.yaw_map   = yaw_map
         self.last_robot_x = robot_x
         self.last_robot_y = robot_y
 
@@ -312,6 +236,7 @@ class ArucoLocalizerNode(Node):
         self._lock = threading.Lock()
 
         # Landmarks: pub_id → Landmark
+        # Se pre-pobla desde YAML; los IDs no listados se anclan dinámicamente.
         self._landmarks: dict[int, Landmark] = {}
 
         # Última pose del EKF
@@ -321,11 +246,11 @@ class ArucoLocalizerNode(Node):
         self._odom_ready: bool = False
 
         # Última detección pendiente de procesar
-        self._pending_id:   int              = -1
-        self._pending_R:    np.ndarray | None = None   # rotación 3×3 del marcador
-        self._pending_t:    np.ndarray | None = None   # traslación [tx,ty,tz]
-        self._pending_dist: float            = 0.0
-        self._pending_ts:   float            = -1.0
+        self._pending_id:   int            = -1
+        self._pending_R:    np.ndarray | None = None
+        self._pending_t:    np.ndarray | None = None
+        self._pending_dist: float          = 0.0
+        self._pending_ts:   float          = -1.0
 
         # Pose a publicar (None = no hay corrección nueva)
         self._correction: tuple[float, float, float, float] | None = None
@@ -352,16 +277,10 @@ class ArucoLocalizerNode(Node):
         self.create_timer(1.0 / rate, self._process_and_publish)
 
         n_fixed = sum(1 for lm in self._landmarks.values() if lm.fixed)
-        n_with_yaw = sum(
-            1 for lm in self._landmarks.values()
-            if lm.fixed and lm.yaw_map is not None
-        )
         self.get_logger().info(
             f'ArUco Localizer (landmark anchoring) listo\n'
-            f'  Landmarks fijos (YAML): {n_fixed} '
-            f'({n_with_yaw} con yaw definido → corrección completa x,y,θ)\n'
-            f'  IDs no listados usarán anclado dinámico de fallback '
-            f'(solo corrección x,y)\n'
+            f'  Landmarks fijos (YAML): {n_fixed}\n'
+            f'  IDs no listados usarán anclado dinámico de fallback\n'
             f'  Publica → /aruco/pose  (PoseWithCovarianceStamped)'
         )
 
@@ -376,18 +295,17 @@ class ArucoLocalizerNode(Node):
               <id>:
                 x: <float>
                 y: <float>
-                yaw: <float>   # opcional, en radianes
 
-        Los landmarks cargados se marcan como fixed=True.
-        Si se proporciona 'yaw', se usará para corregir también la orientación
-        del robot. Sin 'yaw', solo se corrige la posición (x, y).
+        Los landmarks cargados se marcan como fixed=True, de modo que su
+        posición global nunca se modifica con el promedio móvil.
+        IDs no presentes en el YAML seguirán siendo anclados dinámicamente.
         """
         path = self._landmarks_file
 
         if not path:
             self.get_logger().info(
                 'Parámetro landmarks_file vacío → '
-                'todos los landmarks serán dinámicos (solo corrección x,y).'
+                'todos los landmarks serán dinámicos.'
             )
             return
 
@@ -426,7 +344,7 @@ class ArucoLocalizerNode(Node):
         entries = data['landmarks']
         if not isinstance(entries, dict):
             self.get_logger().error(
-                '"landmarks" debe ser un diccionario id → {x, y[, yaw]}.'
+                '"landmarks" debe ser un diccionario id → {{x, y}}.'
             )
             return
 
@@ -436,13 +354,16 @@ class ArucoLocalizerNode(Node):
                 pub_id = int(raw_id)
                 gx = float(coords['x'])
                 gy = float(coords['y'])
-                yaw_map = float(coords['yaw']) if 'yaw' in coords else None
             except (TypeError, KeyError, ValueError) as e:
                 self.get_logger().warn(
                     f'Entrada inválida para ID={raw_id}: {e} — omitida.'
                 )
                 continue
 
+            # robot_x / robot_y en 0,0 porque aún no hemos recibido odometría;
+            # last_robot_x/y se usará solo para el umbral de re-observación,
+            # así que se inicializan en un valor imposible para forzar la
+            # primera corrección en cuanto el robot detecte el marcador.
             lm = Landmark(
                 pub_id=pub_id,
                 gx=gx,
@@ -450,14 +371,11 @@ class ArucoLocalizerNode(Node):
                 robot_x=float('inf'),
                 robot_y=float('inf'),
                 fixed=True,
-                yaw_map=yaw_map,
             )
             self._landmarks[pub_id] = lm
             loaded += 1
-
-            yaw_str = f"  yaw={math.degrees(yaw_map):.1f}°" if yaw_map is not None else "  (sin yaw)"
             self.get_logger().info(
-                f'  [YAML] ID={pub_id} → ({gx:.3f}, {gy:.3f}){yaw_str} [FIJO]'
+                f'  [YAML] ID={pub_id} → ({gx:.3f}, {gy:.3f}) [FIJO]'
             )
 
         self.get_logger().info(
@@ -482,13 +400,13 @@ class ArucoLocalizerNode(Node):
             self._pending_dist = msg.data
 
     def _cb_waypoint(self, msg: PoseStamped):
-        """Recibe R (rotación 3×3) y t (traslación) del marcador desde aruco_detector."""
+        """Recibe rvec+tvec del marcador desde aruco_detector."""
         R, t = pose_stamped_to_Rt(msg)
         dist = float(np.linalg.norm(t))
         if not (self._d_min <= dist <= self._d_max):
             return
         with self._lock:
-            self._pending_R  = R.copy()     # se usa para corrección de yaw
+            self._pending_R  = R
             self._pending_t  = t.copy()
             self._pending_ts = time.monotonic()
 
@@ -507,13 +425,12 @@ class ArucoLocalizerNode(Node):
 
             pub_id   = self._pending_id
             t_vec    = self._pending_t.copy()
-            R_marker = self._pending_R.copy() if self._pending_R is not None else None
             dist     = float(np.linalg.norm(t_vec))
             rx_ekf   = self._robot_x
             ry_ekf   = self._robot_y
             yaw_ekf  = self._robot_yaw
 
-        # ── Posición global del marcador según pose EKF actual ────────────
+        # Posición global del marcador según la pose EKF actual
         dx_g, dy_g = camera_tvec_to_robot_frame(
             t_vec, yaw_ekf, self._cam_x, self._cam_y
         )
@@ -523,16 +440,14 @@ class ArucoLocalizerNode(Node):
         with self._lock:
             if pub_id not in self._landmarks:
                 # ── PRIMERA VEZ y NO está en YAML: anclar dinámicamente ───
-                # Los landmarks dinámicos no tienen yaw_map, por lo que solo
-                # corregirán posición x,y (no orientación).
                 lm = Landmark(pub_id, marker_gx, marker_gy,
-                              rx_ekf, ry_ekf, fixed=False, yaw_map=None)
+                              rx_ekf, ry_ekf, fixed=False)
                 self._landmarks[pub_id] = lm
                 self.get_logger().info(
                     f'[ANCHOR-DYN] ID={pub_id} anclado dinámicamente en '
                     f'({marker_gx:.3f}, {marker_gy:.3f}) '
                     f'desde robot ({rx_ekf:.3f}, {ry_ekf:.3f}) '
-                    f'd={dist:.3f}m  (solo corrección x,y)'
+                    f'd={dist:.3f}m'
                 )
                 self._correction = None   # primera vez no corregimos
                 return
@@ -545,45 +460,30 @@ class ArucoLocalizerNode(Node):
             if moved < self._d_reobs:
                 return   # robot casi quieto, no spamear
 
-            # ── CALCULAR CORRECCIÓN DE POSICIÓN ───────────────────────────
-            # El marcador está en (lm.gx, lm.gy) en el mapa.
-            # Si eso es verdad, el robot DEBE estar en:
+            # ── CALCULAR CORRECCIÓN ───────────────────────────────────────
+            # El marcador está en (lm.gx, lm.gy). Dado el tvec actual,
+            # el robot DEBERÍA estar en:
             rx_corr = lm.gx - dx_g
             ry_corr = lm.gy - dy_g
 
-            # ── CALCULAR CORRECCIÓN DE YAW ────────────────────────────────
-            # Solo posible si:
-            #   a) tenemos la rotación del marcador (R_marker), y
-            #   b) el landmark tiene yaw_map definido en el YAML.
-            #
-            # Si alguna condición falla, se mantiene el yaw actual del EKF
-            # (no se degrada la corrección de posición).
-            if R_marker is not None and lm.yaw_map is not None:
-                ryaw_corr = yaw_from_marker_rotation(
-                    R_marker, yaw_ekf, lm.yaw_map
-                )
-                yaw_corrected = True
-            else:
-                ryaw_corr = yaw_ekf   # sin corrección de yaw
-                yaw_corrected = False
+            bearing = math.atan2(dy_g, dx_g)
+            lateral_angle = math.atan2(-float(t_vec[0]), float(t_vec[2]))
+            ryaw_corr = normalize_angle(bearing - lateral_angle)
 
-            # ── Actualizar ancla (solo landmarks dinámicos) ───────────────
+            # Actualizar ancla (solo si es dinámica; los fijos ignoran esto)
             lm.update_position(marker_gx, marker_gy, rx_ekf, ry_ekf)
 
-            drift_pos = math.hypot(rx_corr - rx_ekf, ry_corr - ry_ekf)
-            drift_yaw = abs(normalize_angle(ryaw_corr - yaw_ekf))
+            drift = math.hypot(rx_corr - rx_ekf, ry_corr - ry_ekf)
             tag = 'FIXED' if lm.fixed else 'DYN'
-            yaw_tag = f"θ={math.degrees(ryaw_corr):.1f}°" if yaw_corrected \
-                      else "θ=EKF(sin corrección)"
 
             self.get_logger().info(
                 f'[CORRECT-{tag}] ID={pub_id} obs#{lm.n_obs} | '
-                f'drift_xy={drift_pos:.3f}m drift_yaw={math.degrees(drift_yaw):.1f}° | '
+                f'drift={drift:.3f}m | '
                 f'EKF=({rx_ekf:.3f},{ry_ekf:.3f}) → '
-                f'corr=({rx_corr:.3f},{ry_corr:.3f}) {yaw_tag}'
+                f'corr=({rx_corr:.3f},{ry_corr:.3f})'
             )
 
-            self._correction = (rx_corr, ry_corr, ryaw_corr, dist, yaw_corrected)
+            self._correction = (rx_corr, ry_corr, ryaw_corr, dist)
 
         # ── Publicar corrección ───────────────────────────────────────────
         self._publish_correction()
@@ -592,17 +492,13 @@ class ArucoLocalizerNode(Node):
         with self._lock:
             if self._correction is None:
                 return
-            rx, ry, ryaw, dist, yaw_corrected = self._correction
+            rx, ry, ryaw, dist = self._correction
             self._correction = None
 
         # Covarianza adaptativa: más ruido a más distancia
         noise = self._k_dist * dist ** 2
         r_pos = self._r_pos + noise
-
-        # Si el yaw NO fue corregido (sin yaw_map), le asignamos
-        # una varianza muy alta para que el EKF ignore esa componente
-        # y confíe en su propia estimación de orientación.
-        r_yaw = (self._r_yaw + noise) if yaw_corrected else 1e6
+        r_yaw = self._r_yaw + noise
 
         msg = PoseWithCovarianceStamped()
         msg.header.stamp    = self.get_clock().now().to_msg()
@@ -616,10 +512,10 @@ class ArucoLocalizerNode(Node):
         cov = [0.0] * 36
         cov[0]  = r_pos    # σ²_xx
         cov[7]  = r_pos    # σ²_yy
-        cov[14] = 1e-6     # σ²_zz  (z fijo en 0)
-        cov[21] = 1e-6     # σ²_roll
-        cov[28] = 1e-6     # σ²_pitch
-        cov[35] = r_yaw    # σ²_yaw  (grande si no hay corrección de yaw)
+        cov[14] = 1e-6
+        cov[21] = 1e-6
+        cov[28] = 1e-6
+        cov[35] = r_yaw    # σ²_yaw
         msg.pose.covariance = cov
 
         self._pub_pose.publish(msg)
@@ -629,11 +525,8 @@ class ArucoLocalizerNode(Node):
             n_dyn    = len(self._landmarks) - n_fixed
         debug = (
             f'lm_fixed={n_fixed} lm_dyn={n_dyn} | '
-            f'corr=({rx:.3f},{ry:.3f}) θ={math.degrees(ryaw):.1f}° '
-            f'[yaw_ok={yaw_corrected}] | '
-            f'σ_pos={math.sqrt(r_pos):.3f}m '
-            f'σ_yaw={math.sqrt(min(r_yaw, 1e3)):.3f}rad '
-            f'd={dist:.3f}m'
+            f'corr=({rx:.3f},{ry:.3f}) θ={math.degrees(ryaw):.1f}° | '
+            f'σ_pos={math.sqrt(r_pos):.3f}m d={dist:.3f}m'
         )
         self._pub_debug.publish(String(data=debug))
 
