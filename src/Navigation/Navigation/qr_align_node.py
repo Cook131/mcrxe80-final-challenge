@@ -564,10 +564,19 @@ class QRAlignNode(Node):
             else:
                 # Barrido completo sin QR
                 self._stop()
-                self.get_logger().error(
-                    '[RECOVER_SCAN] Barrido ±{:.0f}° completado sin encontrar QR → ABORT'.format(
-                        scan_range))
-                self._transition(_S.ABORT)
+                self._scan_attempts = getattr(self, '_scan_attempts', 0) + 1
+                max_attempts = 3
+                self.get_logger().warn(
+                    '[RECOVER_SCAN] Barrido completo sin QR '
+                    f'(intento {self._scan_attempts}/{max_attempts})')
+                if self._scan_attempts >= max_attempts:
+                    self.get_logger().error('[RECOVER_SCAN] Sin QR tras todos los intentos → ABORT')
+                    self._scan_attempts = 0
+                    self._transition(_S.ABORT)
+                else:
+                    # Reiniciar el barrido desde el heading actual
+                    self._scan_phase           = 'LEFT'
+                    self._scan_phase_start_yaw = self._rth
 
     @staticmethod
     def _angle_diff(a: float, b: float) -> float:
@@ -725,6 +734,7 @@ class QRAlignNode(Node):
         self._scan_return_state    = _S.SEARCH_QR
         self._scan_phase           = 'LEFT'
         self._scan_phase_start_yaw = 0.0
+        self._scan_attempts = 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
