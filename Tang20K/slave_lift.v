@@ -1,18 +1,51 @@
 // ============================================================
 //  spi_slave_lift.v  —  Tang Nano 20K (GW2AR-18C) @ 27 MHz
 //  Dual 360° Servo PWM + State Machine + MISO feedback
+//  v2 — fixes aplicados
 //
-//  MISO: durante cada transacción SPI, el FPGA devuelve su
-//  sm_state actual (1 byte). La Jetson lo lee en xfer2().
-//  Sin SPI activo, MISO = 0.
+//  ── Fix F1 (CRÍTICO): timer_fired flag ──────────────────────
+//  La versión anterior tenía una race condition entre spi_new y
+//  timer_done. Cuando la Jetson enviaba un CMD_PING exactamente
+//  en el ciclo donde dur_cnt==1, el bloque "if (spi_new)" tenía
+//  prioridad sobre "else if (timer_done)", el timer_done era
+//  ignorado, dur_cnt caía a 0 en el decrementador, y el
+//  siguiente ciclo timer_done=(0==1)=FALSE → SM atascada en
+//  TO_N1/TO_N2/LIFTING/LOWERING para siempre.
 //
-//  Comandos 0xAC:
-//    0xFF  CMD_PING  → no cambia estado, solo devuelve sm_state
-//    0x00  STOP      0x20 MAN_UP   0x21 MAN_DOWN
-//    0x10  GO_N1     0x11 GO_N2
-//    0x12  GO_HOLD   0x13 GO_DOWN
+//  Solución: registro timer_fired de 1 bit.
+//    - Se activa (seteado) cuando dur_cnt llega a 1 Y sm_moving=1.
+//    - Se limpia al ser consumido por la SM.
+//    - La SM lo procesa EN EL SIGUIENTE CICLO, después de que el
+//      bloque spi_new ya se resolvió.
+//    - spi_new y timer_fired pueden ser TRUE en el mismo ciclo
+//      sin conflicto: spi_new actualiza la SM en un ciclo,
+//      timer_fired estará pendiente para el ciclo siguiente y
+//      la SM actuará sobre el resultado del spi_new.
+//    - Si spi_new fue un STOP (SM→IDLE, sm_moving→FALSE), el
+//      flag timer_fired pendiente se descarta porque la rama
+//      de la SM guarda la condición (sm_state != IDLE cuando
+//      se procesa el flag).
 //
-//  sm_state en MISO (byte 0 devuelto):
+//  ── Fix F2: bit_cnt robusto (5 bits) ───────────────────────
+//  La versión anterior usaba bit_cnt de 3 bits para contar 24
+//  bits. Funcionaba por coincidencia (24 mod 8 = 0), pero un
+//  pulso extra de SCK por ruido dejaba bit_cnt ≠ 0 al final y
+//  spi_new nunca se activaba → comando ignorado silenciosamente.
+//  Solución: bit_cnt de 5 bits. spi_new se activa solo cuando
+//  bit_cnt==23 (exactamente 24 bits recibidos).
+//
+//  ── Fix F3: mosi_r alineado con sck_rise ───────────────────
+//  La versión anterior usaba mosi_s[1] (2 etapas de sync) y
+//  sck_rise basado en sck_s[2:1] (3 etapas de sync). MOSI
+//  llegaba 1 ciclo antes que SCK al lógico, pudiendo capturar
+//  el bit previo en condiciones de skew adverso.
+//  Solución: mosi_r = mosi_s[2] (misma etapa que sck).
+//
+//  ── Protocolo SPI (sin cambios) ────────────────────────────
+//  TX [0xAC][cmd][0x00]  RX [sm_state_prev][0x00][0x00]
+//  CMD_PING 0xFF = solo leer estado, sin cambiar nada
+//
+//  sm_state en MISO (byte 0 devuelto = estado ANTES del cmd):
 //    0=IDLE  1=MAN_UP  2=MAN_DOWN
 //    3=TO_N1  4=AT_N1  5=TO_N2  6=AT_N2
 //    7=LIFTING  8=HOLD  9=LOWERING
@@ -50,26 +83,33 @@ always @(posedge clk) begin
 end
 
 wire cs_r     = cs_s[2];
-wire mosi_r   = mosi_s[1];
+// Fix F3: mosi_r alineado a la misma etapa de sync que sck_rise
+wire mosi_r   = mosi_s[2];
 wire sck_rise = (sck_s[2:1] == 2'b01);
-wire sck_fall = (sck_s[2:1] == 2'b10);   // nuevo: para MISO
+wire sck_fall = (sck_s[2:1] == 2'b10);
 wire cs_fall  = (cs_s[2:1]  == 2'b10);
 wire cs_rise  = (cs_s[2:1]  == 2'b01);
 
 // ============================================================
 // 3.  Receptor SPI (shift register deslizante)
+//     Fix F2: bit_cnt de 5 bits, spi_new cuando bit_cnt==23
 // ============================================================
 reg [23:0] shift_reg;
-reg [ 2:0] bit_cnt;
+// Fix F2: 5 bits para contar 0..23 sin overflow
+reg [ 4:0] bit_cnt;
 
 always @(posedge clk) begin
-    if (cs_fall)        bit_cnt <= 3'd0;
-    else if (!cs_r && sck_rise) bit_cnt <= bit_cnt + 3'd1;
+    if (cs_fall)
+        bit_cnt <= 5'd0;
+    else if (!cs_r && sck_rise)
+        bit_cnt <= bit_cnt + 5'd1;
+
     if (!cs_r && sck_rise)
         shift_reg <= {shift_reg[22:0], mosi_r};
 end
 
-wire spi_new = cs_rise && (bit_cnt == 3'd0);
+// Fix F2: spi_new solo cuando recibimos exactamente 24 bits
+wire spi_new = cs_rise && (bit_cnt == 5'd24);
 
 // ============================================================
 // 4.  Parámetros SM
@@ -117,24 +157,38 @@ wire sm_moving = (sm_state == SM_MAN_UP)  || (sm_state == SM_MAN_DOWN) ||
                  (sm_state == SM_TO_N1)   || (sm_state == SM_TO_N2)    ||
                  (sm_state == SM_LIFTING) || (sm_state == SM_LOWERING);
 
-wire timer_done = sm_moving && (dur_cnt == 26'd1);
+// Fix F1: timer_fired flag — se activa cuando dur_cnt llega a 1
+// mientras la SM está en movimiento. Se procesa en el ciclo
+// siguiente, después de que cualquier spi_new ya fue atendido.
+// Esto elimina la race condition spi_new vs timer_done.
+reg timer_fired = 1'b0;
 
 // ============================================================
 // 6.  SM + decodificador SPI
 // ============================================================
 always @(posedge clk) begin
 
+    // ── Decrementador del timer ─────────────────────────────
+    // Corre independientemente; solo para cuando dur_cnt llega a 0.
     if (sm_moving && dur_cnt > 26'd0)
         dur_cnt <= dur_cnt - 26'd1;
 
+    // Fix F1: detectar cuando dur_cnt está a punto de llegar a 0.
+    // Registramos el flag cuando dur_cnt==1 (antes del último dec).
+    // El flag se limpia al ser consumido por la SM en la rama siguiente.
+    if (sm_moving && dur_cnt == 26'd1)
+        timer_fired <= 1'b1;
+
+    // ── Prioridad 1: nuevo frame SPI completo ────────────────
     if (spi_new) begin
         case (shift_reg[23:16])
 
             8'hAB: begin
-                servo1_reg <= shift_reg[15:8];
-                servo2_reg <= shift_reg[7:0];
-                sm_state   <= SM_IDLE;
-                dur_cnt    <= 26'd0;
+                servo1_reg  <= shift_reg[15:8];
+                servo2_reg  <= shift_reg[7:0];
+                sm_state    <= SM_IDLE;
+                dur_cnt     <= 26'd0;
+                timer_fired <= 1'b0;   // abortar timer pendiente
             end
 
             8'hAC: begin
@@ -142,19 +196,22 @@ always @(posedge clk) begin
                     CMD_PING: ; // no-op: solo devuelve sm_state en MISO
 
                     CMD_STOP: begin
-                        sm_state   <= SM_IDLE;
-                        servo1_reg <= BYTE_STOP;
-                        dur_cnt    <= 26'd0;
+                        sm_state    <= SM_IDLE;
+                        servo1_reg  <= BYTE_STOP;
+                        dur_cnt     <= 26'd0;
+                        timer_fired <= 1'b0;   // abortar timer pendiente
                     end
                     CMD_MAN_UP: begin
-                        sm_state   <= SM_MAN_UP;
-                        servo1_reg <= BYTE_UP;
-                        dur_cnt    <= DUR_MAN;
+                        sm_state    <= SM_MAN_UP;
+                        servo1_reg  <= BYTE_UP;
+                        dur_cnt     <= DUR_MAN;
+                        timer_fired <= 1'b0;
                     end
                     CMD_MAN_DOWN: begin
-                        sm_state   <= SM_MAN_DOWN;
-                        servo1_reg <= BYTE_DOWN;
-                        dur_cnt    <= DUR_MAN;
+                        sm_state    <= SM_MAN_DOWN;
+                        servo1_reg  <= BYTE_DOWN;
+                        dur_cnt     <= DUR_MAN;
+                        timer_fired <= 1'b0;
                     end
                     CMD_GO_N1: begin
                         if (sm_state == SM_IDLE) begin
@@ -192,11 +249,17 @@ always @(posedge clk) begin
             end
 
         endcase
-    end
 
-    else if (timer_done) begin
-        servo1_reg <= BYTE_STOP;
-        dur_cnt    <= 26'd0;
+    // ── Prioridad 2: timer expirado (flag registrado) ────────
+    // Fix F1: este bloque se ejecuta cuando timer_fired=1 y
+    // NO hubo spi_new en este mismo ciclo. Como timer_fired se
+    // setea un ciclo antes de que dur_cnt llegue a 0, la SM
+    // siempre transiciona incluso si spi_new coincidió con la
+    // última cuenta del timer.
+    end else if (timer_fired) begin
+        timer_fired <= 1'b0;
+        servo1_reg  <= BYTE_STOP;
+        dur_cnt     <= 26'd0;
         case (sm_state)
             SM_MAN_UP,
             SM_MAN_DOWN: sm_state <= SM_IDLE;
@@ -217,6 +280,10 @@ end
 //          Jetson muestrea en flanco de subida.
 //  Cargamos sm_state al inicio del CS (cs_fall).
 //  Desplazamos MSB-first en cada sck_fall.
+//
+//  NOTA: el estado devuelto es el de ANTES de procesar el
+//  comando del frame actual (cs_fall ocurre antes que cs_rise).
+//  Esto es intencional y documentado en el protocolo.
 // ============================================================
 reg [7:0] miso_sr;
 
