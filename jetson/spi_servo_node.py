@@ -19,6 +19,13 @@ El 'done' se detecta cuando sm_state cambia a un estado estable.
   TX [0xAC][cmd][0x00]  RX [sm_state][0x00][0x00]
   CMD_PING 0xFF = solo leer estado, sin cambiar nada
 
+─── Transiciones válidas (/lift_auto) ─────────────────────────
+  IDLE(0)          → n1, n2
+  AT_N1(4)         → hold              ← NO puede bajar directo
+  AT_N2(6)         → hold              ← NO puede bajar directo
+  HOLD(8)          → down
+  cualquier estado → stop (emergencia)
+
 ─── Test sin ROS2 ─────────────────────────────────────────────
   python3 spi_servo_node.py --test stop|n1|n2|hold|down|cycle|manual|status
 """
@@ -72,6 +79,20 @@ DONE_LABEL = {
     6: 'AT_N2',  8: 'HOLD',
 }
 
+# ── Tabla de transiciones válidas ──────────────────────────────────────────────
+# cmd_key → conjunto de estados FPGA desde los que se permite ejecutar
+# None en el set = sin restricción de origen (no aplica aquí, pero por claridad)
+#
+#   n1, n2  → solo desde IDLE (0)
+#   hold    → solo desde AT_N1 (4) o AT_N2 (6)  — DEBE pasar por HOLD antes de bajar
+#   down    → solo desde HOLD (8)
+VALID_FROM = {
+    'n1':   {0},      # IDLE
+    'n2':   {0},      # IDLE
+    'hold': {4, 6},   # AT_N1 o AT_N2
+    'down': {8},      # HOLD
+}
+
 # Cuántos ciclos consecutivos del mismo estado se requieren para
 # considerarlo "firme" y evitar jitter en transiciones
 STABLE_CONFIRM_COUNT = 3      # × poll_period = 150 ms @ 20 Hz
@@ -95,9 +116,9 @@ class SpiServoNode(Node):
         publish_rate = self.get_parameter('publish_rate').value
         poll_rate    = self.get_parameter('poll_rate').value
 
-        self._fpga_state      = 0   # último sm_state leído del FPGA
-        self._stable_count    = 0   # contador de confirmaciones consecutivas
-        self._confirmed_state = 0   # estado ya "firme" (anti-jitter)
+        self._fpga_state      = 0     # último sm_state crudo leído del FPGA
+        self._stable_count    = 0     # contador de confirmaciones consecutivas
+        self._confirmed_state = None  # None hasta que el primer poll confirme el estado
         self._spi             = None
 
         if SPIDEV_AVAILABLE:
@@ -114,10 +135,25 @@ class SpiServoNode(Node):
                 self.get_logger().info(f'SPI {spi_device} {spi_speed//1000}kHz | MISO activo')
             except Exception as e:
                 self.get_logger().error(f'SPI error: {e}')
-        else:
-            self.get_logger().warn('spidev no disponible — DRY-RUN')
 
         self.send_cmd(CMD_STOP, repeats=5)
+
+        # ── Inicialización bloqueante del estado confirmado ─────────────────────
+        # Lee STABLE_CONFIRM_COUNT+1 veces para tener _confirmed_state válido
+        # antes de aceptar cualquier comando. Evita rechazar "hold" si el
+        # FPGA ya está en AT_N1/AT_N2 cuando el nodo arranca.
+        if self._spi is not None:
+            raw = 0
+            for _ in range(STABLE_CONFIRM_COUNT + 1):
+                raw = self._read_state()
+                time.sleep(0.05)
+            self._fpga_state      = raw
+            self._confirmed_state = raw
+            self._stable_count    = STABLE_CONFIRM_COUNT
+            self.get_logger().info(
+                f'Estado FPGA inicial confirmado: '
+                f'{FPGA_STATE.get(raw, "?")}({raw})'
+            )
 
         # ── Subscribers ────────────────────────────────────────────────────────
         self.create_subscription(Int8,   '/lift_trigger', self._cb_trigger, 10)
@@ -138,7 +174,8 @@ class SpiServoNode(Node):
         self.get_logger().info(
             'spi_servo_node activo ✓  (SM + timers en FPGA, done via MISO)\n'
             '  ros2 topic echo /lift_done    ← para coordinar otros nodos\n'
-            '  ros2 topic echo /lift_state   ← estado FPGA en tiempo real'
+            '  ros2 topic echo /lift_state   ← estado FPGA en tiempo real\n'
+            '  Transiciones: IDLE→n1/n2 | AT_N1/AT_N2→hold | HOLD→down'
         )
 
     # ── SPI ────────────────────────────────────────────────────────────────────
@@ -165,7 +202,7 @@ class SpiServoNode(Node):
     def _read_state(self) -> int:
         """Lee el sm_state actual del FPGA sin cambiar nada (CMD_PING)."""
         if self._spi is None:
-            return self._fpga_state
+            return self._fpga_state if self._fpga_state is not None else 0
         resp = self._spi.xfer2([HDR_CMD, CMD_PING, 0x00])
         return resp[0] & 0x0F
 
@@ -240,31 +277,37 @@ class SpiServoNode(Node):
             'hold': CMD_GO_HOLD,
             'down': CMD_GO_DOWN,
         }
-        required_state = {
-            'n1': 0, 'n2': 0,          # necesita IDLE
-            'hold': None,               # AT_N1 o AT_N2
-            'down': 8,                  # necesita HOLD
-        }
 
         key = msg.data.strip().lower()
         if key not in cmd_map:
             self.get_logger().warn(f'lift_auto: "{key}" no reconocido')
             return
 
-        # Validación contra estado FPGA confirmado (anti-jitter)
-        current = self._confirmed_state
-        req = required_state[key]
-
-        if key == 'hold' and current not in (4, 6):  # AT_N1 o AT_N2
+        # Guard: estado aún no confirmado (ventana de arranque del nodo)
+        if self._confirmed_state is None:
             self.get_logger().warn(
-                f'Auto "hold" ignorado — FPGA en {FPGA_STATE.get(current,"?")}({current})'
-                f', necesita AT_N1(4) o AT_N2(6)'
+                f'Auto "{key}" ignorado — FPGA aún no confirmado '
+                f'(esperando {STABLE_CONFIRM_COUNT} polls)'
             )
             return
-        elif req is not None and current != req:
+
+        current = self._confirmed_state
+        allowed = VALID_FROM[key]
+
+        if current not in allowed:
+            # Mensaje de error descriptivo según el caso
+            if key == 'hold':
+                reason = 'necesita AT_N1(4) o AT_N2(6) — debe pasar por HOLD antes de bajar'
+            elif key == 'down':
+                reason = 'necesita HOLD(8) — no se puede bajar directo desde AT_N1/AT_N2'
+            elif key in ('n1', 'n2'):
+                reason = 'necesita IDLE(0)'
+            else:
+                reason = f'estados válidos: {allowed}'
+
             self.get_logger().warn(
-                f'Auto "{key}" ignorado — FPGA en {FPGA_STATE.get(current,"?")}({current})'
-                f', necesita {FPGA_STATE.get(req,"?")}({req})'
+                f'Auto "{key}" ignorado — FPGA en '
+                f'{FPGA_STATE.get(current,"?")}({current}), {reason}'
             )
             return
 
@@ -273,16 +316,17 @@ class SpiServoNode(Node):
     # ── Publicación continua ────────────────────────────────────────────────────
 
     def _publish_state(self):
-        # Publica el estado confirmado (firme), no el crudo
-        state_name = FPGA_STATE.get(self._confirmed_state, 'UNKNOWN')
+        # Usar 0 como fallback mientras _confirmed_state es None (arranque)
+        state = self._confirmed_state if self._confirmed_state is not None else 0
+        state_name = FPGA_STATE.get(state, 'UNKNOWN')
         pos_map = {0: 'DOWN', 4: 'N1', 6: 'N2', 8: 'HOLD'}
-        pos = pos_map.get(self._confirmed_state, 'UNKNOWN')
+        pos = pos_map.get(state, 'UNKNOWN')
 
         s = String(); s.data = state_name
         self._pub_state.publish(s)
         p = String(); p.data = pos
         self._pub_pos.publish(p)
-        m = Int16MultiArray(); m.data = [self._confirmed_state, 0]
+        m = Int16MultiArray(); m.data = [state, 0]
         self._pub_servo.publish(m)
 
     @staticmethod
@@ -453,20 +497,31 @@ if __name__ == '__main__':
             tx(CMD_STOP, 5)
 
         elif test == 'n1':
-            print('GO_N1 → esperando AT_N1 (MISO polling con confirmación)...')
-            tx(CMD_GO_N1)
-            wait_until({4}, timeout=3.0, label='[TO_N1]')
+            s, name = read_state_confirmed()
+            print(f'Estado actual (confirmado): {name}({s})')
+            if s != 0:
+                print('Necesitas estar en IDLE(0) para ir a N1. Abort.')
+            else:
+                print('GO_N1 → esperando AT_N1 (MISO polling con confirmación)...')
+                tx(CMD_GO_N1)
+                wait_until({4}, timeout=3.0, label='[TO_N1]')
 
         elif test == 'n2':
-            print('GO_N2 → esperando AT_N2 (MISO polling con confirmación)...')
-            tx(CMD_GO_N2)
-            wait_until({6}, timeout=4.0, label='[TO_N2]')
+            s, name = read_state_confirmed()
+            print(f'Estado actual (confirmado): {name}({s})')
+            if s != 0:
+                print('Necesitas estar en IDLE(0) para ir a N2. Abort.')
+            else:
+                print('GO_N2 → esperando AT_N2 (MISO polling con confirmación)...')
+                tx(CMD_GO_N2)
+                wait_until({6}, timeout=4.0, label='[TO_N2]')
 
         elif test == 'hold':
             s, name = read_state_confirmed()
             print(f'Estado actual (confirmado): {name}({s})')
             if s not in (4, 6):
-                print('Necesitas estar en AT_N1(4) o AT_N2(6). Abort.')
+                print('Necesitas estar en AT_N1(4) o AT_N2(6). '
+                      'No se puede bajar directo — debe pasar por HOLD. Abort.')
             else:
                 tx(CMD_GO_HOLD)
                 wait_until({8}, timeout=3.0, label='[LIFTING]')
@@ -475,7 +530,8 @@ if __name__ == '__main__':
             s, name = read_state_confirmed()
             print(f'Estado actual (confirmado): {name}({s})')
             if s != 8:
-                print('Necesitas estar en HOLD(8). Abort.')
+                print('Necesitas estar en HOLD(8). '
+                      'Desde AT_N1/AT_N2 primero debes ir a hold. Abort.')
             else:
                 tx(CMD_GO_DOWN)
                 wait_until({0}, timeout=4.0, label='[LOWERING]')
