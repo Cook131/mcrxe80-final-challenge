@@ -1,69 +1,44 @@
 #!/usr/bin/env python3
 """
-qr_align_node.py — Iolair QR Align + Collect  [v4]
+qr_align_node.py — Iolair QR Align + Collect  [v5]
 ====================================================
-Correcciones respecto a v3
---------------------------
-  Bug 1: _tick_recover_scan usaba getattr y hardcodeaba max_attempts=3
-         en vez de leer el parámetro scan_max_attempts.
-  Bug 2: _cb_qr_angle no actualizaba _qr_stamp; la visibilidad del QR
-         podía expirar aunque el ángulo llegara fresco.
-  Bug 3: APPROACH_FINAL esperaba GOAL_REACHED de A*, pero el goal se
-         publicó en /goal (GoToGoal directo, sin A*). A* nunca emite
-         GOAL_REACHED para ese waypoint → timeout garantizado. Solución:
-         criterio de llegada por distancia base_link→QR < approach_final_dist.
-  Bug 4: close_enough usaba self._qr_dist (dist cámara→QR). Con offsets de
-         cámara corregidos, la dist base_link→QR difiere en 7-15 cm a rangos
-         cortos. Ahora se usa dist_bl calculada desde base_link.
-  Bug 5: lateral_err mezclaba self._qr_dist (hipotenusa cámara) con
-         angle_err_robot (ángulo desde base_link). Ahora usa dist_bl.
-  Mejora: _qr_visible() verificaba solo que hubiera algún payload; ahora
-         comprueba que el payload coincida con _target_payload para no
-         seguir QRs ajenos al pallet objetivo.
+Correcciones respecto a v4 — compatibilidad spi_servo_node v2
+--------------------------------------------------------------
+  Fix S1 — _cb_lift_done filtra mensajes fuera del estado HOLD.
+            El servo publica /lift_done:"DOWN" al arrancar (FPGA en IDLE=0);
+            ese mensaje no debe contaminar _lift_done_label cuando el nodo
+            está en ALIGNING, APPROACH_FINAL, etc.
+
+  Fix S2 — Estado HOLD dividido en dos fases explícitas:
+            Fase A: envía n1/n2 → espera AT_N1/AT_N2
+            Fase B: envía hold  → espera HOLD confirmado → BACK_AWAY
+            El servo v2 requiere que el FPGA esté en AT_N1(4) o AT_N2(6)
+            para aceptar "hold" (VALID_FROM['hold'] = {4,6}).  Publicar
+            "hold" y salir en el mismo tick garantizaba rechazo silencioso.
+
+  Fix S3 — ABORT envía "down" solo si el lift llegó a HOLD.
+            El servo requiere HOLD(8) para aceptar "down"
+            (VALID_FROM['down'] = {8}). Enviarlo desde AT_N1/AT_N2 era
+            ignorado silenciosamente y dejaba el lift arriba.
+            Ahora se rastrea _lift_reached_hold para saber si es seguro
+            enviar "down" en caso de abort.
+
+Secuencia de lift tras los fixes
+---------------------------------
+  qr_align publica "n1"
+    → FPGA: IDLE(0) → TO_N1(3) → AT_N1(4)
+    → servo publica /lift_done:"AT_N1"
+  qr_align recibe AT_N1 → publica "hold"
+    → FPGA: AT_N1(4) → LIFTING(7) → HOLD(8)
+    → servo publica /lift_done:"HOLD"
+  qr_align recibe HOLD → publica /collect/done SUCCESS → BACK_AWAY
 
 Máquina de estados
 ------------------
   IDLE → SEARCH_QR → ALIGNING → APPROACH_FINAL → HOLD → BACK_AWAY → DELIVERY
-                ↘ RECOVER_SCAN ↗  (safeguard pérdida QR en SEARCH_QR / ALIGNING)
+                ↘ RECOVER_SCAN ↗
 
-Topics
-------
-  SUB:  /collect/trigger     (std_msgs/String)   "rack" | "conveyor" | "abort"
-  PUB:  /collect/done        (std_msgs/String)   "SUCCESS" | "ABORT"
-  SUB:  /aruco/qr            (std_msgs/String)
-  SUB:  /aruco/qr/distance   (std_msgs/Float32)  metros en plano XZ (cámara)
-  SUB:  /aruco/qr/angle      (std_msgs/Float32)  grados, + = derecha (cámara)
-  SUB:  /odom                (nav_msgs/Odometry)
-  SUB:  /astar/status        (std_msgs/String)
-  PUB:  /astar/goal          (geometry_msgs/Pose2D)
-  PUB:  /goal                (geometry_msgs/Pose2D)  GoToGoal directo (tramo final)
-  PUB:  /cmd_vel             (geometry_msgs/Twist)   SOLO BACK_AWAY y RECOVER_SCAN
-  PUB:  /lift_auto           (std_msgs/String)
-  SUB:  /lift_done           (std_msgs/String)
-  PUB:  /align/active        (std_msgs/Bool)
-  PUB:  /collect/qr_payload  (std_msgs/String)
-
-Parámetros ROS2
----------------
-  align_stop_dist       float  0.35   Distancia base_link→QR para considerar alineado [m]
-  approach_final_dist   float  0.05   Distancia base_link→QR para considerar llegada [m]
-  align_lateral_tol     float  0.03   Tolerancia lateral [m]
-  angle_tol_deg         float  4.0    Tolerancia angular desde base_link [°]
-  goal_replan_dist      float  0.06   Umbral de cambio en mundo para re-publicar goal [m]
-  back_away_speed       float  0.10   Velocidad retroceso [m/s]
-  back_away_time        float  1.8    Duración retroceso [s]
-  lift_timeout          float  8.0    Timeout /lift_done [s]
-  align_timeout         float  20.0   Timeout ALIGNING [s]
-  approach_timeout      float  15.0   Timeout APPROACH_FINAL [s]
-  search_timeout        float  10.0   Timeout SEARCH_QR [s]
-  qr_timeout            float  2.5    Segundos sin QR para considerar pérdida [s]
-  cam_offset_deg        float  0.0    Offset angular residual (normalmente 0) [°]
-  cam_fwd_m             float  0.15   Offset cámara adelante de base_link [m]
-  cam_left_m            float  0.07   Offset cámara a la izquierda de base_link [m]
-  fsm_rate_hz           float  20.0   Frecuencia del tick [Hz]
-  scan_range_deg        float  30.0   Semi-amplitud barrido recuperación [°]
-  scan_speed_dps        float  20.0   Velocidad barrido [°/s]
-  scan_max_attempts     int    3      Intentos de barrido antes de ABORT
+Topics / Parámetros: sin cambios respecto a v4.
 """
 
 import math
@@ -138,10 +113,10 @@ class QRAlignNode(Node):
         self._lift_expect = ''
 
         # ── Datos QR ──────────────────────────────────────────────────────
-        self._qr_payload     = ''       # último payload recibido
-        self._target_payload = ''       # payload del pallet objetivo (del trigger)
-        self._qr_angle       = 0.0     # grados, + = derecha, frame cámara
-        self._qr_dist        = 999.0   # metros, dist cámara→QR en plano XZ
+        self._qr_payload     = ''
+        self._target_payload = ''
+        self._qr_angle       = 0.0
+        self._qr_dist        = 999.0
         self._qr_stamp       = 0.0
 
         # ── Pose odométrica ───────────────────────────────────────────────
@@ -161,7 +136,11 @@ class QRAlignNode(Node):
         self._scan_attempts        = 0
 
         # ── Lift ──────────────────────────────────────────────────────────
-        self._lift_done_label = ''
+        self._lift_done_label  = ''
+        # Fix S2: fase del estado HOLD ('WAIT_LEVEL' o 'WAIT_HOLD')
+        self._lift_phase       = 'WAIT_LEVEL'
+        # Fix S3: saber si el FPGA llegó a HOLD para poder enviar "down" en abort
+        self._lift_reached_hold = False
 
         # ── QOS ───────────────────────────────────────────────────────────
         qos_be = QoSProfile(
@@ -192,7 +171,7 @@ class QRAlignNode(Node):
         self.create_timer(1.0 / float(self._p('fsm_rate_hz')), self._tick)
 
         self.get_logger().info(
-            'qr_align_node v4 listo\n'
+            'qr_align_node v5 listo\n'
             f'  align_stop_dist={self._p("align_stop_dist")}m  '
             f'approach_final_dist={self._p("approach_final_dist")}m  '
             f'cam=[fwd={self._p("cam_fwd_m")}m, left={self._p("cam_left_m")}m]'
@@ -222,8 +201,6 @@ class QRAlignNode(Node):
 
         self._zone       = cmd
         self._lift_cmd, self._lift_expect = _ZONE_LIFT[cmd]
-        # El payload objetivo se aprende del primer QR que se vea; se fija en
-        # _cb_qr la primera vez. Se limpia en _reset para el siguiente ciclo.
         self._target_payload = ''
         self.get_logger().info(
             f'[Collect] Trigger zona="{cmd}" → lift_cmd={self._lift_cmd}')
@@ -235,7 +212,6 @@ class QRAlignNode(Node):
         payload = msg.data.strip()
         if not payload:
             return
-        # Fijar el payload objetivo con el primer QR visible tras el trigger
         if self._target_payload == '' and self._state not in (_S.IDLE, _S.ABORT):
             self._target_payload = payload
             self.get_logger().info(f'[QR] Payload objetivo fijado: "{payload}"')
@@ -251,13 +227,16 @@ class QRAlignNode(Node):
         self._qr_stamp = time.monotonic()
 
     def _cb_qr_angle(self, msg: Float32):
-        # Fix Bug 2: actualizar _qr_stamp aquí también.
-        # El offset lateral ya se corrige en aruco_detector._angle_distance;
-        # cam_offset_deg queda en 0.0, preservado solo por compatibilidad.
         self._qr_angle = float(msg.data) + float(self._p('cam_offset_deg'))
         self._qr_stamp = time.monotonic()
 
     def _cb_lift_done(self, msg: String):
+        # Fix S1: solo procesar /lift_done cuando estamos en HOLD.
+        # El servo publica "DOWN" al arrancar (FPGA IDLE=0) y en cualquier
+        # momento que el FPGA llegue a un estado estable. Ignorar fuera de HOLD
+        # evita que esos mensajes corrompan _lift_done_label.
+        if self._state != _S.HOLD:
+            return
         label = msg.data.strip()
         if label:
             self.get_logger().info(f'[Lift] /lift_done: {label}')
@@ -313,21 +292,14 @@ class QRAlignNode(Node):
                 self._transition(_S.ABORT)
                 return
 
-            # Geometría desde base_link (corregida de offsets de cámara)
-            qr_x, qr_y = self._qr_world_pos()
-            bearing_robot = math.atan2(qr_y - self._ry, qr_x - self._rx)
-            angle_err_robot = math.degrees(
-                self._angle_diff(bearing_robot, self._rth))
+            qr_x, qr_y     = self._qr_world_pos()
+            bearing_robot   = math.atan2(qr_y - self._ry, qr_x - self._rx)
+            angle_err_robot = math.degrees(self._angle_diff(bearing_robot, self._rth))
+            dist_bl         = math.hypot(qr_x - self._rx, qr_y - self._ry)
+            lateral_err     = dist_bl * math.sin(math.radians(angle_err_robot))
 
-            # Fix Bug 4+5: usar dist base_link→QR, no dist cámara→QR
-            dist_bl = math.hypot(qr_x - self._rx, qr_y - self._ry)
-            lateral_err = dist_bl * math.sin(math.radians(angle_err_robot))
-
-            aligned = (
-                abs(angle_err_robot) < self._p('angle_tol_deg')
-                and abs(lateral_err)  < self._p('align_lateral_tol')
-            )
-            # Fix Bug 4: close_enough usa dist_bl
+            aligned     = (abs(angle_err_robot) < self._p('angle_tol_deg')
+                           and abs(lateral_err)  < self._p('align_lateral_tol'))
             close_enough = dist_bl <= self._p('align_stop_dist')
 
             if aligned and close_enough:
@@ -347,15 +319,13 @@ class QRAlignNode(Node):
 
         # ── APPROACH_FINAL ────────────────────────────────────────────────
         elif s == _S.APPROACH_FINAL:
-            # Fix Bug 3: GoToGoal directo no genera GOAL_REACHED en /astar/status.
-            # Criterio de llegada: dist base_link→QR < approach_final_dist.
-            # Si el QR no es visible usamos el timeout como fallback.
             if self._qr_visible():
                 qr_x, qr_y = self._qr_world_pos()
                 dist_bl = math.hypot(qr_x - self._rx, qr_y - self._ry)
                 if dist_bl <= self._p('approach_final_dist'):
                     self.get_logger().info(
-                        f'[APPROACH_FINAL] Llegada confirmada dist_bl={dist_bl:.3f}m → HOLD')
+                        f'[APPROACH_FINAL] Llegada confirmada '
+                        f'dist_bl={dist_bl:.3f}m → HOLD')
                     self._transition(_S.HOLD)
                     return
 
@@ -364,27 +334,55 @@ class QRAlignNode(Node):
                 self._transition(_S.ABORT)
 
         # ── HOLD ──────────────────────────────────────────────────────────
+        #
+        # Fix S2: dos fases secuenciales con confirmación de cada una.
+        #
+        # WAIT_LEVEL: envía "n1"/"n2" en la entrada, espera AT_N1/AT_N2.
+        #             spi_servo acepta n1/n2 solo desde IDLE(0).
+        #
+        # WAIT_HOLD:  envía "hold" al llegar a AT_N1/AT_N2, espera HOLD.
+        #             spi_servo acepta "hold" solo desde AT_N1(4)/AT_N2(6).
+        #             Solo tras confirmar HOLD se avanza a BACK_AWAY.
+        #
         elif s == _S.HOLD:
-            if self._time_in_state() < 0.1:
-                self.get_logger().info(f'[HOLD] Subiendo lift: {self._lift_cmd}')
-                self._lift_done_label = ''
-                self._pub_lift.publish(String(data=self._lift_cmd))
-                return
 
-            if self._lift_done_label == self._lift_expect:
+            if self._time_in_state() < 0.05:
+                # Entrada al estado: inicializar fase y enviar primer comando
+                self._lift_done_label  = ''
+                self._lift_phase       = 'WAIT_LEVEL'
+                self._lift_reached_hold = False
                 self.get_logger().info(
-                    f'[HOLD] Lift en {self._lift_done_label} → elevando a hold')
-                self._pub_lift.publish(String(data='hold'))
-                self._lift_done_label = ''
-                self.get_logger().info('[HOLD] Pallet recogido → /collect/done SUCCESS')
-                self._pub_done.publish(String(data='SUCCESS'))
-                self._transition(_S.BACK_AWAY)
+                    f'[HOLD] Fase WAIT_LEVEL → enviando: {self._lift_cmd}')
+                self._pub_lift.publish(String(data=self._lift_cmd))
                 return
 
             if self._time_in_state() > self._p('lift_timeout'):
                 self.get_logger().error(
-                    f'[HOLD] Timeout esperando {self._lift_expect} → ABORT')
+                    f'[HOLD] Timeout en fase {self._lift_phase} → ABORT')
                 self._transition(_S.ABORT)
+                return
+
+            if self._lift_phase == 'WAIT_LEVEL':
+                # Esperando que el FPGA llegue a AT_N1 o AT_N2
+                if self._lift_done_label == self._lift_expect:
+                    self.get_logger().info(
+                        f'[HOLD] {self._lift_done_label} confirmado → '
+                        f'fase WAIT_HOLD, enviando: hold')
+                    self._lift_done_label = ''
+                    self._lift_phase      = 'WAIT_HOLD'
+                    # Fix S2: "hold" solo llega al FPGA cuando está en AT_N1/AT_N2.
+                    # El servo v2 lo acepta aquí porque acabamos de confirmar ese estado.
+                    self._pub_lift.publish(String(data='hold'))
+
+            elif self._lift_phase == 'WAIT_HOLD':
+                # Esperando confirmación de HOLD del FPGA
+                if self._lift_done_label == 'HOLD':
+                    self._lift_reached_hold = True   # Fix S3: marcar para abort seguro
+                    self.get_logger().info(
+                        '[HOLD] HOLD confirmado — pallet asegurado → '
+                        '/collect/done SUCCESS → BACK_AWAY')
+                    self._pub_done.publish(String(data='SUCCESS'))
+                    self._transition(_S.BACK_AWAY)
 
         # ── BACK_AWAY ─────────────────────────────────────────────────────
         elif s == _S.BACK_AWAY:
@@ -410,8 +408,17 @@ class QRAlignNode(Node):
         # ── ABORT ─────────────────────────────────────────────────────────
         elif s == _S.ABORT:
             self._stop()
-            if self._lift_cmd:
+            # Fix S3: "down" solo es válido desde HOLD(8).
+            # Si el lift llegó a HOLD antes del abort, enviarlo es seguro.
+            # En cualquier otro caso (AT_N1, AT_N2, en tránsito) el servo
+            # lo rechazaría silenciosamente y el lift quedaría arriba.
+            if self._lift_reached_hold:
+                self.get_logger().info('[ABORT] Lift en HOLD — enviando down')
                 self._pub_lift.publish(String(data='down'))
+            elif self._lift_cmd:
+                self.get_logger().warn(
+                    '[ABORT] Lift no llegó a HOLD — "down" omitido; '
+                    'el operador debe bajar el lift manualmente')
             self.get_logger().warn('[Collect] ❌ ABORT')
             self._set_vfh_bypass(False)
             self._pub_done.publish(String(data='ABORT'))
@@ -471,7 +478,6 @@ class QRAlignNode(Node):
                 self._pub_cmd.publish(self._spin_cmd(+scan_speed))
             else:
                 self._stop()
-                # Fix Bug 1: usar self._scan_attempts y leer scan_max_attempts
                 self._scan_attempts += 1
                 max_att = int(self._p('scan_max_attempts'))
                 self.get_logger().warn(
@@ -517,26 +523,16 @@ class QRAlignNode(Node):
         )
 
     def _compute_align_goal(self, stop_dist: float) -> Pose2D:
-        """
-        Calcula un Pose2D en coordenadas mundo tal que base_link quede a
-        stop_dist metros del QR mirando directamente hacia él.
-
-        Pasos:
-          1. Posición de la cámara en mundo (base_link + offset rotado).
-          2. Posición del QR en mundo (desde la cámara + bearing_cam).
-          3. Bearing base_link→QR (orientación correcta del robot al llegar).
-          4. Goal = QR retrocedido stop_dist en la dirección base_link→QR.
-        """
         CAM_FWD  = float(self._p('cam_fwd_m'))
         CAM_LEFT = float(self._p('cam_left_m'))
 
-        qr_x, qr_y = self._qr_world_pos_with_offsets(CAM_FWD, CAM_LEFT)
+        qr_x, qr_y   = self._qr_world_pos_with_offsets(CAM_FWD, CAM_LEFT)
         bearing_robot = math.atan2(qr_y - self._ry, qr_x - self._rx)
 
         gx = qr_x - stop_dist * math.cos(bearing_robot)
         gy = qr_y - stop_dist * math.sin(bearing_robot)
 
-        goal = Pose2D()
+        goal       = Pose2D()
         goal.x     = gx
         goal.y     = gy
         goal.theta = bearing_robot
@@ -547,25 +543,21 @@ class QRAlignNode(Node):
     # ══════════════════════════════════════════════════════════════════════
 
     def _qr_world_pos(self):
-        """Posición del QR en mundo usando los offsets de cámara declarados."""
         return self._qr_world_pos_with_offsets(
             float(self._p('cam_fwd_m')),
             float(self._p('cam_left_m')),
         )
 
     def _qr_world_pos_with_offsets(self, cam_fwd: float, cam_left: float):
-        """
-        Calcula (qr_x, qr_y) en coordenadas mundo a partir de la pose del
-        robot, los offsets físicos de la cámara y la medición ángulo+distancia.
-        """
-        # Posición de la cámara en mundo
-        cam_x = self._rx + cam_fwd  * math.cos(self._rth) - cam_left * math.sin(self._rth)
-        cam_y = self._ry + cam_fwd  * math.sin(self._rth) + cam_left * math.cos(self._rth)
+        cam_x = (self._rx
+                 + cam_fwd  * math.cos(self._rth)
+                 - cam_left * math.sin(self._rth))
+        cam_y = (self._ry
+                 + cam_fwd  * math.sin(self._rth)
+                 + cam_left * math.cos(self._rth))
 
-        # Bearing cámara→QR en mundo
         bearing_cam = self._rth + math.radians(self._qr_angle)
 
-        # Posición del QR
         qr_x = cam_x + self._qr_dist * math.cos(bearing_cam)
         qr_y = cam_y + self._qr_dist * math.sin(bearing_cam)
         return qr_x, qr_y
@@ -575,9 +567,8 @@ class QRAlignNode(Node):
     # ══════════════════════════════════════════════════════════════════════
 
     def _qr_visible(self) -> bool:
-        # Mejora: verifica también que el payload coincida con el objetivo.
         payload_ok = (
-            self._target_payload == ''               # aún no fijado → aceptar cualquiera
+            self._target_payload == ''
             or self._qr_payload == self._target_payload
         )
         return (
@@ -607,17 +598,19 @@ class QRAlignNode(Node):
         self._last_goal_y = None
 
     def _reset(self):
-        self._zone             = ''
-        self._lift_cmd         = ''
-        self._lift_expect      = ''
-        self._lift_done_label  = ''
-        self._qr_payload       = ''
-        self._target_payload   = ''
-        self._qr_angle         = 0.0
-        self._qr_dist          = 999.0
-        self._astar_status     = ''
-        self._last_goal_x      = None
-        self._last_goal_y      = None
+        self._zone              = ''
+        self._lift_cmd          = ''
+        self._lift_expect       = ''
+        self._lift_done_label   = ''
+        self._lift_phase        = 'WAIT_LEVEL'
+        self._lift_reached_hold = False
+        self._qr_payload        = ''
+        self._target_payload    = ''
+        self._qr_angle          = 0.0
+        self._qr_dist           = 999.0
+        self._astar_status      = ''
+        self._last_goal_x       = None
+        self._last_goal_y       = None
         self._scan_return_state    = _S.SEARCH_QR
         self._scan_phase           = 'LEFT'
         self._scan_phase_start_yaw = 0.0
