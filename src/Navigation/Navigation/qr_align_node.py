@@ -163,6 +163,8 @@ class QRAlignNode(Node):
         self.declare_parameter('scan_range_deg',      30.0)
         self.declare_parameter('scan_speed_dps',      20.0)
         self.declare_parameter('scan_max_attempts',   3)
+        self.declare_parameter('cam_fwd_m',   0.15)
+        self.declare_parameter('cam_left_m',  0.07)
 
         self._p = lambda n: self.get_parameter(n).value
 
@@ -286,10 +288,10 @@ class QRAlignNode(Node):
         self._qr_stamp = time.monotonic()
 
     def _cb_qr_angle(self, msg: Float32):
-        raw = float(msg.data)
-        self._qr_angle = raw + float(self._p('cam_offset_deg'))
-        self._qr_stamp = time.monotonic()
-
+        # El offset lateral ya se corrige en aruco_detector._angle_distance.
+        # cam_offset_deg queda en 0.0; se preserva el parámetro por compatibilidad.
+        self._qr_angle = float(msg.data) + float(self._p('cam_offset_deg'))
+      
     def _cb_lift_done(self, msg: String):
         label = msg.data.strip()
         if label:
@@ -661,33 +663,31 @@ class QRAlignNode(Node):
         )
 
     def _compute_align_goal(self, stop_dist: float) -> Pose2D:
-        """
-        Devuelve una Pose2D en coordenadas mundo representando el punto desde
-        el cual el robot estará:
-          - A `stop_dist` metros del QR.
-          - Mirando directamente hacia el QR (orientación = bearing al QR).
+        angle_rad = math.radians(self._qr_angle)
+        bearing   = self._rth + angle_rad
 
-        El cálculo es:
-          bearing  = robot_yaw + angle_rad   (dirección al QR en mundo)
-          qr_world = robot_pos + dist * [cos(bearing), sin(bearing)]
-          goal_pos = qr_world - stop_dist * [cos(bearing), sin(bearing)]
-          goal_yaw = bearing   (robot mira al QR al llegar)
-        """
-        angle_rad   = math.radians(self._qr_angle)
-        bearing     = self._rth + angle_rad
+        # Posición de la cámara en coordenadas mundo.
+        # La cámara está desplazada respecto a base_link (origen de /odom):
+        #   cam_offset_x = +0.15 m  (adelante, a lo largo del eje del robot)
+        #   cam_offset_y = +0.07 m  (izquierda en frame robot → +Y en frame mundo rotado)
+        # Se rota el offset al frame mundo según el yaw actual del robot.
+        CAM_FWD  = float(self._p('cam_fwd_m'))
+        CAM_LEFT = float(self._p('cam_left_m'))
+        cam_x = self._rx + CAM_FWD  * math.cos(self._rth) - CAM_LEFT * math.sin(self._rth)
+        cam_y = self._ry + CAM_FWD  * math.sin(self._rth) + CAM_LEFT * math.cos(self._rth)
 
-        # Posición estimada del QR en coordenadas mundo
-        qr_x = self._rx + self._qr_dist * math.cos(bearing)
-        qr_y = self._ry + self._qr_dist * math.sin(bearing)
+        # Posición estimada del QR en coordenadas mundo (desde la cámara, no desde base_link)
+        qr_x = cam_x + self._qr_dist * math.cos(bearing)
+        qr_y = cam_y + self._qr_dist * math.sin(bearing)
 
-        # Goal: retroceder stop_dist desde el QR en la misma dirección
+        # Goal: base_link a stop_dist metros del QR, mirando al QR
         gx = qr_x - stop_dist * math.cos(bearing)
         gy = qr_y - stop_dist * math.sin(bearing)
 
         goal = Pose2D()
         goal.x     = gx
         goal.y     = gy
-        goal.theta = bearing   # orientación deseada al llegar
+        goal.theta = bearing
         return goal
 
     # ══════════════════════════════════════════════════════════════════════
