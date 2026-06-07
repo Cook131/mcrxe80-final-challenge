@@ -1,36 +1,8 @@
 #!/usr/bin/env python3
 """
 puzzlebotOdometry.py — Full EKF Odometry with automatic MCL / ICP / ArUco switching
-======================================================================================
-[misma arquitectura que v2, fixes adicionales v3]
 
-Fixes v3 (sobre v2)
---------------------
-  FIX-V3-1  Integración RK2 (Runge-Kutta orden 2) en lugar de Euler hacia adelante.
-             En trayectorias curvas, Euler acumula error O(dt) mientras que RK2
-             acumula O(dt²). Con dt=0.02s y velocidades típicas del PuzzleBot el
-             error posicional se reduce ~10x en curvas cerradas.
-
-  FIX-V3-2  Parámetros de calibración de slip por rueda: `slip_l` y `slip_r`
-             (default 1.0, sin corrección). Motores físicos con distinta fricción
-             o desgaste producen velocidades efectivas distintas aunque el encoder
-             reporte lo mismo. Ajustar individualmente con:
-               --ros-args -p slip_l:=0.98 -p slip_r:=1.02
-             Procedimiento de calibración: marcar posición inicial, avanzar recto
-             2m, medir desvío lateral. Si desvía a la derecha: slip_l > 1 o slip_r < 1.
-
-  FIX-V3-3  dt upper-bound reducido de 0.08s a 0.05s (2.5 ciclos a 50Hz).
-             En Jetson Nano bajo carga el scheduler puede retrasar el timer hasta
-             80ms — integrar 4 ciclos de velocidad estale sobreestima la distancia.
-
-  FIX-V3-4  Q process noise escalado con velocidad cuando la EKF lleva más de
-             `predict_only_decay_s` segundos sin corrección externa. Esto ensancha
-             la covarianza progresivamente para que la innovación gate acepte
-             correcciones ArUco/MCL más agresivas en vez de rechazarlas.
-
-  FIX-V3-5  La publicación de /ekf/active_source se hace también dentro del timer
-             de predict (no solo en log_source_change) para que el dashboard siempre
-             tenga el valor más reciente incluso cuando no hay cambio de fuente.
+======================================================================================e
 """
 
 import math

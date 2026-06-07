@@ -39,7 +39,6 @@ setup(
             'controller  = iolair.puzzlebotController:main',
             'teleop      = iolair.puzzlebotTeleop:main',
             'go_to_goal  = iolair.puzzlebotGoToGoal:main',
-            'vfh_plus         = iolair.vfh_plus:main',
 
         ],
     },

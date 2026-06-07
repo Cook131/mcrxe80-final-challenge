@@ -33,12 +33,11 @@ setup(
         'console_scripts': [
             # format:  'executable_name = package.module:main_function'
 
-            'astar_planner   = Navigation.astar_planner:main',
+            'astar_planner    = Navigation.astar_planner:main',
             'rviz_goal_bridge = Navigation.goal_bridge:main',
-            'mission_planner = Navigation.mission_planner:main',
-            'mission_manager = Navigation.mission_manager:main',
-            'qr_align_node  = Navigation.qr_align_node:main',
-            'truck_align_node = Navigation.truck_align_node:main',
+            'mission_planner  = Navigation.mission_planner:main',
+            'mission_manager v= Navigation.mission_manager:main',
+            'vfh_plus         = Navigation.vfh_plus:main',
         ],
     },
 )
