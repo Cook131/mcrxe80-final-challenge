@@ -190,8 +190,8 @@ class QRAlignNode(Node):
         # ── A*/GoToGoal ───────────────────────────────────────────────────
         self._astar_status = ''
         # Último goal publicado (para detectar si hay que re-publicar)
-        self._last_goal_angle  = None   # grados
-        self._last_goal_dist   = None   # metros
+        self._last_goal_x = None   # coordenada mundo del último goal publicado
+        self._last_goal_y = None
 
         # ── RECOVER_SCAN — barrido de recuperación ────────────────────────
         # Estado al que se vuelve si el barrido encuentra el QR.
@@ -355,13 +355,21 @@ class QRAlignNode(Node):
                 self._transition(_S.ABORT)
                 return
 
-            # Calcular error lateral estimado en metros
-            # Para QR pequeño (9 cm) la estimación por ángulo es suficiente:
-            # lateral_err ≈ dist * sin(angle_rad)
-            lateral_err = self._qr_dist * math.sin(math.radians(self._qr_angle))
+            # Error lateral y angular medidos desde base_link, no desde la cámara.
+            # Se reutiliza la misma geometría de _compute_align_goal.
+            CAM_FWD  = float(self._p('cam_fwd_m'))
+            CAM_LEFT = float(self._p('cam_left_m'))
+            cam_x = self._rx + CAM_FWD  * math.cos(self._rth) - CAM_LEFT * math.sin(self._rth)
+            cam_y = self._ry + CAM_FWD  * math.sin(self._rth) + CAM_LEFT * math.cos(self._rth)
+            bearing_cam   = self._rth + math.radians(self._qr_angle)
+            qr_x = cam_x + self._qr_dist * math.cos(bearing_cam)
+            qr_y = cam_y + self._qr_dist * math.sin(bearing_cam)
+            bearing_robot = math.atan2(qr_y - self._ry, qr_x - self._rx)
+            angle_err_robot = math.degrees(self._angle_diff(bearing_robot, self._rth))
+            lateral_err = self._qr_dist * math.sin(math.radians(angle_err_robot))
             aligned = (
-                abs(self._qr_angle) < self._p('angle_tol_deg')
-                and abs(lateral_err) < self._p('align_lateral_tol')
+                abs(angle_err_robot) < self._p('angle_tol_deg')
+                and abs(lateral_err)  < self._p('align_lateral_tol')
             )
             close_enough = self._qr_dist <= self._p('align_stop_dist')
 
@@ -602,45 +610,22 @@ class QRAlignNode(Node):
     # ══════════════════════════════════════════════════════════════════════
 
     def _publish_align_goal_if_needed(self):
-        """
-        Calcula un goal de alineación en coordenadas mundo y lo publica en
-        /astar/goal si los datos de percepción cambiaron lo suficiente desde
-        la última publicación.
-
-        Estrategia de goal de alineación
-        ---------------------------------
-        El objetivo es que el robot quede:
-          1. Centrado lateralmente con el QR (error lateral ≈ 0).
-          2. Mirando directamente al QR (ángulo ≈ 0°).
-          3. A align_stop_dist metros del QR.
-
-        Para eso, calculamos la posición estimada del QR en coordenadas mundo
-        y generamos un goal a align_stop_dist metros frente al QR, en la
-        dirección perpendicular al plano del QR.
-
-        Dado que el QR es plano y el robot lo ve de frente, "frente al QR"
-        equivale a estar a lo largo del vector de bearing desde el robot.
-
-        La corrección lateral queda embebida automáticamente: el goal siempre
-        está alineado con la línea robot→QR, así que GoToGoal corregirá el
-        offset lateral al aproximarse.
-        """
-        # Verificar si vale la pena re-publicar
-        if self._last_goal_angle is not None:
-            d_angle = abs(self._qr_angle - self._last_goal_angle)
-            d_dist  = abs(self._qr_dist  - self._last_goal_dist)
-            if (d_angle < self._p('goal_replan_angle')
-                    and d_dist < self._p('goal_replan_dist')):
-                return   # Sin cambio significativo; no saturar el planner
-
         goal = self._compute_align_goal(self._p('align_stop_dist'))
-        self._pub_astar.publish(goal)
 
-        self._last_goal_angle = self._qr_angle
-        self._last_goal_dist  = self._qr_dist
+        # Hysteresis en coordenadas mundo, no en ángulo de cámara.
+        # Así detecta cambios aunque vengan de rotación del robot o de nueva lectura.
+        if self._last_goal_x is not None:
+            dx = abs(goal.x - self._last_goal_x)
+            dy = abs(goal.y - self._last_goal_y)
+            if dx < self._p('goal_replan_dist') and dy < self._p('goal_replan_dist'):
+                return
+
+        self._pub_astar.publish(goal)
+        self._last_goal_x = goal.x
+        self._last_goal_y = goal.y
 
         self.get_logger().info(
-            f'[ALIGNING] Goal → ({goal.x:.3f}, {goal.y:.3f}) θ={goal.theta:.2f}rad  '
+            f'[ALIGNING] Goal → ({goal.x:.3f}, {goal.y:.3f}) θ={math.degrees(goal.theta):.1f}°  '
             f'[QR dist={self._qr_dist:.2f}m ang={self._qr_angle:+.1f}°]'
         )
 
@@ -721,8 +706,8 @@ class QRAlignNode(Node):
         self._state       = new_state
         self._state_entry = time.monotonic()
         # Reset del último goal para forzar re-publicación al entrar a ALIGNING
-        self._last_goal_angle = None
-        self._last_goal_dist  = None
+        self._last_goal_x = None
+        self._last_goal_y = None
 
     def _reset(self):
         self._zone            = ''
@@ -733,8 +718,8 @@ class QRAlignNode(Node):
         self._qr_angle        = 0.0
         self._qr_dist         = 999.0
         self._astar_status    = ''
-        self._last_goal_angle = None
-        self._last_goal_dist  = None
+        self._last_goal_x = None
+        self._last_goal_y = None
         self._scan_return_state    = _S.SEARCH_QR
         self._scan_phase           = 'LEFT'
         self._scan_phase_start_yaw = 0.0
