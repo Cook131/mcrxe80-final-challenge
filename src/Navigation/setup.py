@@ -36,8 +36,9 @@ setup(
             'astar_planner    = Navigation.astar_planner:main',
             'rviz_goal_bridge = Navigation.goal_bridge:main',
             'mission_planner  = Navigation.mission_planner:main',
-            'mission_manager v= Navigation.mission_manager:main',
+            'mission_manager  = Navigation.mission_manager:main',
             'vfh_plus         = Navigation.vfh_plus:main',
+            'qr_aligner       = Navigation.qr_aligner_node:main',
         ],
     },
 )
