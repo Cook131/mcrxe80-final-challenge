@@ -27,13 +27,21 @@ Máquina de estados
     → SEARCH_QR   al recibir /collect/trigger (siempre)
 
   SEARCH_QR
-    → ALIGNING    cuando el QR es visible
-    → ABORT       si timeout sin QR
+    → ALIGNING      cuando el QR es visible
+    → RECOVER_SCAN  si timeout sin QR  (safeguard)
 
   ALIGNING
     → APPROACH_FINAL  cuando centrado + dist ≤ align_stop_dist
     → ALIGNING        cada tick: recalcula y publica goal de alineación
-    → ABORT           si QR perdido demasiado tiempo
+    → RECOVER_SCAN    si QR perdido  (safeguard)
+
+  RECOVER_SCAN  ← safeguard: barrido ±30° buscando el QR
+    Fases:
+      1. LEFT_SWEEP : gira +scan_range_deg a la izquierda
+      2. RIGHT_SWEEP: gira −2×scan_range_deg a la derecha (cubre ambos lados)
+      3. CENTER     : vuelve al centro (+scan_range_deg)
+    → estado_origen  si recupera el QR en cualquier fase
+    → ABORT          si el barrido completo termina sin QR
 
   APPROACH_FINAL
     → HOLD        cuando A* publica GOAL_REACHED  (llegó a 35 cm)
@@ -88,6 +96,8 @@ Parámetros ROS2
   qr_timeout            float  2.5    Segundos sin QR antes de pausar [s]
   cam_offset_deg        float  0.0    Offset angular cámara→base_link [°]
   fsm_rate_hz           float  20.0   Frecuencia del tick [Hz]
+  scan_range_deg        float  30.0   Semi-amplitud del barrido de recuperación [°]
+  scan_speed_dps        float  20.0   Velocidad angular del barrido [°/s]
 """
 
 import math
@@ -110,6 +120,7 @@ class _S:
     IDLE           = 'IDLE'
     SEARCH_QR      = 'SEARCH_QR'
     ALIGNING       = 'ALIGNING'
+    RECOVER_SCAN   = 'RECOVER_SCAN'   # safeguard: barrido ±30° al perder el QR
     APPROACH_FINAL = 'APPROACH_FINAL'
     HOLD           = 'HOLD'
     BACK_AWAY      = 'BACK_AWAY'
@@ -149,6 +160,8 @@ class QRAlignNode(Node):
         self.declare_parameter('qr_timeout',          2.5)
         self.declare_parameter('cam_offset_deg',      0.0)
         self.declare_parameter('fsm_rate_hz',         20.0)
+        self.declare_parameter('scan_range_deg',      30.0)
+        self.declare_parameter('scan_speed_dps',      20.0)
 
         self._p = lambda n: self.get_parameter(n).value
 
@@ -176,6 +189,14 @@ class QRAlignNode(Node):
         # Último goal publicado (para detectar si hay que re-publicar)
         self._last_goal_angle  = None   # grados
         self._last_goal_dist   = None   # metros
+
+        # ── RECOVER_SCAN — barrido de recuperación ────────────────────────
+        # Estado al que se vuelve si el barrido encuentra el QR.
+        self._scan_return_state = _S.SEARCH_QR
+        # Fase del barrido: 'LEFT' | 'RIGHT' | 'CENTER'
+        self._scan_phase        = 'LEFT'
+        # Yaw odométrico al inicio de la fase actual (referencia de giro).
+        self._scan_phase_start_yaw = 0.0
 
         # ── Lift ──────────────────────────────────────────────────────────
         self._lift_done_label = ''
@@ -310,16 +331,19 @@ class QRAlignNode(Node):
                 return
 
             if self._time_in_state() > self._p('search_timeout'):
-                self.get_logger().warn('[SEARCH_QR] Timeout sin QR → ABORT')
-                self._transition(_S.ABORT)
+                self.get_logger().warn(
+                    '[SEARCH_QR] Timeout sin QR → RECOVER_SCAN')
+                self._start_recover_scan(return_to=_S.SEARCH_QR)
+                return
 
         # ── ALIGNING ──────────────────────────────────────────────────────
         elif s == _S.ALIGNING:
             if not self._qr_visible():
-                # QR perdido — esperar un poco (ruido de detección)
-                if self._time_in_state() > self._p('qr_timeout') * 3:
-                    self.get_logger().warn('[ALIGNING] QR perdido → ABORT')
-                    self._transition(_S.ABORT)
+                # Breve gracia de ruido de detección antes de reaccionar
+                if (time.monotonic() - self._qr_stamp) > self._p('qr_timeout'):
+                    self.get_logger().warn(
+                        '[ALIGNING] QR perdido → RECOVER_SCAN')
+                    self._start_recover_scan(return_to=_S.ALIGNING)
                 return  # No publicar goals con datos viejos
 
             if self._time_in_state() > self._p('align_timeout'):
@@ -348,6 +372,10 @@ class QRAlignNode(Node):
 
             # Publicar goal de alineación (solo si cambió lo suficiente)
             self._publish_align_goal_if_needed()
+
+        # ── RECOVER_SCAN ──────────────────────────────────────────────────
+        elif s == _S.RECOVER_SCAN:
+            self._tick_recover_scan()
 
         # ── APPROACH_FINAL ────────────────────────────────────────────────
         elif s == _S.APPROACH_FINAL:
@@ -430,6 +458,131 @@ class QRAlignNode(Node):
             self._pub_done.publish(String(data='ABORT'))
             self._reset()
             self._transition(_S.IDLE)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RECOVER_SCAN — barrido de recuperación de QR
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _start_recover_scan(self, return_to: str):
+        """
+        Inicia el barrido de recuperación.
+
+        Parámetro
+        ---------
+        return_to : estado al que volver si el QR es encontrado.
+                    (SEARCH_QR o ALIGNING)
+
+        El barrido se hace en sitio (giro puro, sin traslación) en tres
+        fases:
+          LEFT  → gira +scan_range_deg  (izquierda, antihorario)
+          RIGHT → gira −2×scan_range_deg (derecha, cruzando el centro)
+          CENTER → gira +scan_range_deg  (vuelve al heading original)
+
+        En cada tick se compara el yaw odométrico actual con el yaw al
+        inicio de la fase para saber cuándo se completó el arco. La
+        velocidad angular se publica en cmd_vel directamente — es el
+        único uso de cmd_vel junto con BACK_AWAY, y es legítimo porque
+        el robot está parado buscando visibilidad, no navegando.
+        """
+        self._scan_return_state    = return_to
+        self._scan_phase           = 'LEFT'
+        self._scan_phase_start_yaw = self._rth
+        self.get_logger().warn(
+            f'[RECOVER_SCAN] Iniciando barrido ±{self._p("scan_range_deg")}°  '
+            f'(volveré a {return_to} si encuentro el QR)')
+        self._transition(_S.RECOVER_SCAN)
+
+    def _tick_recover_scan(self):
+        """
+        Ejecuta un tick del barrido de recuperación.
+
+        Lógica por fase
+        ---------------
+        LEFT   → gira antihorario hasta alcanzar +scan_range_deg desde el
+                 heading de entrada.
+        RIGHT  → gira horario hasta alcanzar −scan_range_deg desde el
+                 heading de entrada (recorre 2× el rango, cruzando el centro).
+        CENTER → gira antihorario hasta volver al heading de entrada
+                 (recorre +scan_range_deg).
+
+        En cualquier fase: si el QR se vuelve visible, se para el robot
+        y se hace la transición al estado de retorno configurado.
+
+        Si las tres fases se completan sin detectar el QR → ABORT.
+
+        Convención de ángulos
+        ---------------------
+        El yaw de odometría crece en sentido antihorario (positivo = izquierda).
+        angular.z positivo = giro antihorario = hacia la izquierda.
+        """
+        # ── ¿Recuperamos el QR? ───────────────────────────────────────────
+        if self._qr_visible():
+            self._stop()
+            self.get_logger().info(
+                f'[RECOVER_SCAN] QR recuperado en fase {self._scan_phase} '
+                f'(dist={self._qr_dist:.2f}m, angle={self._qr_angle:+.1f}°) '
+                f'→ {self._scan_return_state}')
+            self._transition(self._scan_return_state)
+            return
+
+        scan_range = self._p('scan_range_deg')
+        scan_speed = math.radians(self._p('scan_speed_dps'))  # rad/s
+
+        # Ángulo girado desde el inicio de la fase actual (con signo)
+        delta_yaw_deg = math.degrees(
+            self._angle_diff(self._rth, self._scan_phase_start_yaw)
+        )
+
+        if self._scan_phase == 'LEFT':
+            # Objetivo: girar +scan_range_deg (antihorario)
+            if delta_yaw_deg < scan_range:
+                self._pub_cmd.publish(self._spin_cmd(+scan_speed))
+            else:
+                # Fase LEFT completada → pasar a RIGHT
+                self._stop()
+                self.get_logger().info(
+                    f'[RECOVER_SCAN] LEFT completado ({delta_yaw_deg:+.1f}°) → RIGHT')
+                self._scan_phase           = 'RIGHT'
+                self._scan_phase_start_yaw = self._rth
+
+        elif self._scan_phase == 'RIGHT':
+            # Objetivo: girar −2×scan_range_deg (horario) desde el punto más izquierdo
+            if delta_yaw_deg > -2.0 * scan_range:
+                self._pub_cmd.publish(self._spin_cmd(-scan_speed))
+            else:
+                # Fase RIGHT completada → volver al centro
+                self._stop()
+                self.get_logger().info(
+                    f'[RECOVER_SCAN] RIGHT completado ({delta_yaw_deg:+.1f}°) → CENTER')
+                self._scan_phase           = 'CENTER'
+                self._scan_phase_start_yaw = self._rth
+
+        elif self._scan_phase == 'CENTER':
+            # Objetivo: girar +scan_range_deg (antihorario, volver al heading original)
+            if delta_yaw_deg < scan_range:
+                self._pub_cmd.publish(self._spin_cmd(+scan_speed))
+            else:
+                # Barrido completo sin QR
+                self._stop()
+                self.get_logger().error(
+                    '[RECOVER_SCAN] Barrido ±{:.0f}° completado sin encontrar QR → ABORT'.format(
+                        scan_range))
+                self._transition(_S.ABORT)
+
+    @staticmethod
+    def _angle_diff(a: float, b: float) -> float:
+        """Diferencia angular con signo en [-π, π]: a − b."""
+        d = a - b
+        while d >  math.pi: d -= 2.0 * math.pi
+        while d < -math.pi: d += 2.0 * math.pi
+        return d
+
+    @staticmethod
+    def _spin_cmd(angular_z: float) -> Twist:
+        """Twist de giro puro en sitio (linear.x = 0)."""
+        cmd = Twist()
+        cmd.angular.z = angular_z
+        return cmd
 
     # ══════════════════════════════════════════════════════════════════════
     # PUBLICACIÓN DE GOALS  (núcleo del refactor)
@@ -569,6 +722,9 @@ class QRAlignNode(Node):
         self._astar_status    = ''
         self._last_goal_angle = None
         self._last_goal_dist  = None
+        self._scan_return_state    = _S.SEARCH_QR
+        self._scan_phase           = 'LEFT'
+        self._scan_phase_start_yaw = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
