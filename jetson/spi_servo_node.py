@@ -72,6 +72,11 @@ DONE_LABEL = {
     6: 'AT_N2',  8: 'HOLD',
 }
 
+# Cuántos ciclos consecutivos del mismo estado se requieren para
+# considerarlo "firme" y evitar jitter en transiciones
+STABLE_CONFIRM_COUNT = 3      # × poll_period = 150 ms @ 20 Hz
+KEEPALIVE_PERIOD     = 0.05   # segundos entre keepalives durante pausa
+
 
 class SpiServoNode(Node):
 
@@ -90,9 +95,10 @@ class SpiServoNode(Node):
         publish_rate = self.get_parameter('publish_rate').value
         poll_rate    = self.get_parameter('poll_rate').value
 
-        self._fpga_state  = 0          # último sm_state leído del FPGA
-        self._prev_fpga   = 0          # para detectar transiciones
-        self._spi         = None
+        self._fpga_state      = 0   # último sm_state leído del FPGA
+        self._stable_count    = 0   # contador de confirmaciones consecutivas
+        self._confirmed_state = 0   # estado ya "firme" (anti-jitter)
+        self._spi             = None
 
         if SPIDEV_AVAILABLE:
             try:
@@ -168,26 +174,45 @@ class SpiServoNode(Node):
     def _poll_fpga(self):
         """
         Lee sm_state del FPGA a poll_rate Hz.
-        Si transiciona de moving→stable, publica /lift_done.
+        Aplica confirmación por mayoría (STABLE_CONFIRM_COUNT lecturas
+        consecutivas iguales) antes de considerar el estado como firme,
+        eliminando el jitter en transiciones como TO_N1→AT_N1.
+        Publica /lift_done solo al confirmar un estado estable.
         """
-        new_state = self._read_state()
+        raw = self._read_state()
 
-        if new_state != self._fpga_state:
-            prev = self._fpga_state
-            self._fpga_state = new_state
+        # Acumular confirmaciones del mismo valor crudo
+        if raw == self._fpga_state:
+            self._stable_count = min(self._stable_count + 1, STABLE_CONFIRM_COUNT)
+        else:
+            # Nuevo valor — reiniciar contador
+            self._fpga_state   = raw
+            self._stable_count = 1
+            return   # esperar más muestras antes de actuar
 
-            self.get_logger().info(
-                f'FPGA: {FPGA_STATE.get(prev,"?")}({prev}) → '
-                f'{FPGA_STATE.get(new_state,"?")}({new_state})'
-            )
+        # Solo actuar cuando el estado lleva N lecturas consecutivas iguales
+        if self._stable_count < STABLE_CONFIRM_COUNT:
+            return
 
-            # Transición a estado ESTABLE → publicar done
-            if new_state in FPGA_STABLE:
-                label = DONE_LABEL.get(new_state, 'DONE')
-                msg = String()
-                msg.data = label
-                self._pub_done.publish(msg)
-                self.get_logger().info(f'/lift_done: "{label}"')
+        # Estado firme — detectar cambio respecto al último confirmado
+        if raw == self._confirmed_state:
+            return   # sin cambio real
+
+        prev = self._confirmed_state
+        self._confirmed_state = raw
+
+        self.get_logger().info(
+            f'FPGA (confirmado): {FPGA_STATE.get(prev,"?")}({prev}) → '
+            f'{FPGA_STATE.get(raw,"?")}({raw})'
+        )
+
+        # Transición a estado ESTABLE → publicar done
+        if raw in FPGA_STABLE:
+            label = DONE_LABEL.get(raw, 'DONE')
+            msg = String()
+            msg.data = label
+            self._pub_done.publish(msg)
+            self.get_logger().info(f'/lift_done: "{label}"')
 
     # ── Callbacks ──────────────────────────────────────────────────────────────
 
@@ -226,8 +251,8 @@ class SpiServoNode(Node):
             self.get_logger().warn(f'lift_auto: "{key}" no reconocido')
             return
 
-        # Validación contra estado FPGA real (vía MISO)
-        current = self._read_state()
+        # Validación contra estado FPGA confirmado (anti-jitter)
+        current = self._confirmed_state
         req = required_state[key]
 
         if key == 'hold' and current not in (4, 6):  # AT_N1 o AT_N2
@@ -248,15 +273,16 @@ class SpiServoNode(Node):
     # ── Publicación continua ────────────────────────────────────────────────────
 
     def _publish_state(self):
-        state_name = FPGA_STATE.get(self._fpga_state, 'UNKNOWN')
+        # Publica el estado confirmado (firme), no el crudo
+        state_name = FPGA_STATE.get(self._confirmed_state, 'UNKNOWN')
         pos_map = {0: 'DOWN', 4: 'N1', 6: 'N2', 8: 'HOLD'}
-        pos = pos_map.get(self._fpga_state, 'UNKNOWN')
+        pos = pos_map.get(self._confirmed_state, 'UNKNOWN')
 
         s = String(); s.data = state_name
         self._pub_state.publish(s)
         p = String(); p.data = pos
         self._pub_pos.publish(p)
-        m = Int16MultiArray(); m.data = [self._fpga_state, 0]
+        m = Int16MultiArray(); m.data = [self._confirmed_state, 0]
         self._pub_servo.publish(m)
 
     @staticmethod
@@ -310,7 +336,12 @@ if __name__ == '__main__':
     spi.lsbfirst      = False
     spi.cshigh        = False
 
-    def tx(cmd, repeats=3):
+    def tx(cmd, repeats=3, post_delay=0.08):
+        """
+        Envía el comando N veces y espera post_delay segundos.
+        El delay es crítico: el FPGA necesita tiempo para procesar
+        el comando y transicionar su SM antes del primer poll.
+        """
         pkt = [HDR_CMD, cmd, 0x00]
         state = 0
         for i in range(repeats):
@@ -321,50 +352,119 @@ if __name__ == '__main__':
         name = CMD_NAMES.get(cmd, f'0x{cmd:02X}')
         fname = FPGA_STATE.get(state, '?')
         print(f'  TX [{name}] ×{repeats}  MISO→ {fname}({state})')
+        if post_delay > 0:
+            time.sleep(post_delay)   # dar tiempo al FPGA para actualizar su SM
         return state
 
-    def read_state():
+    def read_state_raw():
+        """Lee sm_state crudo una sola vez."""
         resp = spi.xfer2([HDR_CMD, CMD_PING, 0x00])
         s = resp[0] & 0x0F
         return s, FPGA_STATE.get(s, '?')
 
-    def wait_until(target_states, timeout=5.0, label=''):
-        """Espera (polling MISO) hasta que FPGA llegue a un estado esperado."""
+    def read_state_confirmed(confirm_count=3, period=0.02):
+        """
+        Lee hasta obtener `confirm_count` lecturas consecutivas iguales.
+        Evita falsos positivos por jitter en transiciones del FPGA.
+        """
+        last = None
+        streak = 0
+        while True:
+            s, name = read_state_raw()
+            if s == last:
+                streak += 1
+                if streak >= confirm_count:
+                    return s, name
+            else:
+                last   = s
+                streak = 1
+            time.sleep(period)
+
+    def wait_until(target_states, timeout=5.0, label='',
+                   confirm_count=STABLE_CONFIRM_COUNT,
+                   reinforce_cmd=None, reinforce_every=0.5):
+        """
+        Espera (polling MISO con confirmación anti-jitter) hasta que
+        el FPGA llegue de forma estable a uno de los estados esperados.
+        Si reinforce_cmd se especifica, lo reenvía cada reinforce_every
+        segundos para asegurar que el FPGA no pierda el comando.
+        """
         t0 = time.time()
+        last   = None
+        streak = 0
+        last_reinforce = t0
+
         while time.time() - t0 < timeout:
-            s, name = read_state()
+            # Reforzar comando si se especificó
+            now = time.time()
+            if reinforce_cmd is not None and (now - last_reinforce) >= reinforce_every:
+                spi.xfer2([HDR_CMD, reinforce_cmd, 0x00])
+                last_reinforce = now
+
+            resp   = spi.xfer2([HDR_CMD, CMD_PING, 0x00])
+            s      = resp[0] & 0x0F
+            name   = FPGA_STATE.get(s, '?')
             elapsed = time.time() - t0
-            print(f'  {label}  {elapsed:.1f}s  FPGA={name}({s})', end='\r')
-            if s in target_states:
-                print(f'  {label}  {elapsed:.1f}s  FPGA={name}({s}) ✓')
+
+            if s == last:
+                streak += 1
+            else:
+                last   = s
+                streak = 1
+
+            confirmed = streak >= confirm_count
+            marker = ' ✓' if (s in target_states and confirmed) else ''
+            print(f'  {label}  {elapsed:.1f}s  FPGA={name}({s})'
+                  f'  streak={streak}{marker}', end='\r')
+
+            if s in target_states and confirmed:
+                print()   # nueva línea
                 return s
-            time.sleep(0.05)
+
+            time.sleep(0.02)
+
         print(f'\n  TIMEOUT después de {timeout}s')
         return None
+
+    def keepalive_pause(cmd, duration, label='pausa'):
+        """
+        Mantiene el estado del FPGA enviando el mismo comando cada
+        KEEPALIVE_PERIOD segundos durante `duration` segundos.
+        Evita que un timer interno del FPGA caiga a IDLE durante la pausa.
+        """
+        print(f'  {label} {duration:.1f}s con keepalive CMD 0x{cmd:02X}...')
+        t0 = time.time()
+        while time.time() - t0 < duration:
+            spi.xfer2([HDR_CMD, cmd, 0x00])
+            time.sleep(KEEPALIVE_PERIOD)
+        # Verificar que seguimos en el estado correcto tras la pausa
+        s, name = read_state_confirmed()
+        print(f'  Tras pausa: FPGA={name}({s})')
+        return s
 
     print(f'\n=== Test: {test} ===\n')
 
     try:
         if test == 'status':
-            s, name = read_state()
-            print(f'FPGA sm_state = {name} ({s})')
+            s, name = read_state_confirmed()
+            print(f'FPGA sm_state (confirmado) = {name} ({s})')
 
         elif test == 'stop':
             tx(CMD_STOP, 5)
 
         elif test == 'n1':
-            print('GO_N1 → esperando AT_N1 (MISO polling)...')
+            print('GO_N1 → esperando AT_N1 (MISO polling con confirmación)...')
             tx(CMD_GO_N1)
             wait_until({4}, timeout=3.0, label='[TO_N1]')
 
         elif test == 'n2':
-            print('GO_N2 → esperando AT_N2 (MISO polling)...')
+            print('GO_N2 → esperando AT_N2 (MISO polling con confirmación)...')
             tx(CMD_GO_N2)
             wait_until({6}, timeout=4.0, label='[TO_N2]')
 
         elif test == 'hold':
-            s, name = read_state()
-            print(f'Estado actual: {name}({s})')
+            s, name = read_state_confirmed()
+            print(f'Estado actual (confirmado): {name}({s})')
             if s not in (4, 6):
                 print('Necesitas estar en AT_N1(4) o AT_N2(6). Abort.')
             else:
@@ -372,59 +472,107 @@ if __name__ == '__main__':
                 wait_until({8}, timeout=3.0, label='[LIFTING]')
 
         elif test == 'down':
-            s, name = read_state()
-            print(f'Estado actual: {name}({s})')
+            s, name = read_state_confirmed()
+            print(f'Estado actual (confirmado): {name}({s})')
             if s != 8:
                 print('Necesitas estar en HOLD(8). Abort.')
             else:
                 tx(CMD_GO_DOWN)
                 wait_until({0}, timeout=4.0, label='[LOWERING]')
-        
+
         elif test == 'cycle':
             pause = float(sys.argv[idx + 2]) if len(sys.argv) > idx + 2 else 1.0
-            print(f'Ciclo: N1 completo → N2 → HOLD → DOWN  (pausa={pause:.1f}s)\n')
+            print(f'Ciclo: N1 → HOLD → DOWN → N2 → HOLD → DOWN'
+                  f'  (pausa={pause:.1f}s, keepalive activo)\n')
 
-            tx(CMD_STOP, 5); time.sleep(0.3)
+            abort = False   # bandera para salida limpia sin cerrar spi en medio
 
-            # ── Sub-ciclo N1 ──────────────────────────────────────
-            print('[1/7] GO_N1')
-            tx(CMD_GO_N1)
-            wait_until({4}, timeout=3.0, label='[TO_N1]')
-            print(f'  En N1 — pausa {pause:.1f}s')
-            time.sleep(pause)
+            # Asegurar punto de partida limpio
+            tx(CMD_STOP, 5, post_delay=0.3)
+            s, name = read_state_confirmed()
+            print(f'Estado inicial confirmado: {name}({s})\n')
+            if s != 0:
+                print('Se esperaba IDLE(0) para iniciar ciclo. Abort.')
+                abort = True
 
-            print('[2/7] HOLD desde N1')
-            tx(CMD_GO_HOLD)
-            wait_until({8}, timeout=3.0, label='[LIFTING N1]')
+            # ── Sub-ciclo N1 ──────────────────────────────────────────────────
+            if not abort:
+                print('[1/6] GO_N1 → esperando AT_N1...')
+                tx(CMD_GO_N1)   # post_delay=0.08 por defecto
+                reached = wait_until({4}, timeout=5.0, label='[TO_N1]',
+                                     reinforce_cmd=CMD_GO_N1)
+                if reached is None:
+                    print('No se alcanzó AT_N1. Abort.')
+                    abort = True
 
-            print('[3/7] DOWN')
-            tx(CMD_GO_DOWN)
-            wait_until({0}, timeout=5.0, label='[LOWERING]')
-            time.sleep(0.3)
+            if not abort:
+                # Pausa en N1 con keepalive para evitar caída a IDLE
+                keepalive_pause(CMD_GO_N1, pause, label='[AT_N1]')
 
-            # ── Sub-ciclo N2 ──────────────────────────────────────
-            print('[4/7] GO_N2')
-            tx(CMD_GO_N2)
-            wait_until({6}, timeout=4.0, label='[TO_N2]')
-            print(f'  En N2 — pausa {pause:.1f}s')
-            time.sleep(pause)
+            if not abort:
+                print('[2/6] HOLD desde N1 → esperando HOLD...')
+                tx(CMD_GO_HOLD)   # post_delay=0.08 da tiempo al FPGA
+                reached = wait_until({8}, timeout=8.0, label='[LIFTING N1]',
+                                     reinforce_cmd=CMD_GO_HOLD)
+                if reached is None:
+                    print('No se alcanzó HOLD. Abort.')
+                    abort = True
 
-            print('[5/7] HOLD desde N2')
-            tx(CMD_GO_HOLD)
-            wait_until({8}, timeout=3.0, label='[LIFTING N2]')
-            print(f'  En HOLD — pausa {pause:.1f}s')
-            time.sleep(pause)
+            if not abort:
+                print('[3/6] DOWN → esperando IDLE...')
+                tx(CMD_GO_DOWN)
+                reached = wait_until({0}, timeout=10.0, label='[LOWERING]',
+                                     reinforce_cmd=CMD_GO_DOWN)
+                if reached is None:
+                    print('No se alcanzó IDLE. Abort.')
+                    abort = True
+                else:
+                    time.sleep(0.3)
 
-            print('[6/7] DOWN')
-            tx(CMD_GO_DOWN)
-            wait_until({0}, timeout=5.0, label='[LOWERING]')
+            # ── Sub-ciclo N2 ──────────────────────────────────────────────────
+            if not abort:
+                print('[4/6] GO_N2 → esperando AT_N2...')
+                tx(CMD_GO_N2)
+                reached = wait_until({6}, timeout=6.0, label='[TO_N2]',
+                                     reinforce_cmd=CMD_GO_N2)
+                if reached is None:
+                    print('No se alcanzó AT_N2. Abort.')
+                    abort = True
 
-            tx(CMD_STOP, 5)
-            print('\nCiclo completado ✓')
+            if not abort:
+                keepalive_pause(CMD_GO_N2, pause, label='[AT_N2]')
+
+            if not abort:
+                print('[5/6] HOLD desde N2 → esperando HOLD...')
+                tx(CMD_GO_HOLD)
+                reached = wait_until({8}, timeout=8.0, label='[LIFTING N2]',
+                                     reinforce_cmd=CMD_GO_HOLD)
+                if reached is None:
+                    print('No se alcanzó HOLD. Abort.')
+                    abort = True
+
+            if not abort:
+                keepalive_pause(CMD_GO_HOLD, pause, label='[HOLD]')
+
+            if not abort:
+                print('[6/6] DOWN → esperando IDLE...')
+                tx(CMD_GO_DOWN)
+                reached = wait_until({0}, timeout=10.0, label='[LOWERING]',
+                                     reinforce_cmd=CMD_GO_DOWN)
+                if reached is None:
+                    print('No se alcanzó IDLE final. Abort.')
+                    abort = True
+
+            tx(CMD_STOP, 5, post_delay=0)
+            if abort:
+                print('\nCiclo abortado ✗')
+            else:
+                print('\nCiclo completado ✓')
 
         elif test == 'manual':
             import threading
-            print(f'Estado inicial: {read_state()[1]}')
+            s, name = read_state_confirmed()
+            print(f'Estado inicial (confirmado): {name}({s})')
             print('  1=MAN_UP  -1=MAN_DOWN  0=STOP  s=status  q=salir\n')
             tx(CMD_STOP, 5)
             state = {'cmd': CMD_STOP}
@@ -438,17 +586,17 @@ if __name__ == '__main__':
             threading.Thread(target=sender, daemon=True).start()
 
             while True:
-                raw = input('> ').strip()
-                if raw == 'q':
+                raw_input = input('> ').strip()
+                if raw_input == 'q':
                     break
-                elif raw == 's':
-                    s, n = read_state()
-                    print(f'  FPGA: {n}({s})')
-                elif raw == '1':
+                elif raw_input == 's':
+                    s, n = read_state_confirmed()
+                    print(f'  FPGA (confirmado): {n}({s})')
+                elif raw_input == '1':
                     state['cmd'] = CMD_MAN_UP;   print('  MAN_UP')
-                elif raw == '-1':
+                elif raw_input == '-1':
                     state['cmd'] = CMD_MAN_DOWN; print('  MAN_DOWN')
-                elif raw == '0':
+                elif raw_input == '0':
                     state['cmd'] = CMD_STOP;     print('  STOP')
                 else:
                     print('  Usa: 1 / -1 / 0 / s / q')
@@ -457,7 +605,7 @@ if __name__ == '__main__':
             tx(CMD_STOP, 5)
 
         else:
-            print(f'Opciones: status | stop | n1 | n2 | hold | down | cycle | manual')
+            print('Opciones: status | stop | n1 | n2 | hold | down | cycle | manual')
 
     except KeyboardInterrupt:
         print('\nAbortado.')

@@ -150,7 +150,7 @@ def _to_posestamped(rvec, tvec) -> PoseStamped:
 class ArucoDetectorNode(Node):
 
     MARKER_SIZE = 0.095   # metros — medir marcador físico con regla
-    QR_SIZE     = 0.08    # metros — medir el QR físico con regla
+    QR_SIZE     = 0.089   # metros — medir el QR físico con regla
 
     def __init__(self):
         super().__init__('aruco_detector')

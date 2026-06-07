@@ -260,7 +260,7 @@ def generate_launch_description():
     # Durante ALIGN/ADVANCE/EXTRACT qr_align publica /align/active=True
     # y vfh_plus cede el control directo sin tocar cmd_raw.
     vfh_plus_node = Node(
-        package='Navigation',
+        package='iolair',
         executable='vfh_plus',
         name='vfh_plus',
         output='screen',
