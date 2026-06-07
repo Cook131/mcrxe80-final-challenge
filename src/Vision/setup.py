@@ -31,6 +31,7 @@ setup(
             'yolo_vision = Vision.yolo_vision:main',
             'qr_zone_checker = Vision.qr_zone_checker:main',
             'qr_detector = Vision.qr_detector:main',
+            'yolo_world_pos = Vision.truck_pos:main',
         ],
     },
 )
