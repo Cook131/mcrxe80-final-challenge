@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-spi_servo_node.py  v2
+spi_servo_node.py  v3
 Jetson Nano → Tang Nano 20K (SPI slave) → 1× Servo 360° (lift)
 
 La SM y sus timers viven en el FPGA.
@@ -8,33 +8,28 @@ El FPGA devuelve su sm_state real en MISO en cada transacción SPI.
 El 'done' se detecta cuando sm_state cambia a un estado estable.
 
 ─── Fix P1: _read_state() con retry anti-glitch ──────────────
-  La versión anterior aceptaba cualquier valor crudo de MISO
-  inmediatamente. Si la línea tenía ruido durante la transición
-  CS↓, el nibble bajo podía ser basura. Ahora _read_state()
-  hace 2 lecturas consecutivas y solo acepta el valor si ambas
-  coinciden; si no, reintenta hasta max_tries.
-  Impacto: elimina falsos "AT_N1" o "HOLD" reportados por
-  glitches en la línea MISO durante pruebas.
+  (sin cambios respecto a v2)
 
 ─── Fix P2: _poll_fpga suspende durante ventana de expiración ─
-  La versión anterior enviaba CMD_PING a 20 Hz durante toda la
-  operación. Esto creaba una race condition en el FPGA (Bug F1
-  del Verilog): si el CMD_PING llegaba exactamente cuando
-  dur_cnt==1, spi_new tenía prioridad sobre timer_done y la SM
-  quedaba atascada en TO_N1/LIFTING/etc. para siempre.
-  Con el Verilog v2 (timer_fired flag) esa race está resuelta
-  en hardware. Este fix P2 es una capa defensiva adicional:
-  cuando el nodo sabe que el FPGA está en una transición con
-  timer conocido, reduce el poll rate al 10% del normal durante
-  los últimos POLL_SILENCE_MS ms antes de la expiración esperada.
-  Esto hace la probabilidad de coincidencia prácticamente cero
-  incluso con Verilog v1 si fuera necesario un rollback.
+  (sin cambios respecto a v2)
 
 ─── Fix P3: send_cmd documenta que MISO = estado PREVIO ───────
-  El FPGA carga miso_sr en cs_fall (antes de decodificar el cmd).
-  send_cmd() ya no usa el valor de retorno para inferir el
-  estado post-comando; solo lo registra en el log con la
-  etiqueta "(pre-cmd)".
+  (sin cambios respecto a v2)
+
+─── Fix P5: retry con timeout en _cb_auto ─────────────────────
+  Después de enviar un comando auto (n1/n2/hold/down), se lanza
+  un hilo de retry (_start_retry_watch) que:
+    - Cada RETRY_INTERVAL_S (200 ms), si _confirmed_state no ha
+      llegado al estado destino, reenvía el mismo comando al FPGA.
+    - Si tras RETRY_TIMEOUT_S (1 s) el estado destino no se
+      confirma, publica /lift_done "<label>_TIMEOUT" y loguea WARN
+      para no bloquear el pipeline aguas arriba.
+    - El retry termina limpiamente en cuanto el poll confirma el
+      estado destino (camino normal).
+    - Si llega un nuevo comando a _cb_auto, el retry anterior se
+      cancela antes de lanzar el nuevo.
+  El FPGA y el Verilog no se modifican — los safeties son
+  enteramente en software.
 
 ─── sm_state devuelto en MISO ─────────────────────────────────
   0=IDLE   1=MAN_UP   2=MAN_DOWN
@@ -43,8 +38,9 @@ El 'done' se detecta cuando sm_state cambia a un estado estable.
 
 ─── /lift_done publica cuando FPGA transiciona a estado estable ─
   "AT_N1" | "AT_N2" | "HOLD" | "DOWN" | "MANUAL_DONE"
+  "<label>_TIMEOUT" si el retry agota 1 s sin confirmación.
 
-─── Protocolo SPI ─────────────────────────────────────────────
+─── Protocolo SPI (sin cambios) ───────────────────────────────
   TX [0xAC][cmd][0x00]  RX [sm_state_prev][0x00][0x00]
   CMD_PING 0xFF = solo leer estado, sin cambiar nada
   MISO byte 0 = estado ANTES de procesar el comando actual
@@ -62,6 +58,7 @@ El 'done' se detecta cuando sm_state cambia a un estado estable.
 
 import sys
 import time
+import threading
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Int8, Int16MultiArray
@@ -136,6 +133,10 @@ KEEPALIVE_PERIOD     = 0.05
 POLL_SILENCE_MS      = 120   # ms antes del fin del timer
 POLL_SILENCE_PERIOD  = 0.5   # segundos entre polls en modo silencioso
 
+# Fix P5: retry de comando auto hasta confirmar done
+RETRY_INTERVAL_S = 0.20   # reenviar cmd cada 200 ms si no hay confirmación
+RETRY_TIMEOUT_S  = 1.0    # publicar TIMEOUT y rendirse tras 1 s
+
 
 class SpiServoNode(Node):
 
@@ -162,6 +163,10 @@ class SpiServoNode(Node):
         # Fix P2: timestamp de inicio de la última transición con timer
         self._transition_start = None
         self._transition_dur   = None
+
+        # Fix P5: retry de comando auto
+        self._retry_stop_event: threading.Event | None = None
+        self._retry_thread:     threading.Thread | None = None
 
         if SPIDEV_AVAILABLE:
             try:
@@ -206,11 +211,13 @@ class SpiServoNode(Node):
         self.create_timer(1.0 / poll_rate,    self._poll_fpga)
 
         self.get_logger().info(
-            'spi_servo_node v2 activo ✓\n'
+            'spi_servo_node v3 activo ✓\n'
             '  fixes: anti-glitch MISO, poll silence, timer_fired (FPGA v2)\n'
+            '         retry+timeout en _cb_auto (P5)\n'
             '  ros2 topic echo /lift_done    ← coordinar otros nodos\n'
             '  ros2 topic echo /lift_state   ← estado FPGA en tiempo real\n'
-            '  Transiciones: IDLE→n1/n2 | AT_N1/AT_N2→hold | HOLD→down'
+            '  Transiciones: IDLE→n1/n2 | AT_N1/AT_N2→hold | HOLD→down\n'
+            f'  Retry: cada {RETRY_INTERVAL_S*1000:.0f}ms, timeout {RETRY_TIMEOUT_S:.1f}s'
         )
 
     # ── SPI ────────────────────────────────────────────────────────────────────
@@ -328,6 +335,80 @@ class SpiServoNode(Node):
             self._pub_done.publish(msg)
             self.get_logger().info(f'/lift_done: "{label}"')
 
+    # ── Fix P5: retry de comando auto ──────────────────────────────────────────
+
+    def _cancel_retry(self):
+        """Cancela el hilo de retry activo si existe y espera que termine."""
+        if self._retry_stop_event is not None:
+            self._retry_stop_event.set()
+        if self._retry_thread is not None and self._retry_thread.is_alive():
+            self._retry_thread.join(timeout=0.1)
+        self._retry_stop_event = None
+        self._retry_thread     = None
+
+    def _start_retry_watch(self, cmd: int, target_state: int, label: str):
+        """
+        Fix P5: lanza un hilo daemon que vigila que _confirmed_state
+        llegue a target_state dentro de RETRY_TIMEOUT_S.
+
+        Comportamiento:
+          - Cada RETRY_INTERVAL_S, si el estado destino no se confirmó,
+            reenvía cmd al FPGA (el FPGA es idempotente: un segundo
+            CMD_GO_HOLD desde SM_LIFTING es ignorado, pero si la SM
+            quedó en AT_N1/AT_N2 por algún glitch, el reenvío la mueve).
+          - En cuanto _confirmed_state == target_state el hilo termina
+            sin publicar nada (el poll normal ya publicó /lift_done).
+          - Si se agota RETRY_TIMEOUT_S, publica "<label>_TIMEOUT" en
+            /lift_done para desbloquear el pipeline y loguea WARN.
+          - _cancel_retry() permite abortar el hilo en cualquier momento
+            (por ejemplo, si llega un nuevo comando antes del timeout).
+        """
+        stop_ev = threading.Event()
+        self._retry_stop_event = stop_ev
+
+        def _watch():
+            t0             = time.monotonic()
+            retry_count    = 0
+            next_retry_at  = RETRY_INTERVAL_S   # próxima ventana de reenvío
+
+            while not stop_ev.is_set():
+                elapsed = time.monotonic() - t0
+
+                # Camino feliz: el poll ya confirmó el estado
+                if self._confirmed_state == target_state:
+                    self.get_logger().debug(
+                        f'[retry] "{label}" confirmado por poll '
+                        f'tras {elapsed:.2f}s ({retry_count} reenvío(s))'
+                    )
+                    return
+
+                # Timeout: publicar señal de fallo y salir
+                if elapsed >= RETRY_TIMEOUT_S:
+                    timeout_label = f'{label}_TIMEOUT'
+                    self.get_logger().warn(
+                        f'[retry] TIMEOUT esperando "{label}" tras '
+                        f'{RETRY_TIMEOUT_S:.1f}s ({retry_count} reenvío(s)). '
+                        f'Publicando "{timeout_label}".'
+                    )
+                    msg = String(); msg.data = timeout_label
+                    self._pub_done.publish(msg)
+                    return
+
+                # Reenviar comando si llegamos al intervalo
+                if elapsed >= next_retry_at:
+                    retry_count   += 1
+                    next_retry_at += RETRY_INTERVAL_S
+                    self.get_logger().warn(
+                        f'[retry] "{label}" sin confirmar tras {elapsed:.2f}s '
+                        f'— reenviando cmd 0x{cmd:02X} (reenvío #{retry_count})'
+                    )
+                    self.send_cmd(cmd, repeats=3)
+
+                time.sleep(0.05)   # resolución de chequeo: 50 ms
+
+        self._retry_thread = threading.Thread(target=_watch, daemon=True, name='lift_retry')
+        self._retry_thread.start()
+
     # ── Callbacks ──────────────────────────────────────────────────────────────
 
     def _cb_trigger(self, msg: Int8):
@@ -353,6 +434,18 @@ class SpiServoNode(Node):
             'n2':   CMD_GO_N2,
             'hold': CMD_GO_HOLD,
             'down': CMD_GO_DOWN,
+        }
+        target_state_map = {   # Fix P5: estado FPGA que confirma el done
+            'n1':   4,   # AT_N1
+            'n2':   6,   # AT_N2
+            'hold': 8,   # HOLD
+            'down': 0,   # IDLE
+        }
+        done_label_map = {     # Fix P5: etiqueta para TIMEOUT si aplica
+            'n1':   'AT_N1',
+            'n2':   'AT_N2',
+            'hold': 'HOLD',
+            'down': 'DOWN',
         }
 
         key = msg.data.strip().lower()
@@ -386,10 +479,12 @@ class SpiServoNode(Node):
             )
             return
 
+        # Fix P5: cancelar retry previo si existía (comando llegó antes del done)
+        self._cancel_retry()
+
         self.send_cmd(cmd_map[key], 3)
 
         # Fix P2: registrar inicio de transición para gestión de silencio
-        # El estado destino es el estado transitorio (no estable)
         transitioning_to = {
             'n1':   3,   # TO_N1
             'n2':   5,   # TO_N2
@@ -397,6 +492,13 @@ class SpiServoNode(Node):
             'down': 9,   # LOWERING
         }
         self._record_transition_start(transitioning_to[key])
+
+        # Fix P5: lanzar watcher de retry/timeout
+        self._start_retry_watch(
+            cmd          = cmd_map[key],
+            target_state = target_state_map[key],
+            label        = done_label_map[key],
+        )
 
     # ── Publicación continua ────────────────────────────────────────────────────
 
@@ -422,6 +524,7 @@ class SpiServoNode(Node):
             return 0, 0
 
     def destroy_node(self):
+        self._cancel_retry()   # Fix P5: limpiar hilo de retry antes de salir
         self.send_cmd(CMD_STOP, 5)
         if self._spi:
             try: self._spi.close()
