@@ -38,8 +38,8 @@ class QRZoneChecker(Node):
 
         # Subs
         self.create_subscription(Odometry, '/odom',         self.odom_callback,     10)
-        self.create_subscription(Float32,  '/qr/distance',  self.distance_callback, 10)
-        self.create_subscription(Float32,  '/qr/angle',     self.angle_callback,    10)
+        self.create_subscription(Float32,  '/aruco/qr/distance',  self.distance_callback, 10)
+        self.create_subscription(Float32,  '/aruco/qr/angle',     self.angle_callback,    10)
 
         # Pubs
         self.pub_trigger   = self.create_publisher(String,       '/collect/trigger', 10)
