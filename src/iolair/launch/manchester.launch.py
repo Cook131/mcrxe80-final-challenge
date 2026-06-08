@@ -149,7 +149,7 @@ def generate_launch_description():
             'odom_topic':         '/odom',
             'goal_in_topic':      '/astar/goal',
             'goal_out_topic':     '/goal',
-            'inflation_radius':   0.2,
+            'inflation_radius':   0.25,
             'waypoint_threshold': 0.10,
             'occupied_threshold': 50,
             'allow_diagonal':     False,
@@ -165,7 +165,7 @@ def generate_launch_description():
     )
 
     vfh_node = Node(
-        package    = 'iolair',
+        package    = 'Navigation',
         executable = 'vfh_plus',
         name       = 'vfh_plus',
         output     = 'screen',

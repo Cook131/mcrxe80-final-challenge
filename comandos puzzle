@@ -7,7 +7,6 @@ ros2 launch puzzlebot_ros micro_ros_agent.launch.py
 
 
 cd iolair_ws
-
 python3 camera.py
 
 

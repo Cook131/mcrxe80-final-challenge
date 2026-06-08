@@ -6,7 +6,9 @@ Asume que la cámara ya está corriendo en /camera_raw/compressed.
 
 Nodos levantados:
   aruco_detector_node  — detección ArUco + QR  (suscribe /camera_raw/compressed)
-  qr_collect_node      — FSM alignment QR
+  qr_align_node        — FSM alignment QR (v7)
+  qr_zone_checker      — chequeo de zona QR
+  qr_detector          — detección QR
 
 Uso:
   ros2 launch iolair qr_align_tryout.launch.py zone:=rack
@@ -27,18 +29,12 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-
 def generate_launch_description():
 
-    # ── ArUco Detector ────────────────────────────────────────────────────────
-    # Suscribe /camera_raw/compressed directamente — sin remap necesario.
-
-    # ── QRCollectNode ─────────────────────────────────────────────────────────
-    
-        # ── Package share directories ──────────────────────────────────────────
+    # ── Package share directories ──────────────────────────────────────────
     iolair_dir = get_package_share_directory('iolair')
 
-    # ── Launch arguments ───────────────────────────────────────────────────
+    # ── Launch arguments ──────────────────────────────────────────────────
     map_yaml_arg = DeclareLaunchArgument(
         'map_yaml',
         default_value=os.path.join(iolair_dir, 'maps', 'SLAM_map.yaml'),
@@ -47,33 +43,15 @@ def generate_launch_description():
     map_yaml = LaunchConfiguration('map_yaml')
     landmarks_yaml_file = os.path.join(iolair_dir, 'configs', 'aruco_landmarks.yaml')
 
+    # ── 1. QR Align — FSM de alineación (v7, parámetros internos) ─────────
     qr_align = Node(
         package    = 'Navigation',
         executable = 'qr_align_node',
         name       = 'qr_align_node',
         output     = 'screen',
-        parameters = [{
-            'kp_angle'             : 0.018,
-            'kd_angle'             : 0.004,
-            'kp_dist'              : 0.40,
-            'kd_dist'              : 0.08,
-            'angle_tol_deg'        : 4.0,
-            'approach_dist'        : 0.28,
-            'approach_handoff_dist': 0.80,
-            'dist_tol'             : 0.02,
-            'max_angular'          : 0.45,
-            'max_linear'           : 0.18,
-            'extract_speed'        : 0.08,
-            'extract_time'         : 0.6,
-            'reverse_speed'        : 0.10,
-            'reverse_time'         : 1.8,
-            'qr_timeout'           : 2.5,
-            'lift_timeout'         : 8.0,
-            'nav_approach_timeout' : 30.0,
-            'fsm_rate_hz'          : 20.0,
-        }],
     )
 
+    # ── 2. QR Zone Checker ────────────────────────────────────────────────
     qr_zone_checker = Node(
         package    = 'Vision',
         executable = 'qr_zone_checker',
@@ -81,6 +59,7 @@ def generate_launch_description():
         output     = 'screen',
     )
 
+    # ── 3. ArUco Detector ─────────────────────────────────────────────────
     aruco_detector_node = Node(
         package='Vision',
         executable='aruco_detector',
@@ -88,7 +67,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 2. Odometry (EKF) — wheel encoders + ArUco EKF fusion ─────────────
+    # ── 4. Odometry (EKF) — wheel encoders + ArUco EKF fusion ─────────────
     odometry_node = Node(
         package='iolair',
         executable='odometry',
@@ -102,7 +81,7 @@ def generate_launch_description():
         }]
     )
 
-    # ── 3. ArUco Localizer — landmark-anchoring correction for the EKF ─────
+    # ── 5. ArUco Localizer — landmark-anchoring correction for the EKF ────
     aruco_localizer_node = Node(
         package='LocalizationMapping',
         executable='aruco_localizer',
@@ -123,7 +102,7 @@ def generate_launch_description():
         }]
     )
 
-    # ── 4. ArUco Map Publisher — landmark markers for RViz ─────────────────
+    # ── 6. ArUco Map Publisher — landmark markers for RViz ────────────────
     aruco_map_node = Node(
         package='LocalizationMapping',
         executable='aruco_map_publisher',
@@ -137,10 +116,7 @@ def generate_launch_description():
         }]
     )
 
-    # ── 5. A* Planner — global path planner on occupancy grid ──────────────
-    # inflation_radius: half-width (0.11) + 10cm clearance = 0.21m
-    # Reduced from 0.35 — that value blocked navigable passages narrower than
-    # 70cm, which is overkill for a 22cm-wide robot.
+    # ── 7. A* Planner — global path planner on occupancy grid ─────────────
     astar_planner_node = Node(
         package='Navigation',
         executable='astar_planner',
@@ -159,18 +135,15 @@ def generate_launch_description():
         }]
     )
 
-    # ── 6. Go-to-Goal — drives the robot toward each A* waypoint ───────────
+    # ── 8. Go-to-Goal — publica en /cmd_raw por defecto ───────────────────
     go_to_goal_node = Node(
         package='iolair',
         executable='go_to_goal',
         name='puzzlebot_go_to_goal',
         output='screen',
-        remappings=[
-            ('/cmd_vel', '/cmd_raw'),   # VFH+ filtra /cmd_raw → /cmd_vel
-        ],
     )
 
-    # ── 8. Controller — PID wheel velocity controller ──────────────────────
+    # ── 9. Controller — PID wheel velocity controller ──────────────────────
     controller_node = Node(
         package='iolair',
         executable='controller',
@@ -178,7 +151,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 9. Map Server — serves the pre-built SLAM map as /map ──────────────
+    # ── 10. Map Server — serves the pre-built SLAM map as /map ────────────
     map_server_node = Node(
         package='nav2_map_server',
         executable='map_server',
@@ -187,7 +160,7 @@ def generate_launch_description():
         parameters=[{'yaml_filename': map_yaml}]
     )
 
-    # ── 10. Nav2 Lifecycle Manager — auto-activates map_server ─────────────
+    # ── 11. Nav2 Lifecycle Manager — auto-activates map_server ────────────
     lifecycle_manager_node = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
@@ -199,6 +172,7 @@ def generate_launch_description():
         ]
     )
 
+    # ── 12. RViz Goal Bridge ───────────────────────────────────────────────
     rviz_goal_bridge_node = Node(
         package='Navigation',
         executable='rviz_goal_bridge',
@@ -206,6 +180,7 @@ def generate_launch_description():
         output='screen',
     )
 
+    # ── 13. MCL — Monte Carlo Localization ────────────────────────────────
     mcl_node = Node(
         package='LocalizationMapping',
         executable='mcl',
@@ -218,13 +193,14 @@ def generate_launch_description():
             'map_frame':        'map',
             'odom_frame':       'odom',
             'base_frame':       'base_link',
-            'pose_ema_alpha':     0.25,   # 0.25 si aún hay jitter, 0.5 si responde lento
+            'pose_ema_alpha':     0.25,
             'beam_skip':          10,
             'sigma_hit':          0.38,
             'resample_interval':  3,
         }]
     )
 
+    # ── 14. SLAM ───────────────────────────────────────────────────────────
     slam_node = Node(
         package='LocalizationMapping',
         executable='slam',
@@ -254,11 +230,10 @@ def generate_launch_description():
         }]
     )
 
-
-    # ── 11. VFH+ — capa de evasión (bypass activo durante qr_align) ────────
+    # ── 15. VFH+ — capa de evasión ────────────────────────────────────────
     # go_to_goal publica en /cmd_raw → vfh_plus filtra → /cmd_vel
-    # Durante ALIGN/ADVANCE/EXTRACT qr_align publica /align/active=True
-    # y vfh_plus cede el control directo sin tocar cmd_raw.
+    # Durante alineación qr_align publica /align/active=True
+    # y vfh_plus cede el control directo.
     vfh_plus_node = Node(
         package='Navigation',
         executable='vfh_plus',
@@ -279,35 +254,30 @@ def generate_launch_description():
             'kp_heading'        : 2.00,
             'lidar_yaw_offset'  : 3.14159,
         }],
-        remappings=[
-            ('/cmd_raw', '/cmd_raw'),   # recibe de go_to_goal
-            ('/cmd_vel', '/cmd_vel'),   # publica al controller
-        ],
     )
 
+    # ── 16. QR Detector ───────────────────────────────────────────────────
     qr_detector = Node(
         package='Vision',
         executable='qr_detector',
         name='qr_detector',
         output='screen',
     )
-    
 
     return LaunchDescription([
-        qr_align,
-        qr_zone_checker,
         map_yaml_arg,
 
-        # Map infrastructure (start first — map_server must be active before
-        # A* planner tries to subscribe to /map)
+        # Map infrastructure (primero — map_server debe estar activo
+        # antes de que A* intente suscribirse a /map)
         map_server_node,
         lifecycle_manager_node,
 
         # Perception
         aruco_detector_node,
+        qr_detector,
+        qr_zone_checker,
 
-        # State estimation — odometry must come before aruco_localizer so the
-        # /odom subscriber inside aruco_localizer finds the topic immediately
+        # State estimation
         odometry_node,
         aruco_localizer_node,
         mcl_node,
@@ -321,10 +291,12 @@ def generate_launch_description():
 
         # Navigation
         go_to_goal_node,
+        vfh_plus_node,
+
+        # QR alignment FSM
+        qr_align,
 
         # Actuation
         controller_node,
         rviz_goal_bridge_node,
-        vfh_plus_node,
-        qr_detector,
     ])
