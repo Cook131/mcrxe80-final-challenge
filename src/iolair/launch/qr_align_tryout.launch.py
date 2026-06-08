@@ -60,7 +60,7 @@ def generate_launch_description():
             'angle_tol_deg'        : 4.0,
             'approach_dist'        : 0.28,
             'approach_handoff_dist': 0.80,
-            'dist_tol'             : 0.03,
+            'dist_tol'             : 0.02,
             'max_angular'          : 0.45,
             'max_linear'           : 0.18,
             'extract_speed'        : 0.08,
@@ -260,7 +260,7 @@ def generate_launch_description():
     # Durante ALIGN/ADVANCE/EXTRACT qr_align publica /align/active=True
     # y vfh_plus cede el control directo sin tocar cmd_raw.
     vfh_plus_node = Node(
-        package='iolair',
+        package='Navigation',
         executable='vfh_plus',
         name='vfh_plus',
         output='screen',
@@ -285,10 +285,18 @@ def generate_launch_description():
         ],
     )
 
+    qr_detector = Node(
+        package='Vision',
+        executable='qr_detector',
+        name='qr_detector',
+        output='screen',
+    )
+    
+
     return LaunchDescription([
         qr_align,
         qr_zone_checker,
-                map_yaml_arg,
+        map_yaml_arg,
 
         # Map infrastructure (start first — map_server must be active before
         # A* planner tries to subscribe to /map)
@@ -318,4 +326,5 @@ def generate_launch_description():
         controller_node,
         rviz_goal_bridge_node,
         vfh_plus_node,
+        qr_detector,
     ])

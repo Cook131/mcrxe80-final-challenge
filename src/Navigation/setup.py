@@ -38,7 +38,7 @@ setup(
             'mission_planner  = Navigation.mission_planner:main',
             'mission_manager  = Navigation.mission_manager:main',
             'vfh_plus         = Navigation.vfh_plus:main',
-            'qr_aligner       = Navigation.qr_aligner_node:main',
+            'qr_align_node       = Navigation.qr_aligner_node:main',
         ],
     },
 )
