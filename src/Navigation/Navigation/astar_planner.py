@@ -20,7 +20,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from geometry_msgs.msg import Pose2D, PoseStamped, Pose, Point, Quaternion
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 
 
 # ── Helpers de quaternión ─────────────────────────────────────────────────────
@@ -187,6 +187,7 @@ class AStarPlannerNode(Node):
         self.pub_wp     = self.create_publisher(Pose2D,  goal_out_topic, 10)
         self.pub_path   = self.create_publisher(Path,    '/astar/path',  10)
         self.pub_status = self.create_publisher(String,  '/astar/status', 10)
+        self.pub_goal_reached = self.create_publisher(Bool, '/goal_reached', 10)
 
         # ── Timers de Control y Descubrimiento Continúo ─────────────────────
         self.create_timer(0.1, self._control_loop)
@@ -371,6 +372,9 @@ class AStarPlannerNode(Node):
                 self.active = False
                 self._set_status('GOAL_REACHED')
                 self.get_logger().info('[A*] ✅ Objetivo alcanzado.')
+                reached_msg = Bool()
+                reached_msg.data = True
+                self.pub_goal_reached.publish(reached_msg)
                 return
             wx, wy = self.waypoints[0]
             self.get_logger().info(f'[A*] Waypoint alcanzado → siguiente ({wx:.2f}, {wy:.2f})')

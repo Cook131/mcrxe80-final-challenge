@@ -18,7 +18,7 @@ Uso:
 # =============================================================
 # CONFIGURACION — edita solo este bloque
 # =============================================================
-WEIGHTS      = "src/Vision/weights/best.pt"
+WEIGHTS      = "src/Vision/Vision/best.pt"
 CAMERA_TOPIC = "/camera_raw/compressed"
 CONF         = 0.65
 DEVICE       = "0"                     # "0" = GPU, "cpu" = CPU

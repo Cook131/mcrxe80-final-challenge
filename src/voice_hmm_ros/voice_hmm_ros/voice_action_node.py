@@ -14,7 +14,8 @@ Descripción:
         3. Selección de dispositivo de audio (--device) para sounddevice.
         4. threading.Lock() para proteger _active_twist y _active_until
            contra race conditions entre el hilo de voz y el timer de ROS.
-        5. cmd_duration restaurado a 1.5 s (era 50 por error).
+        5. Secuencia de hold automático integrada para "toma" (n1) y "arriba" (n2).
+        6. Ejecución continua (auto-loop) por defecto con paths preconfigurados.
 
 ================================================================================
 """
@@ -147,10 +148,6 @@ def predict_from_signal(
 class VoiceActionNode(Node):
     """
     Nodo integrado de voz + acción.
-
-    No recibe comandos desde tópicos.
-    No escucha feedback del lifter.
-    La entrada de voz viene directamente del micrófono.
     """
 
     def __init__(
@@ -171,10 +168,10 @@ class VoiceActionNode(Node):
         # Parámetros configurables de movimiento
         # ============================================================
 
-        self.declare_parameter("linear_speed",  0.22)
-        self.declare_parameter("angular_speed", 0.40)
-        self.declare_parameter("spin_speed",    0.60)
-        self.declare_parameter("cmd_duration",  15.0)   # FIX: era 50 por error
+        self.declare_parameter("linear_speed",  1.0)
+        self.declare_parameter("angular_speed", 1.0)
+        self.declare_parameter("spin_speed",    0.6)
+        self.declare_parameter("cmd_duration",  3.0)
         self.declare_parameter("hold_delay",    1.20)
 
         self._v_lin        = float(self.get_parameter("linear_speed").value)
@@ -210,9 +207,9 @@ class VoiceActionNode(Node):
 
         if self._cmd_duration <= 0.0:
             self.get_logger().warning(
-                "cmd_duration <= 0.0; usando 1.5 s por seguridad."
+                "cmd_duration <= 0.0; usando 2.0 s por seguridad."
             )
-            self._cmd_duration = 1.5
+            self._cmd_duration = 2.0
 
         # Duración de giro 360°: θ = ω·t  →  t = 2π / ω
         self._spin_360_duration: float = (2.0 * math.pi) / self._w_spin
@@ -245,11 +242,9 @@ class VoiceActionNode(Node):
 
         # ============================================================
         # Estado interno — base móvil
-        # FIX: protegido con _state_lock para evitar race conditions
-        #      entre el hilo de voz y el timer de ROS.
         # ============================================================
 
-        self._state_lock   = threading.Lock()   # <-- NUEVO
+        self._state_lock   = threading.Lock()
         self._active_twist = Twist()
         self._active_until = 0.0
 
@@ -274,7 +269,7 @@ class VoiceActionNode(Node):
         self._pub_lift_auto    = self.create_publisher(String, "/lift_auto",      10)
         self._pub_lift_trigger = self.create_publisher(Int8,   "/lift_trigger",   10)
 
-        # Timer a 20 Hz: publica /cmd_vel siempre, aplica auto-stop y secuencia n1→hold.
+        # Timer a 20 Hz
         self.create_timer(0.05, self._timer_loop)
 
         self._running = True
@@ -295,7 +290,8 @@ class VoiceActionNode(Node):
             f"w_spin={self._w_spin:.2f} rad/s | "
             f"dur_base={self._cmd_duration:.2f} s | "
             f"dur_360={self._spin_360_duration:.2f} s\n"
-            f"  Lifter: toma = n1 -> espera {self._hold_delay:.2f} s -> hold"
+            f"  Lifter: toma/arriba -> espera {self._hold_delay:.2f} s -> hold\n"
+            f"  Modo: {'Continuo (Auto-loop)' if self.auto_loop else 'Interactivo'}"
         )
 
     # ============================================================
@@ -303,12 +299,6 @@ class VoiceActionNode(Node):
     # ============================================================
 
     def _voice_input_loop(self) -> None:
-        """
-        Loop en hilo separado para no bloquear rclpy.spin().
-
-        Modo normal:    ENTER -> graba -> predice -> ejecuta
-        Modo auto-loop: graba continuamente con pausas cortas.
-        """
         while self._running and rclpy.ok():
             try:
                 if not self.auto_loop:
@@ -322,7 +312,7 @@ class VoiceActionNode(Node):
             except EOFError:
                 self.get_logger().warning(
                     "No hay entrada interactiva disponible. "
-                    "Usa una terminal interactiva o ejecuta con --auto-loop."
+                    "Usa una terminal interactiva o ejecuta en modo auto-loop."
                 )
                 break
             except KeyboardInterrupt:
@@ -332,7 +322,6 @@ class VoiceActionNode(Node):
                 time.sleep(0.5)
 
     def record_predict_and_execute(self) -> None:
-        """Graba audio, predice el comando y ejecuta la acción internamente."""
         self.get_logger().info(f"Grabando {self.duration:.1f} s. Habla ahora.")
 
         n_samples = int(self.duration * self.samplerate)
@@ -381,27 +370,22 @@ class VoiceActionNode(Node):
 
         self.get_logger().info(f'Procesando comando: "{command}"')
 
-        # Comando vacío o desconocido → paro seguro general
         if not command or command == CMD_UNKNOWN:
             self._stop_all("Comando desconocido o vacío: paro seguro.")
             return
 
-        # Stop general (detente)
         if command in CMD_STOP:
             self._stop_all(f'Paro general por comando "{command}".')
             return
 
-        # Lifter (arriba / abajo / toma / suelta)
         if self._handle_lift_command(command):
             return
 
-        # Base (avanza / atras / izquierda / derecha / gira)
         twist, duration = self._build_base_action(command)
         if twist is None:
             self._stop_all(f'Comando sin mapeo: "{command}". Paro seguro.')
             return
 
-        # FIX: escritura protegida con lock
         with self._state_lock:
             self._active_twist = twist
             self._active_until = time.monotonic() + duration
@@ -420,29 +404,27 @@ class VoiceActionNode(Node):
     def _timer_loop(self) -> None:
         now = time.monotonic()
 
-        # FIX: lectura y escritura del estado protegidas con lock
         with self._state_lock:
             if self._active_until > 0.0 and now >= self._active_until:
-                self._active_twist = Twist()   # volver a ceros
+                self._active_twist = Twist()
                 self._active_until = 0.0
                 self.get_logger().info("Auto-stop: duración de base completada.")
 
-            twist_to_publish = self._active_twist  # copia local para publicar fuera del lock
+            twist_to_publish = self._active_twist
 
-        # Publicar SIEMPRE a 20 Hz (watchdog) — fuera del lock
         self._pub_cmd_vel.publish(twist_to_publish)
 
-        # --- Secuencia temporizada de lift: toma = n1 -> hold ---
+        # --- Secuencia temporizada de lift: n1 o n2 -> hold ---
         if (
             self._pending_lift_action == "SEND_HOLD_AFTER_DELAY"
             and self._lift_sequence_start > 0.0
             and (now - self._lift_sequence_start) >= self._hold_delay
         ):
             self.get_logger().info(
-                f'Secuencia "toma": espera de {self._hold_delay:.2f} s completada '
+                f'Secuencia auto-hold: espera de {self._hold_delay:.2f} s completada '
                 '→ enviando "hold".'
             )
-            self._send_lift_auto("hold", "toma/hold")
+            self._send_lift_auto("hold", "secuencia/hold")
             self._pending_lift_action = None
             self._lift_sequence_start = 0.0
 
@@ -451,31 +433,20 @@ class VoiceActionNode(Node):
     # ============================================================
 
     def _build_base_action(self, command: str) -> tuple[Optional[Twist], float]:
-        """
-        Construye el Twist y la duración para los comandos de base.
-
-        Para "gira" calcula la duración de una vuelta completa:
-            t = 2π / spin_speed
-        """
         twist    = Twist()
         duration = self._cmd_duration
 
         if command in CMD_ADELANTE:
             twist.linear.x = self._v_lin
-
         elif command in CMD_ATRAS:
             twist.linear.x = -self._v_lin
-
         elif command in CMD_IZQUIERDA:
             twist.angular.z = self._w_ang
-
         elif command in CMD_DERECHA:
             twist.angular.z = -self._w_ang
-
         elif command in CMD_GIRA:
             twist.angular.z = self._w_spin
-            duration = self._spin_360_duration   # 2π / spin_speed
-
+            duration = self._spin_360_duration
         else:
             return None, 0.0
 
@@ -488,17 +459,15 @@ class VoiceActionNode(Node):
     def _handle_lift_command(self, command: str) -> bool:
         """
         Ejecuta comandos del lifter.
-
-        Mapeo:
-            arriba → n2
-            abajo  → down
-            suelta → down
-            toma   → n1, luego hold por tiempo configurable
         """
         if command in CMD_LIFT_N2:
-            self._pending_lift_action = None
-            self._lift_sequence_start = 0.0
+            self._pending_lift_action = "SEND_HOLD_AFTER_DELAY"
+            self._lift_sequence_start = time.monotonic()
             self._send_lift_auto("n2", command)
+            self.get_logger().info(
+                f'Secuencia "arriba": se mandó "n2". '
+                f'Se mandará "hold" en {self._hold_delay:.2f} s.'
+            )
             return True
 
         if command in CMD_LIFT_DOWN:
@@ -520,17 +489,12 @@ class VoiceActionNode(Node):
         return False
 
     def _send_lift_auto(self, lift_cmd: str, source_word: str) -> None:
-        """Publica un comando en /lift_auto para spi_servo_node."""
         msg = String()
         msg.data = lift_cmd
         self._pub_lift_auto.publish(msg)
         self.get_logger().info(f'"{source_word}" → /lift_auto: "{lift_cmd}"')
 
     def _stop_lifter(self) -> None:
-        """
-        Para el lifter de forma manual usando /lift_trigger = 0.
-        spi_servo_node interpreta Int8(0) como CMD_STOP.
-        """
         self._pending_lift_action = None
         self._lift_sequence_start = 0.0
 
@@ -544,7 +508,6 @@ class VoiceActionNode(Node):
     # ============================================================
 
     def _stop_base(self, reason: Optional[str] = None) -> None:
-        """Detiene la base y cancela el temporizador de movimiento."""
         with self._state_lock:
             self._active_twist = Twist()
             self._active_until = 0.0
@@ -552,14 +515,12 @@ class VoiceActionNode(Node):
             self.get_logger().info(reason)
 
     def _stop_all(self, reason: Optional[str] = None) -> None:
-        """Paro de emergencia: detiene base y lifter."""
         self._stop_base()
         self._stop_lifter()
         if reason:
             self.get_logger().info(reason)
 
     def shutdown(self) -> None:
-        """Cierre seguro del nodo."""
         self._running = False
         self._stop_all("Cierre seguro: base y lifter detenidos.")
 
@@ -570,14 +531,18 @@ class VoiceActionNode(Node):
 
 def main(args: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser()
+    
+    # Rutas por defecto preconfiguradas
     parser.add_argument(
         "--model-dir",
-        required=True,
+        type=str,
+        default="src/voice_hmm_ros/voice_hmm_ros/resultados_hmm_bw_tol05/models",
         help="Ruta a la carpeta con los .npz de los HMM.",
     )
     parser.add_argument(
         "--codebook-path",
-        required=True,
+        type=str,
+        default="src/voice_hmm_ros/voice_hmm_ros/resultados_hmm_bw_tol05/codebook.npy",
         help="Ruta al archivo codebook.npy.",
     )
     parser.add_argument(
@@ -595,13 +560,14 @@ def main(args: Optional[list[str]] = None) -> None:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.0,
-        help="Umbral opcional de confianza basado en gap entre top-1 y top-2.",
+        default=70.0,
+        help="Umbral opcional de confianza basado en gap ent    re top-1 y top-2.",
     )
+    # auto-loop activado por defecto. --interactive pide usar ENTER manualmente.
     parser.add_argument(
-        "--auto-loop",
-        action="store_true",
-        help="Graba continuamente sin pedir ENTER.",
+        "--interactive",
+        action="store_false",
+        help="Desactiva el auto-loop continuo y pide presionar ENTER para cada comando.",
     )
     parser.add_argument(
         "--device",
@@ -620,7 +586,7 @@ def main(args: Optional[list[str]] = None) -> None:
         duration=parsed_args.duration,
         samplerate=parsed_args.samplerate,
         threshold=parsed_args.threshold,
-        auto_loop=parsed_args.auto_loop,
+        auto_loop=not parsed_args.interactive,
         device=parsed_args.device,
     )
 

@@ -45,7 +45,7 @@ def generate_launch_description():
 
     # ── 1. QR Align — FSM de alineación (v7, parámetros internos) ─────────
     qr_align = Node(
-        package    = 'Navigation',
+        package    = 'Vision',
         executable = 'qr_align_node',
         name       = 'qr_align_node',
         output     = 'screen',
@@ -89,8 +89,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'landmarks_file':   landmarks_yaml_file,
-            'camera_to_base_x': 0.07,
-            'camera_to_base_y': 0.08,
+            'camera_to_base_x': -0.07,
+            'camera_to_base_y': -0.08,
             'camera_to_base_z': 0.15,
             'anchor_min_dist':  0.2,
             'anchor_max_dist':  3.50,
@@ -128,7 +128,7 @@ def generate_launch_description():
             'odom_topic':         '/odom',
             'goal_in_topic':      '/astar/goal',
             'goal_out_topic':     '/goal',
-            'inflation_radius':   0.2,
+            'inflation_radius':   0.22,
             'waypoint_threshold': 0.10,
             'occupied_threshold': 50,
             'allow_diagonal':     False,
@@ -241,7 +241,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'robot_radius_m'    : 0.18,
-            'safety_margin_m'   : 0.10,
+            'safety_margin_m'   : 0.08,
             'warn_dist'         : 0.65,
             'emergency_dist'    : 0.35,
             'stop_dist'         : 0.14,
