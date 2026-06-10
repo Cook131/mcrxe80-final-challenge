@@ -153,7 +153,7 @@ class SensorSnapshot:
     lift_done:          str   = ''
     lift_state:         str   = ''
     reflex_status:      str   = 'PASS'
-    truck_align_result: str   = ''
+    truck_align_done:   str   = ''
     truck_align_status: str   = 'IDLE'   # IDLE/SCAN/ALIGN/DONE — heartbeat del nodo
     robot_x:            float = 0.0
     robot_y:            float = 0.0
@@ -349,7 +349,7 @@ class MissionManagerNode(Node):
         self.create_subscription(String,       '/reflex_status',      self._cb_reflex,      10)
         self.create_subscription(OccupancyGrid,'/map',                self._cb_map,         transient)
         self.create_subscription(OccupancyGrid,'/slam_map',           self._cb_map,         10)
-        self.create_subscription(String,       '/truck_align/result', self._cb_truck_result,  10)
+        self.create_subscription(String,       '/truck_align/done', self._cb_truck_done,  10)
         self.create_subscription(String,       '/truck_align/status', self._cb_truck_status,  10)
         self.create_subscription(Bool,         '/emergency_stop',     self._cb_emergency_stop,10)
 
@@ -357,11 +357,12 @@ class MissionManagerNode(Node):
         self._pub_goal        = self.create_publisher(Pose2D,  '/astar/goal',       10)
         self._pub_cmd         = self.create_publisher(Twist,   '/cmd_vel',          10)
         self._pub_state       = self.create_publisher(String,  '/mission/state',    10)
-        self._pub_context     = self.create_publisher(String,  '/mission/context',  10)
-        self._pub_lift_auto   = self.create_publisher(String,  '/lift_auto',        10)
-        self._pub_recovery    = self.create_publisher(String,  '/recovery/active',  10)
-        self._pub_truck_cmd   = self.create_publisher(String,  '/truck_align/cmd',  10)
-        self._pub_astar_cancel= self.create_publisher(String,  '/astar/cancel',     10)
+        self._pub_context     = self.create_publisher(String,  '/mission/context',     10)
+        self._pub_lift_auto   = self.create_publisher(String,  '/lift_auto',           10)
+        self._pub_recovery    = self.create_publisher(String,  '/recovery/active',     10)
+        self._pub_truck_cmd   = self.create_publisher(String,  '/truck_align/cmd',     10)
+        self._pub_qr_payload  = self.create_publisher(String,  '/collect/qr_payload',  10)
+        self._pub_astar_cancel= self.create_publisher(String,  '/astar/cancel',        10)
 
         # ── Timer FSM ─────────────────────────────────────────────────────────
         self.create_timer(1.0 / self._fsm_rate, self._fsm_tick)
@@ -449,11 +450,11 @@ class MissionManagerNode(Node):
             self._sensors.map_ready = True
             self.get_logger().info('[Map] disponible')
 
-    def _cb_truck_result(self, msg: String):
+    def _cb_truck_done(self, msg: String):
         result = msg.data.strip()
         if result:
-            self.get_logger().info(f'[TruckAlign] result: "{result}"')
-        self._sensors.truck_align_result = result
+            self.get_logger().info(f'[TruckAlign] done: "{result}"')
+        self._sensors.truck_align_done = result
 
     def _cb_truck_status(self, msg: String):
         self._sensors.truck_align_status = msg.data.strip()
@@ -848,6 +849,13 @@ class MissionManagerNode(Node):
 
         if self._just_entered:
             self._goal_retries = 0
+            # Pre-cargar la clase YOLO en truck_aligener para que lo tenga listo
+            # al recibir el trigger, sin esperar la detección activa
+            if self._ctx.pallet_client:
+                self._pub_qr_payload.publish(String(data=self._ctx.pallet_client))
+                self.get_logger().info(
+                    f'[GO2GOAL] Pre-cargando QR payload "{self._ctx.pallet_client}" '
+                    f'→ /collect/qr_payload')
             self._send_goal(self._ctx.truck_goal_x, self._ctx.truck_goal_y)
             return
 
@@ -893,7 +901,7 @@ class MissionManagerNode(Node):
             cmd_msg = f'align:{self._ctx.pallet_client}'
             self.get_logger().info(f'[TRUCK_ALIGN] → truck_align_node: "{cmd_msg}"')
             self._pub_truck_cmd.publish(String(data=cmd_msg))
-            self._sensors.truck_align_result = ''
+            self._sensors.truck_align_done = ''
             self._truck_watchdog_idle_s = 0.0
             self._truck_watchdog_last_t = time.monotonic()
             return
@@ -915,22 +923,23 @@ class MissionManagerNode(Node):
             return
 
         # ── Procesar resultado ────────────────────────────────────────────
-        result = s.truck_align_result
+        result = s.truck_align_done
 
-        if result == 'ALIGNED':
-            self.get_logger().info('[TRUCK_ALIGN] Alineado ✓ → DROP_PALLET')
-            self._sensors.truck_align_result = ''
+        if result == 'SUCCESS':
+            self.get_logger().info('[TRUCK_ALIGN] Entrega confirmada ✓ → DROP_PALLET')
+            self._sensors.truck_align_done = ''
             self._recovery.reset(State.YOLO_RECOVERY)
             self._transition(State.DROP_PALLET)
 
-        elif result == 'FAILED':
-            self.get_logger().warning('[TRUCK_ALIGN] FAILED → YOLO_RECOVERY')
-            self._sensors.truck_align_result = ''
+        elif result == 'ABORT':
+            self.get_logger().warning('[TRUCK_ALIGN] ABORT → YOLO_RECOVERY')
+            self._sensors.truck_align_done = ''
             self._enter_recovery(State.YOLO_RECOVERY)
 
-        elif result == 'TIMEOUT':
-            self.get_logger().warning('[TRUCK_ALIGN] TIMEOUT → YOLO_RECOVERY')
-            self._sensors.truck_align_result = ''
+        elif result and result not in ('SUCCESS', 'ABORT'):
+            # Resultado inesperado — tratar como fallo
+            self.get_logger().warning(f'[TRUCK_ALIGN] resultado inesperado: "{result}" → YOLO_RECOVERY')
+            self._sensors.truck_align_done = ''
             self._enter_recovery(State.YOLO_RECOVERY)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1216,7 +1225,7 @@ class MissionManagerNode(Node):
                         and d.get('conf', 0) >= 0.50):
                     self._stop_robot()
                     self.get_logger().info('[YOLO_RECOVERY] Logo encontrado → TRUCK_ALIGN')
-                    self._sensors.truck_align_result = ''
+                    self._sensors.truck_align_done = ''
                     self._pub_truck_cmd.publish(
                         String(data=f'align:{self._ctx.pallet_client}'))
                     self._recovery.reset(State.YOLO_RECOVERY)
