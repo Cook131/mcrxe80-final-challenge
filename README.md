@@ -116,12 +116,20 @@ The mission manager implements a hierarchical FSM with 20 operational states org
 ```
 mcrxe80-final-challenge/
 ├── Camera Calibration/
+│   ├── calib_imgs/                   # Checkerboard calibration images
 │   ├── calibrar.py                   # Fisheye calibration script (Zhang's method)
 │   └── save_imgs.py                  # Calibration image capture
+│
+├── Tang20K/
+│   ├── slave_lift.v                  # Verilog FSM for Tang Nano 20K FPGA (dual servo PWM + SPI slave)
+│   └── lift.cst                      # Pin constraints file
 │
 ├── jetson/
 │   ├── spi_servo_node.py             # Jetson → Tang Nano 20K SPI bridge (lift driver)
 │   └── camera.py                     # Camera node for Jetson
+│
+├── rviz_bonito.rviz                  # RViz configuration for full-stack visualization
+├── comandos puzzle                   # Quick-reference startup commands (SSH, launch, rosbridge)
 │
 └── src/
     ├── iolair/                        # Base robot package (actuation + odometry)
@@ -149,6 +157,7 @@ mcrxe80-final-challenge/
     │   │   ├── goal_bridge.py           # RViz /clicked_point → /astar/goal bridge
     │   │   ├── mission_manager.py       # Hierarchical FSM (20 states, 4 recovery)
     │   │   ├── mission_planner.py       # Legacy YAML waypoint sequencer
+    │   │   ├── qr_aligner_node.py       # QR aligner (also registered here for Navigation launch)
     │   │   ├── truck_aligener.py        # 9-state truck delivery FSM (YOLO + geometry)
     │   │   └── vfh_plus.py              # VFH+ obstacle avoidance layer
     │   ├── configs/
@@ -166,7 +175,8 @@ mcrxe80-final-challenge/
     │   │   ├── qr_aligner_node.py       # FSM: visual alignment to pallet via QR
     │   │   ├── qr_zone_checker.py       # Conveyor vs rack zone classifier
     │   │   ├── truck_pos.py             # YOLO world-frame position with lateral offset
-    │   │   └── fisheye_params.npz       # Camera calibration (fisheye)
+    │   │   ├── fisheye_params.npz       # Camera calibration (fisheye, numpy format)
+    │   │   └── fisheye_params.json      # Camera calibration (fisheye, JSON format)
     │   └── setup.py
     │
     ├── LocalizationMapping/           # SLAM + localization
@@ -217,6 +227,7 @@ mcrxe80-final-challenge/
 | **vfh_plus** | `vfh_plus` | VFH+ obstacle avoidance layer sitting between GoToGoal (`/cmd_raw`) and the controller (`/cmd_vel`). Builds a polar obstacle histogram from `/scan`, steers through free sectors, and emits `PASS / BRAKE / VFH_STEER / REFLEX_STOP` on `/reflex_status`. Bypassed automatically during pallet alignment via `/align/active`. |
 | **mission_planner** | `mission_planner` | Legacy YAML waypoint sequencer. Reads `exploration_waypoints.yaml` and publishes goals to `/astar/goal` sequentially with configurable per-goal timeout. Used for pre-mission scouting or standalone waypoint demos. |
 | **goal_bridge** | `rviz_goal_bridge` | Converts RViz `/clicked_point` (PointStamped) into `/astar/goal` (Pose2D), enabling click-to-navigate from RViz. |
+| **qr_aligner_node** | `qr_align_node` | Also registered in the Navigation package to allow use from Navigation-only launches. See Vision package for full description. |
 
 ### `Vision` package
 
@@ -243,13 +254,21 @@ mcrxe80-final-challenge/
 
 | Node | Executable | Description |
 |---|---|---|
-| **voice_action_node** | `voice_action_node` | Integrated voice control node. Records microphone audio, runs HMM + VQ recognition, and executes robot actions at 20 Hz. Supports 10 commands: `avanza`, `atras`, `izquierda`, `derecha`, `gira`, `detente`, `toma` (lift n1 → hold), `arriba` (lift n2 → hold), `suelta` (lift down), and `sube/baja` for manual lift. Thread-safe with automatic lift hold sequencing. |
+| **voice_action_node** | `voice_action_node` | Integrated voice control node. Records microphone audio, runs HMM + VQ recognition, and executes robot actions at 20 Hz. Supports 10 commands: `avanza`, `atras`, `izquierda`, `derecha`, `gira`, `detente`, `toma` (lift n1 → hold), `arriba` (lift n2 → hold), `suelta` / `abajo` (lift down). Thread-safe with automatic lift hold sequencing. |
 
 ### Jetson (standalone, not a ROS package)
 
 | File | Description |
 |---|---|
 | `jetson/spi_servo_node.py` | ROS 2 node running on the Jetson Nano. Bridges `/lift_auto` (String) and `/lift_trigger` (Int8) topics to the Tang Nano 20K FPGA via SPI. Implements a 10-state FPGA state machine mirror, anti-glitch MISO reading, poll-silence window around timer expirations, and a retry/timeout watchdog (200 ms retry, 1 s timeout) that publishes `<label>_TIMEOUT` on `/lift_done` to unblock the pipeline. Valid auto transitions: `IDLE→n1/n2`, `AT_N1/AT_N2→hold`, `HOLD→down`. |
+| `jetson/camera.py` | Camera node for Jetson Nano. Captures and publishes frames from the onboard fisheye camera. |
+
+### Tang Nano 20K FPGA (`Tang20K/`)
+
+| File | Description |
+|---|---|
+| `Tang20K/slave_lift.v` | Verilog implementation of the lift state machine running on the Tang Nano 20K (GW2AR-18C). Implements dual 360° servo PWM control with SPI slave interface and MISO feedback. Includes fixes for timer race conditions (timer_fired flag), robust bit counter (5-bit), and MOSI/SCK alignment. States: `IDLE → TO_N1/TO_N2 → AT_N1/AT_N2 → LIFTING → HOLD → LOWERING`. |
+| `Tang20K/lift.cst` | Physical pin constraint file for the Tang Nano 20K. |
 
 ---
 
@@ -309,6 +328,8 @@ mcrxe80-final-challenge/
 > **Primary entry point for competition use:** `manchester.launch.py`
 >
 > The `mission_manager` and `truck_aligener` are launched separately (or added to `manchester.launch.py`) — they are not included in the default launch to allow independent testing.
+>
+> The included `rviz_bonito.rviz` config provides a ready-to-use RViz layout for the full stack (map, TF, LiDAR, ArUco markers, MCL particles).
 
 ---
 
@@ -321,8 +342,9 @@ mcrxe80-final-challenge/
 - **nav2_map_server** + **nav2_lifecycle_manager** (only needed for `manchester.launch.py`)
 - **Physical Puzzlebot** hardware: RPLiDAR, fisheye camera, Tang Nano 20K FPGA lift controller
 - **Jetson Nano** for SPI → FPGA communication (`jetson/spi_servo_node.py`)
-- Camera calibration file: `src/Vision/Vision/fisheye_params.npz` (included)
+- Camera calibration files: `src/Vision/Vision/fisheye_params.npz` and `fisheye_params.json` (both included)
 - Custom YOLOv8 weights: not included in repo — place `best.pt` under `src/Vision/Vision/weights/`
+- **Gowin EDA** (or compatible toolchain) to synthesize `Tang20K/slave_lift.v` if reflashing the FPGA
 
 ---
 
@@ -365,6 +387,9 @@ ros2 launch iolair manchester.launch.py
 
 # Override the map file
 ros2 launch iolair manchester.launch.py map_yaml:=/path/to/your_map.yaml
+
+# Load the included RViz config for visualization
+rviz2 -d rviz_bonito.rviz
 ```
 
 To navigate:
@@ -407,10 +432,11 @@ python3 -c "import sounddevice; print(sounddevice.query_devices())"
 # Run the voice action node with the correct device index
 ros2 run voice_hmm_ros voice_action_node --ros-args --device 1
 
-# Recognized commands:
+# Recognized commands (10 total, trained with Baum-Welch HMM + VQ):
 # avanza / atras / izquierda / derecha / gira / detente
-# toma (lift n1 → hold)    arriba (lift n2 → hold)
-# suelta (lift down)       sube / baja (manual lift)
+# toma   → lift to n1, then auto-hold
+# arriba → lift to n2, then auto-hold
+# suelta / abajo → lower lift
 ```
 
 ### Lift manual control (Jetson)
@@ -432,6 +458,20 @@ ros2 launch iolair manchester.launch.py
 # Drive manually in a second terminal:
 ros2 run iolair teleop
 # Map auto-saves to maps/SLAM_map when slam_node shuts down
+```
+
+### Connecting to the Puzzlebot
+
+```bash
+# SSH into the Puzzlebot onboard computer
+ssh 10.42.0.1   # password: Puzzlebot72
+
+# On the robot — start LiDAR and micro-ROS agent (separate terminals)
+ros2 launch sllidar_ros2 sllidar_a1_launch.py serial_port:=/dev/ttyUSB1
+ros2 launch puzzlebot_ros micro_ros_agent.launch.py
+
+# Start camera (from iolair_ws on the robot)
+python3 camera.py
 ```
 
 ### Camera fisheye calibration
@@ -456,6 +496,7 @@ ros2 run Navigation mission_manager
 ros2 run Navigation mission_planner
 ros2 run Navigation vfh_plus
 ros2 run Navigation rviz_goal_bridge
+ros2 run Navigation qr_align_node
 
 # Vision
 ros2 run Vision aruco_detector
